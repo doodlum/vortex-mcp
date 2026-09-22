@@ -236,11 +236,22 @@ Callers that mean "just run the game" have to clear it _and_ the reader has to
 treat `null` and `""` as unset.
 
 Worth knowing too: a seeded profile carries its recorded tools with it, so an
-instance restored from a snapshot can have a primary tool pointing at a path
-that no longer exists. Vortex spawns it, the process exits immediately, and
-`launch_game` still reports success — `runExecutable` resolving only means the
-process was _started_, never that it stayed up. Check for the process rather
-than trusting the return value.
+instance restored from a snapshot can have a primary tool that no longer works.
+Two different failures look identical from the outside:
+
+- the recorded path is **gone**, or
+- the path still exists but the binary is **stale** — a backup F4SE built for
+  another game version, for instance — so it spawns cleanly and exits having
+  started nothing.
+
+Either way `runExecutable` resolves, which only means the process was _started_,
+never that it stayed up or that a game appeared. Nor is the tool's own process
+the thing to watch: a loader is _supposed_ to exit once it has handed off, so a
+working loader and a dead one both leave nothing behind.
+
+Watch for the **game's** executable in the OS process list instead, and fall
+back to launching it directly when it never shows up. That is what `launchGame`
+does; `processWaitMs` exists so tests need not wait it out.
 
 ### Deploying over another instance's files is blocked
 
