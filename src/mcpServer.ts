@@ -1172,8 +1172,10 @@ function registerUiReadTools(server: McpServer, api: IExtensionApi): void {
           ),
       }),
     },
-    async ({ selector, includeHidden, maxDepth, maxNodes, includeBox }) => ({
-      content: [jsonText(ui.snapshot({ selector, includeHidden, maxDepth, maxNodes, includeBox }))],
+    async ({ selector, index, includeHidden, maxDepth, maxNodes, includeBox }) => ({
+      content: [
+        jsonText(ui.snapshot({ selector, index, includeHidden, maxDepth, maxNodes, includeBox })),
+      ],
     }),
   );
 

@@ -151,7 +151,7 @@ nothing happened". Call the prototype's native setter first, as `ui_fill` does.
 ### Stacked modals: `:nth-of-type()` cannot select between them
 
 Vortex mounts each modal under its own parent, so two open dialogs are not
-siblings. Every `div:nth-of-type(n)` therefore matches *both*, `querySelector`
+siblings. Every `div:nth-of-type(n)` therefore matches _both_, `querySelector`
 keeps returning the first, and the second dialog is unaddressable by CSS alone.
 
 The failure is silent and misleading. A purge prompt stacked behind a collection
@@ -160,7 +160,7 @@ the scoped lookup kept landing in the wrong dialog, so it read as "no policy for
 this dialog" — while the unanswered modal blocked the install driver, which read
 as a hung collection.
 
-`ui_snapshot` takes an `index` alongside `selector` for this: the nth *match*,
+`ui_snapshot` takes an `index` alongside `selector` for this: the nth _match_,
 which is the thing CSS cannot express. Note that `[role="dialog"]` can match
 several nested elements of a single dialog, so indices are not one-per-dialog —
 confirm with the dialog's text before acting, as `clickInsideDialog` does.
@@ -203,7 +203,44 @@ until the list is narrowed or scrolled to it. Filter with the search box rather
 than scrolling — far more reliable. And scrolling needs a real `scroll` **event**,
 not just a `scrollTop` assignment, or the new rows never mount.
 
+### Tool schemas change only on a restart, not a renderer reload
+
+`ui_reload_renderer` re-runs extension code, so a fix inside a tool's _handler_
+takes effect immediately. Tool **registration** does not: the MCP server is
+already listening, so re-registration is skipped and the previous schemas stay.
+
+The result is a half-updated extension that is easy to misread. A new parameter
+is rejected by the old schema and silently stripped before the handler sees it,
+so the handler runs the new code with the argument missing and returns a
+perfectly normal result. Nothing errors. It looks exactly like the new code not
+being loaded — and led to a "verified against the live app" claim here that was
+really the old schema discarding the argument.
+
+Restart the instance (`vortex-ai down && vortex-ai up`) after changing anything
+in a tool's `inputSchema`. Hot reload is fine for handler-only edits.
+
+### Installing the extension: `installMcpExtension` appends `userData` itself
+
+It takes the _instance_ directory and joins `userData/plugins/<id>` onto it.
+Passing the userData directory produces `userData/userData/plugins/...`, which
+Vortex never reads — so the extension keeps running the previously installed
+build and every change appears to have no effect.
+
 ## Deployment
+
+### A cleared primary tool is `null`, not absent
+
+Clearing a game's primary tool writes `null` rather than removing the key, so an
+`!== undefined` check treats it as a tool named "null" and refuses to launch.
+Callers that mean "just run the game" have to clear it _and_ the reader has to
+treat `null` and `""` as unset.
+
+Worth knowing too: a seeded profile carries its recorded tools with it, so an
+instance restored from a snapshot can have a primary tool pointing at a path
+that no longer exists. Vortex spawns it, the process exits immediately, and
+`launch_game` still reports success — `runExecutable` resolving only means the
+process was _started_, never that it stayed up. Check for the process rather
+than trusting the return value.
 
 ### Deploying over another instance's files is blocked
 

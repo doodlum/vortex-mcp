@@ -1446,9 +1446,17 @@ export async function launchGame(
     | { path?: string; executable?: string }
     | undefined;
 
-  const toolId = queryStatePath(api, ["settings", "interface", "primaryTool", targetGameId]) as
-    | string
-    | undefined;
+  // Clearing a primary tool leaves `null` in the state rather than removing the
+  // key, so an `!== undefined` check treats "no primary tool" as a tool named
+  // "null" and refuses to launch anything — instead of falling back to the
+  // game's own executable, which is exactly what clearing it asks for.
+  const primaryTool = queryStatePath(api, [
+    "settings",
+    "interface",
+    "primaryTool",
+    targetGameId,
+  ]) as string | null | undefined;
+  const toolId = primaryTool === null || primaryTool === "" ? undefined : primaryTool;
 
   if (toolId !== undefined) {
     const tool = queryStatePath(api, [

@@ -718,6 +718,36 @@ describe("vortexControl: games", () => {
     );
   });
 
+  it("launchGame treats a cleared primary tool as no primary tool", async () => {
+    // Clearing one leaves `null` behind rather than removing the key, so an
+    // `!== undefined` check read it as a tool literally named "null" and
+    // refused to launch at all — when clearing it is precisely how you ask for
+    // the game's own executable. Seen with a seeded profile whose recorded tool
+    // pointed at a path that no longer existed.
+    vi.mocked(selectors.knownGames).mockReturnValue([
+      { id: "skyrimse", executable: "SkyrimSE.exe" },
+    ] as never);
+    for (const cleared of [null, ""]) {
+      const api = fakeApi();
+      (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+        settings: {
+          interface: { primaryTool: { skyrimse: cleared } },
+          gameMode: { discovered: { skyrimse: { path: "C:/Games/SkyrimSE" } } },
+        },
+      });
+      const runExecutable = vi.fn(async () => undefined);
+      (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+      await launchGame(api, "skyrimse");
+
+      expect(runExecutable).toHaveBeenCalledWith(
+        expect.stringContaining("SkyrimSE.exe"),
+        [],
+        expect.objectContaining({ suggestDeploy: true }),
+      );
+    }
+  });
+
   it("launchGame prefers the executable discovery recorded over the extension's", async () => {
     // Someone who renamed or relocated the binary is recorded in discovery and
     // nowhere else, so that has to win.

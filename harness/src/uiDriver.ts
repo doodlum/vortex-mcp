@@ -204,6 +204,46 @@ export interface DialogPolicy {
  * unattended would delete those. Anything not listed is deliberately left alone
  * and reported, rather than guessed at by clicking the first button.
  */
+/**
+ * The two possible answers to "Purge files from different instance?".
+ *
+ * Vortex raises this when the game directory holds files deployed by a
+ * *different* Vortex instance, and it has to be answered before that game can
+ * be deployed to at all. Which answer is right is not a property of the dialog,
+ * it is a property of what the caller is doing — so both exist and the caller
+ * chooses, rather than one being hardcoded.
+ */
+const FOREIGN_PURGE_REFUSED: DialogPolicy = {
+  match: /purge files from different instance/i,
+  button: /^cancel$/i,
+  because:
+    "another Vortex instance deployed mods to this game; purging them unattended would " +
+    "remove real files the operator did not ask to lose",
+};
+
+const FOREIGN_PURGE_ACCEPTED: DialogPolicy = {
+  match: /purge files from different instance/i,
+  button: /^purge$/i,
+  because: "the caller asked for the game to be reset to a clean state",
+};
+
+/**
+ * The policy list, with the purge prompt answered according to intent.
+ *
+ * `allowForeignPurge` deletes files another Vortex instance deployed, so it is
+ * opt-in per call and never inferred. Resetting a game to a known state is a
+ * legitimate thing for a test harness to do — it is what makes a run
+ * repeatable — but it is destructive to whatever else was using that game
+ * directory, so nothing turns it on by accident.
+ */
+export function dialogPolicies(options: { allowForeignPurge?: boolean } = {}): DialogPolicy[] {
+  return DEFAULT_DIALOG_POLICIES.map((policy) =>
+    policy === FOREIGN_PURGE_REFUSED && options.allowForeignPurge === true
+      ? FOREIGN_PURGE_ACCEPTED
+      : policy,
+  );
+}
+
 export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
   {
     // Must come first: clicking the wrong button here throws away an install
@@ -213,13 +253,7 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
     button: /^close$/i,
     because: "never abandon an install we started; Close dismisses without cancelling",
   },
-  {
-    match: /purge files from different instance/i,
-    button: /^cancel$/i,
-    because:
-      "another Vortex instance deployed mods to this game; purging them unattended would " +
-      "remove real files the operator did not ask to lose",
-  },
+  FOREIGN_PURGE_REFUSED,
   {
     match: /game version mismatch/i,
     button: /^continue$/i,

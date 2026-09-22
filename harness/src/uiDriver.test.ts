@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { VortexMcpClient } from "./mcpClient";
-import { advanceFomod, type Snapshot, type SnapshotNode } from "./uiDriver";
+import {
+  advanceFomod,
+  DEFAULT_DIALOG_POLICIES,
+  dialogPolicies,
+  type Snapshot,
+  type SnapshotNode,
+} from "./uiDriver";
 
 function node(name: string, overrides: Partial<SnapshotNode> = {}): SnapshotNode {
   return { ref: `ref-${name}`, role: "button", name, ...overrides };
@@ -99,5 +105,45 @@ describe("advanceFomod", () => {
     });
     await expect(advanceFomod(mcp)).resolves.toBeUndefined();
     expect(clicked).toEqual([]);
+  });
+});
+
+const PURGE_PROMPT =
+  "Purge files from different instance?IMPORTANT: This game was modded by another instance";
+
+function answerTo(text: string, policies = DEFAULT_DIALOG_POLICIES): string | undefined {
+  return policies.find((p) => p.match.test(text))?.button.toString();
+}
+
+describe("dialogPolicies", () => {
+  const purgePrompt = PURGE_PROMPT;
+
+  it("refuses the purge by default", () => {
+    // The default runs against whatever game directory is on the machine, which
+    // may be someone's real install with another Vortex's files deployed in it.
+    expect(answerTo(purgePrompt)).toMatch(/cancel/i);
+    expect(answerTo(purgePrompt, dialogPolicies())).toMatch(/cancel/i);
+    expect(answerTo(purgePrompt, dialogPolicies({ allowForeignPurge: false }))).toMatch(/cancel/i);
+  });
+
+  it("accepts it only when the caller opts in", () => {
+    expect(answerTo(purgePrompt, dialogPolicies({ allowForeignPurge: true }))).toMatch(/purge/i);
+  });
+
+  it("changes nothing else when opting in", () => {
+    // Opting into a purge must not quietly make the other answers destructive.
+    const base = DEFAULT_DIALOG_POLICIES;
+    const opted = dialogPolicies({ allowForeignPurge: true });
+    expect(opted).toHaveLength(base.length);
+    for (const [i, policy] of base.entries()) {
+      if (policy.match.test(purgePrompt)) continue;
+      expect(opted[i]).toBe(policy);
+    }
+  });
+
+  it("still refuses to abandon an install in progress", () => {
+    // This one is first for a reason: Vortex raises it on a stray Escape, and
+    // the wrong answer throws away a half-finished install.
+    expect(answerTo("Do you want to cancel the installation?")).toMatch(/close/i);
   });
 });

@@ -27,6 +27,7 @@ import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
 import { installCollection } from "./collections";
+import { deployMods, needsDeployment, purgeGame } from "./deployment";
 import {
   buildVortexSource,
   detectGitHubUser,
@@ -155,6 +156,14 @@ Collections (needs a Nexus API key — they cannot be downloaded anonymously)
                          Runs unattended: member mods' FOMOD installers are
                          advanced on their defaults, which are the choices the
                          collection already records.
+
+Deployment
+  deploy                 Link every enabled mod into the game directory
+    --purge              First remove files another Vortex instance deployed.
+                         DELETES those files; without it, deployment of a game
+                         another instance has touched is blocked outright.
+  purge                  Reset the game directory to unmodded, for a repeatable
+                         run. Implies --purge's consent.
 
 Testing
   responsive             Sweep window sizes, report width-dependent issues
@@ -432,6 +441,30 @@ async function main(): Promise<number> {
         log("  collection page says which, and its archive is usually already");
         log("  downloaded, so a retry from there does not re-fetch it.");
       }
+      return 0;
+    }
+
+    case "deploy": {
+      const mcp = await requireRunning(config);
+      await deployMods(mcp, {
+        allowForeignPurge: flags.purge === true,
+        onProgress: (m) => log(`  ${m}`),
+      });
+      const pending = await needsDeployment(mcp, config.gameId);
+      log("");
+      log(
+        pending
+          ? `${config.gameId} still reports undeployed changes.`
+          : `Deployed ${config.gameId}.`,
+      );
+      return pending ? 1 : 0;
+    }
+
+    case "purge": {
+      const mcp = await requireRunning(config);
+      await purgeGame(mcp, { allowForeignPurge: true, onProgress: (m) => log(`  ${m}`) });
+      log("");
+      log(`Purged ${config.gameId}; the game directory is back to unmodded.`);
       return 0;
     }
 
