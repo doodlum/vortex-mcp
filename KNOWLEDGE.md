@@ -203,6 +203,26 @@ which is the thing CSS cannot express. Note that `[role="dialog"]` can match
 several nested elements of a single dialog, so indices are not one-per-dialog —
 confirm with the dialog's text before acting, as `clickInsideDialog` does.
 
+### A mod exists in state before it is installed
+
+A mod row appears the moment its install _starts_, not when it finishes. Until
+the installer completes it sits at `state: "installing"`, shows its archive
+filename rather than its real name, and stays disabled. For a mod with a FOMOD,
+"until the installer completes" means until someone answers the wizard.
+
+So counting mods counts installs that have merely begun. A collection reported
+8/8 complete while four members were still installing, deploy ran over the
+half-installed set, and the game launched with a wizard still open on screen.
+The archive-named disabled rows are the tell, and they look like a cosmetic
+quirk rather than the signal they are.
+
+Wait on `state === "installed"`, **and** on nothing being left in `installing`.
+Neither alone is enough: the count can be reached while later members are still
+going, and "nothing installing" is briefly true in the gap before the next one
+starts. Anything that writes to the game directory should refuse while mods are
+installing, because deploying then links a half-extracted set and the result
+reads as a broken collection rather than an unfinished one.
+
 ### FOMOD steps do not have a predictably-named forward button
 
 Vortex labels a FOMOD installer's forward action after the step it is showing,
