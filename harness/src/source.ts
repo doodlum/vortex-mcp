@@ -12,7 +12,7 @@
  * already knows — needs no token, which matters because requiring `gh auth
  * login` before you can build anything would be a poor first five minutes.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -36,34 +36,68 @@ export function hasVortexSource(dir = vortexSourceDir()): boolean {
 export class ForkError extends Error {}
 
 /**
- * Run a command, and on failure throw an error that actually says what happened.
+ * Environment for a nested package-manager run.
  *
- * execFile's rejection carries only "Command failed: <cmd>"; the output that
- * explains why is on the error object's stdout/stderr and is otherwise lost.
- * For a step like `pnpm install`, which can fail for a dozen unrelated reasons,
- * that is the difference between a fixable message and a shrug.
+ * Strips the `npm_*` / `PNPM_*` variables the surrounding `pnpm exec` exports.
+ * They pin a child to the *parent* project's package manager regardless of its
+ * own `packageManager` field and working directory — so running Vortex's install
+ * from here used pnpm 9 instead of the 11 it requires, and failed with a
+ * "broken lockfile" and an unresolvable `node@runtime:` spec. Neither error
+ * mentions the version mismatch that actually caused them.
+ *
+ * `CI=1` additionally keeps anything downstream from stopping on a prompt there
+ * is no terminal to answer.
  */
-async function run(
+function childEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { CI: "1" };
+  for (const [key, value] of Object.entries(process.env)) {
+    if (/^(npm_|PNPM_|COREPACK_)/i.test(key)) continue;
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+/**
+ * Run a long command with its output visible.
+ *
+ * Capturing stdout for these was a mistake worth recording: `pnpm install` in a
+ * Vortex checkout downloads an Electron binary and rebuilds six native modules,
+ * which takes many minutes and prints steadily the whole time. With the output
+ * swallowed it is indistinguishable from a hang — so it got killed as hung when
+ * it was working fine. Streaming costs nothing and makes the difference obvious.
+ *
+ * `CI=1` keeps anything downstream from stopping on an interactive prompt there
+ * is no terminal to answer.
+ */
+function runStreaming(
   cmd: string,
   args: string[],
-  options: { cwd?: string; timeoutMs?: number; label: string },
+  options: { cwd?: string; label: string },
 ): Promise<void> {
-  try {
-    await execFileAsync(cmd, args, {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, {
       cwd: options.cwd,
       shell: true,
-      maxBuffer: 100 * 1024 * 1024,
-      timeout: options.timeoutMs ?? 60 * 60 * 1000,
+      stdio: "inherit",
+      env: childEnv(),
     });
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; message?: string };
-    const output = [e.stdout ?? "", e.stderr ?? ""].join("\n").trim();
-    const tail = output.split(/\r?\n/).slice(-25).join("\n");
-    throw new ForkError(
-      `${options.label} failed (${cmd} ${args.join(" ")})` +
-        (tail === "" ? `: ${e.message ?? "no output"}` : `:\n\n${tail}`),
+    child.on("error", (err) =>
+      reject(new ForkError(`${options.label} could not start: ${err.message}`)),
     );
-  }
+    child.on("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(
+        new ForkError(
+          `${options.label} failed (${cmd} ${args.join(" ")}) with ` +
+            `${signal === null ? `exit code ${String(code)}` : `signal ${signal}`}. ` +
+            `Its output is above.`,
+        ),
+      );
+    });
+  });
 }
 
 async function tryExec(cmd: string, args: string[]): Promise<string | undefined> {
@@ -239,9 +273,8 @@ export async function ensureVortexSource(options: EnsureSourceOptions = {}): Pro
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   // A full Vortex clone over a slow link genuinely takes a while; a short
   // timeout here would abort a working clone and leave a half-written dir.
-  await run("git", ["clone", fork.cloneUrl, dir], {
+  await runStreaming("git", ["clone", "--progress", fork.cloneUrl, dir], {
     label: `Cloning ${fork.fullName}`,
-    timeoutMs: 30 * 60 * 1000,
   });
 
   await tryExec("git", ["-C", dir, "remote", "add", "upstream", UPSTREAM_URL]);
@@ -264,11 +297,16 @@ export async function buildVortexSource(options: EnsureSourceOptions = {}): Prom
   }
 
   report("installing dependencies (slow: native modules are rebuilt)");
-  await run("pnpm", ["install"], { cwd: dir, label: "Installing Vortex's dependencies" });
+  // Minutes, not seconds: an Electron binary download plus six native module
+  // rebuilds. The output is streamed so that is visible rather than looking hung.
+  await runStreaming("pnpm", ["install"], { cwd: dir, label: "Installing Vortex's dependencies" });
 
   report("building renderer and main");
   try {
-    await run("pnpm", ["nx", "run", "@vortex/main:build"], { cwd: dir, label: "Building Vortex" });
+    await runStreaming("pnpm", ["nx", "run", "@vortex/main:build"], {
+      cwd: dir,
+      label: "Building Vortex",
+    });
   } catch (err) {
     // Vortex's full build can exit non-zero on a bundled extension whose native
     // dependency did not build, while still having produced the renderer and
@@ -276,10 +314,9 @@ export async function buildVortexSource(options: EnsureSourceOptions = {}): Prom
     // unrelated extension cannot block the whole suite — but only accept that
     // if the artifacts the harness actually needs exist afterwards.
     report("full build failed; building main's own bundle directly");
-    await run("node", ["./build.mjs"], {
+    await runStreaming("node", ["./build.mjs"], {
       cwd: path.join(dir, "src", "main"),
       label: "Building main",
-      timeoutMs: 30 * 60 * 1000,
     });
     if (!buildArtifactsPresent(dir)) throw err;
     report("main built — the earlier failure was in a bundled extension");

@@ -38,6 +38,10 @@ pnpm run ai:doctor   # check the setup, print fixes
 pnpm run ai:up       # start a ready-to-drive Vortex, logged in, game active
 ```
 
+Working on **Vortex itself** rather than this extension? `pnpm run ai:source`
+finds your Vortex fork on GitHub, clones it into `.vortex-src/` here, and builds
+it; `ai:up` then drives that clone instead of the installed app.
+
 Verified against the released Vortex 2.6.3 — cold start ~90-140s, warm ~10-20s.
 See [harness/AGENTS.md](harness/AGENTS.md) for the operating manual and
 [KNOWLEDGE.md](KNOWLEDGE.md) for the Vortex behaviours that will otherwise cost

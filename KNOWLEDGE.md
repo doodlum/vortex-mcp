@@ -56,6 +56,32 @@ The cost: it also disables startup quick discovery and suppresses the
 Register the path yourself with a raw `type:ADD_DISCOVERED_GAME` dispatch —
 faster than a scan and deterministic across machines anyway.
 
+## Building Vortex from here
+
+### A nested package-manager run inherits the wrong pnpm
+
+`pnpm exec` exports a pile of `npm_*` / `PNPM_*` environment variables, and they
+pin any child process to the **parent** project's package manager — regardless
+of the child's own `packageManager` field or working directory. Running Vortex's
+`pnpm install` from a script that this repo's pnpm launched therefore used
+pnpm 9 instead of the 11 Vortex requires, and failed with:
+
+```
+WARN  Ignoring broken lockfile ... expected a single document in the stream
+ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER  node@runtime:24.17.0
+```
+
+Neither message mentions a version mismatch. The lockfile is fine; pnpm 9 just
+cannot read one pnpm 11 wrote, and does not understand `node@runtime:` specs.
+`childEnv()` in `harness/src/source.ts` strips those variables.
+
+### Capturing output makes a slow step look like a hang
+
+`pnpm install` in a Vortex checkout downloads an Electron binary and rebuilds six
+native modules — many minutes of steady output. Captured rather than streamed,
+it is indistinguishable from a wedged process, and gets killed as one. Long steps
+stream; only short, quiet commands capture.
+
 ## Games and profiles
 
 ### `activate-game` is a dead end for a game with no profile
