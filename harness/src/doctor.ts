@@ -41,9 +41,31 @@ export async function runDoctor(config: HarnessConfig): Promise<DoctorReport> {
   checks.push(checkExtension());
   checks.push(checkGame(config));
   checks.push(checkCache(config));
+  checks.push(checkCapturedLogin(config));
   checks.push(await checkRunning(config));
 
   return { ok: checks.every((c) => c.ok || c.advisory === true), checks };
+}
+
+function checkCapturedLogin(config: HarnessConfig): Check {
+  const key = config.apiKey?.trim();
+  const captured =
+    readMarker(snapshotDir(config, key === undefined || key === "" ? "anonymous" : key))
+      ?.loginCaptured === true;
+  return {
+    name: "Nexus login captured",
+    ok: captured,
+    // Advisory for the same reason as the API key: only collections need it,
+    // and everything else works without it.
+    advisory: true,
+    detail: captured
+      ? "captured — cold starts come up signed in"
+      : "not captured — collections will fail; an API key alone does not cover them",
+    fix:
+      "Collections use OAuth, and its captcha cannot be automated, so log in once:\n" +
+      "      pnpm run ai:up        then click Log in in Vortex\n" +
+      "      pnpm run ai -- save-login",
+  };
 }
 
 function checkApiKey(config: HarnessConfig): Check {
