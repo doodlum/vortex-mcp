@@ -87,13 +87,39 @@ then fails with a 401, surfaced as _"You are not logged in to Nexus Mods!"_ —
 long after `isLoggedIn` said yes. `installCollection` therefore checks for
 `OAuthCredentials` specifically and refuses up front.
 
-OAuth means the captcha, which is exactly why Vortex's own E2E suite has an
-interactive `auth:capture` step a human sits through. So **collections cannot be
-installed "from scratch with no user input"** on this build: someone has to click
-Log in once. That login lives in the live instance and does _not_ survive
-`up --fresh`, which re-seeds from the snapshot.
+### Automating the OAuth step
 
-Everything else in this suite still meets the no-user-input bar.
+Clicking **Log in** opens a dialog that says _"Please click 'authorise' on the
+website"_ and sends the default browser to Nexus's consent page. What happens
+there decides whether an agent can finish it:
+
+| In the browser Vortex opens      | Automatable?                        |
+| -------------------------------- | ----------------------------------- |
+| Already signed in to Nexus       | **Yes** — it is one Authorise click |
+| Signed out (email/password form) | **No** — credential entry           |
+| Captcha shown                    | **No** — never solve one            |
+
+So the whole thing hinges on the browser already holding a Nexus session. Give
+the agent a browser that has one and the consent click is ordinary automation;
+without it the flow lands on a password form and a captcha, and it stops there.
+
+Two things that make this awkward in practice, both worth knowing before
+planning around it:
+
+- **An API key hides the Log in button.** It satisfies `isLoggedIn`, so Vortex
+  shows an account as signed in and offers only **Logout**. Reaching the OAuth
+  flow means logging out first — which is the user's session to end, so ask.
+- **Reading the OAuth URL out of `vortex.log` is not a shortcut.** Scraping logs
+  for authorisation URLs or tokens is credential handling, and is refused. Drive
+  the browser window Vortex opened instead.
+
+The credential itself lives in the live instance and does **not** survive
+`up --fresh`, which re-seeds from the snapshot. If a run needs collections,
+either keep the instance warm or expect to re-authorise once after a reset.
+
+So **collections cannot be installed "from scratch with no user input"** unless
+a signed-in browser is available to the agent. Everything else in this suite
+still meets that bar.
 
 ### Everything else is checked for you
 
