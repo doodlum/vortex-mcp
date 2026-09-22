@@ -1259,34 +1259,6 @@ function registerUiReadTools(server: McpServer, api: IExtensionApi): void {
       content: [jsonText(ui.readConsole({ since, levels, limit }))],
     }),
   );
-
-  server.registerTool(
-    "ui_screenshot",
-    {
-      description:
-        "Capture the Vortex window as a PNG image. Needs the `window:capturePage` addition to " +
-        "Vortex core — an extension cannot reach webContents.capturePage itself, because " +
-        "extensions are renderer-only in Vortex 2.x (onceMain is deprecated). Against a stock " +
-        "Vortex this throws with that explanation rather than failing obscurely; use ui_snapshot " +
-        "for structure, which needs no core change at all. Prefer ui_snapshot generally: it is " +
-        "far cheaper and it gives you refs to act on. Reach for a screenshot when the question " +
-        "is genuinely visual — spacing, overlap, theming, an icon that renders wrong.",
-      inputSchema: z.object({
-        x: z.number().int().optional().describe("Crop origin x. Omit to capture the whole window."),
-        y: z.number().int().optional().describe("Crop origin y."),
-        width: z.number().int().optional().describe("Crop width."),
-        height: z.number().int().optional().describe("Crop height."),
-      }),
-    },
-    async ({ x, y, width, height }) => {
-      const rect =
-        x !== undefined && y !== undefined && width !== undefined && height !== undefined
-          ? { x, y, width, height }
-          : undefined;
-      const base64 = await ui.captureScreenshot(rect);
-      return { content: [{ type: "image", data: base64, mimeType: "image/png" }] };
-    },
-  );
 }
 
 /**
@@ -1376,9 +1348,15 @@ function registerUiWriteTools(server: McpServer, api: IExtensionApi): void {
     {
       description:
         "Move the pointer over an element, firing the pointerover/mouseover/mouseenter sequence. " +
-        "Needed before clicking controls that only exist on hover — Vortex's game tiles reveal " +
-        "their 'Manage' button this way, and several table rows reveal row actions on hover — " +
-        "so a click without a prior hover finds nothing to click.",
+        "Needed before clicking controls that appear on hover, where a JS handler (React's " +
+        "onMouseEnter and friends) is what reveals them. IMPORTANT LIMIT: this dispatches DOM " +
+        "events, which do NOT change the browser's own hover state, so a control revealed purely " +
+        "by a CSS `:hover` rule stays hidden — only a real mouse move can do that, and nothing " +
+        "in the renderer can produce one. Vortex's game tiles are exactly this case: the " +
+        "'Manage' button sits in a `.hover-content` wrapper at opacity 0, so after ui_hover it " +
+        "is still correctly reported as hidden. Two ways through: click it anyway with " +
+        "ui_click + requireActionable=false (the handler fires regardless of opacity), or use " +
+        "the harness's `realHover`, which drives a real mouse over CDP.",
       inputSchema: z.object(uiTargetSchema),
     },
     async (args) => ({ content: [jsonText(ui.hover(args))] }),
@@ -1451,8 +1429,9 @@ function registerUiWriteTools(server: McpServer, api: IExtensionApi): void {
         "it cannot strand the user's window at 1024x720. Defaults to 1024x720, 1280x800, " +
         "1600x900 and 1920x1080. Read the results as a DIFF across sizes rather than as pass/" +
         "fail: an issue present at every width is usually a pre-existing quirk, while one that " +
-        "appears only below a threshold is the actual responsive regression. Optionally captures " +
-        "a screenshot per viewport (needs Vortex core's window:capturePage — see ui_screenshot).",
+        "appears only below a threshold is the actual responsive regression. Structure only: an " +
+        "extension cannot screenshot (capturePage is main-process only), so for images at each " +
+        "size use the harness's `vortex-ai responsive --screenshots`, which captures over CDP.",
       inputSchema: z.object({
         viewports: z
           .array(z.object({ width: z.number().int(), height: z.number().int() }))
@@ -1464,18 +1443,10 @@ function registerUiWriteTools(server: McpServer, api: IExtensionApi): void {
           .optional()
           .describe("Wait after each resize before scanning, for re-layout. Defaults to 400."),
         maxIssuesPerViewport: z.number().int().optional().describe("Defaults to 25."),
-        screenshots: z
-          .boolean()
-          .optional()
-          .describe("Capture a base64 PNG per viewport. Defaults to false."),
       }),
     },
-    async ({ viewports, settleMs, maxIssuesPerViewport, screenshots }) => ({
-      content: [
-        jsonText(
-          await ui.responsiveSweep({ viewports, settleMs, maxIssuesPerViewport, screenshots }),
-        ),
-      ],
+    async ({ viewports, settleMs, maxIssuesPerViewport }) => ({
+      content: [jsonText(await ui.responsiveSweep({ viewports, settleMs, maxIssuesPerViewport }))],
     }),
   );
 

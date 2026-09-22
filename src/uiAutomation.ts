@@ -11,14 +11,16 @@
  *
  * Two things deliberately do NOT live here:
  *
- * - **Screenshots** need the main process (`webContents.capturePage`), which an
- *   extension can't reach: `onceMain` is deprecated in Vortex 2.x and logs
- *   "won't work as expected", so extensions are renderer-only. `captureScreenshot`
- *   below goes through `window.api.window.capturePage`, a small Vortex-core
- *   addition, and degrades with a clear error when running against a stock build
- *   that lacks it.
- * - **Launching/building Vortex** is the harness's job (packages/ai-harness in
- *   the Vortex repo). Nothing here can start a process.
+ * - **Screenshots.** They need `webContents.capturePage`, which lives in the
+ *   main process; extensions are renderer-only in Vortex 2.x (`onceMain` is
+ *   deprecated and logs "won't work as expected"). Rather than require a patch
+ *   to Vortex itself, the harness takes them over CDP — which works against a
+ *   stock, released Vortex. See harness/src/screenshot.ts.
+ * - **Launching/building Vortex.** That is the harness's job; nothing here can
+ *   start a process.
+ *
+ * Everything in this file works against an unmodified, officially released
+ * Vortex. That constraint is deliberate and worth preserving.
  */
 
 // Vortex's own Electron preload bridge. Not part of @nexusmods/vortex-api and not
@@ -30,11 +32,6 @@ interface VortexPreloadWindowApi {
   setSize: (windowId: number, width: number, height: number) => Promise<void>;
   isMaximized: (windowId: number) => Promise<boolean>;
   unmaximize: (windowId: number) => Promise<void>;
-  /**
-   * Vortex-core addition (see the AI-automation branch's ipcHandlers change).
-   * Absent on a stock Vortex build — callers must handle `undefined`.
-   */
-  capturePage?: (windowId: number, rect?: CaptureRect) => Promise<string>;
 }
 
 export interface CaptureRect {
@@ -1118,7 +1115,6 @@ export interface ResponsiveSweepResult {
   hasHorizontalOverflow: boolean;
   issueCount: number;
   issues: LayoutIssue[];
-  screenshot?: string;
 }
 
 /** The sizes worth checking by default: Vortex's own minimum, a common laptop, and a wide desktop. */
@@ -1141,7 +1137,6 @@ export async function responsiveSweep(
     viewports?: Viewport[];
     settleMs?: number;
     maxIssuesPerViewport?: number;
-    screenshots?: boolean;
   } = {},
 ): Promise<{ restored: Viewport; results: ResponsiveSweepResult[] }> {
   const viewports = options.viewports ?? DEFAULT_SWEEP_VIEWPORTS;
@@ -1163,11 +1158,6 @@ export async function responsiveSweep(
         issueCount: layout.issues.length,
         issues: layout.issues,
       };
-      if (options.screenshots === true) {
-        result.screenshot = await captureScreenshot().catch(
-          (err: unknown) => `unavailable: ${String(err)}`,
-        );
-      }
       results.push(result);
     }
   } finally {
@@ -1175,32 +1165,6 @@ export async function responsiveSweep(
   }
 
   return { restored: original, results };
-}
-
-// ---------------------------------------------------------------------------
-// Screenshot
-// ---------------------------------------------------------------------------
-
-/**
- * Capture the window as a base64 PNG via Vortex's preload bridge.
- *
- * Needs `window:capturePage`, which a stock Vortex does not have — an extension
- * can't reach `webContents.capturePage` itself because extensions are
- * renderer-only in Vortex 2.x. The error names the missing piece rather than
- * failing as a generic undefined-call, since running against a stock build is
- * the expected case, not a bug.
- */
-export async function captureScreenshot(rect?: CaptureRect): Promise<string> {
-  const api = preloadWindowApi();
-  if (typeof api.capturePage !== "function") {
-    throw new Error(
-      "window.api.window.capturePage is not available in this Vortex build. Screenshots need the " +
-        "AI-automation addition to Vortex core (ipcHandlers 'window:capturePage'). Until then, " +
-        "use ui_snapshot for structure, or drive Vortex through the Playwright harness " +
-        "(packages/ai-harness), which screenshots over CDP instead.",
-    );
-  }
-  return api.capturePage(await api.getId(), rect);
 }
 
 // ---------------------------------------------------------------------------

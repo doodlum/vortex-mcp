@@ -1,0 +1,6 @@
+# Cached seeded Vortex profiles (may contain a live Nexus API key) and run output.
+.cache/
+.artifacts/
+test-results/
+playwright-report/
+.env

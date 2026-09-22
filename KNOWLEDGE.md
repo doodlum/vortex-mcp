@@ -1,0 +1,159 @@
+# Vortex behaviours worth knowing
+
+Things learned the hard way building and running this against a real Vortex.
+Every one of them fails _silently_, or with a message that points somewhere else.
+If you are debugging something baffling, start here.
+
+## Extensions
+
+### An extension under an ESM package root never runs
+
+Node decides a `.js` file's module type from the **nearest `package.json` up the
+tree**. Copy an extension into a directory beneath a `"type": "module"` package
+and Node parses its CommonJS bundle as ESM: the module body never executes,
+`require()` returns an empty namespace object, **nothing throws**, and Vortex
+reports only:
+
+```
+corrupt extension, failed to initialize: {"name":"vortex-mcp",...}
+```
+
+which says nothing about module resolution. `installMcpExtension` writes
+`{"type":"commonjs"}` into the installed directory to pin it. A normal install
+under `%APPDATA%/vortex/plugins` has no ESM ancestor, so this only bites
+harnesses — which is why it is so confusing when it happens.
+
+### Extensions are renderer-only
+
+`onceMain` is deprecated; `ExtensionManager` logs _"onceMain is deprecated and
+won't work as expected"_. Anything needing the main process —
+`webContents.capturePage`, `desktopCapturer`, `BrowserWindow` — is out of reach.
+Use CDP from outside instead (see `harness/src/cdp.ts`); it works against a
+released build and needs no change to Vortex.
+
+### The app-name directory differs between builds
+
+Vortex expects `<appData>/<appName>/startup.json` to exist before launch.
+`appName` is Electron's app name:
+
+- released build → `Vortex`
+- source checkout → `@vortex/main` (from `src/main/package.json`)
+
+Create the wrong one and Vortex quits during startup with an unrecoverable
+ENOENT on `startup.json`, which reads like a corrupt profile.
+
+## Isolation
+
+### `VORTEX_E2E=1` is load-bearing, and hostile to discovery
+
+`ELECTRON_USERDATA` / `ELECTRON_APPDATA` are **only honoured when it is set**, and
+it also skips the single-instance lock so a harness instance can run alongside
+the operator's own Vortex. The released build honours all three, which is what
+makes isolated automation against a stock install possible.
+
+The cost: it also disables startup quick discovery and suppresses the
+`discover-game` event, so the Games page will never list a game on its own.
+Register the path yourself with a raw `type:ADD_DISCOVERED_GAME` dispatch —
+faster than a scan and deterministic across machines anyway.
+
+## Games and profiles
+
+### `activate-game` is a dead end for a game with no profile
+
+Its handler calls `activateGame`, which on finding no profile shows a "Choose
+profile" dialog whose choice list is **empty** — unanswerable, so activation
+hangs forever. It also takes **no callback**, so `vortex_dispatch`'s
+`__CALLBACK__` sentinel waits on something that never fires.
+
+`manageGameDiscovered` — which creates the first profile _and_ initialises and
+tags the staging directory — is not exposed through `registerAPI`; only
+`unmanageGame` is. The working route is the UI: Games page → search → hover the
+tile → the manage button.
+
+### The manage button's label and shape move between versions
+
+- Vortex 2.6.3: `button.action-manage`, labelled **"Manage"**, inside a
+  `.hover-content` wrapper at `opacity: 0`.
+- Newer layouts: labelled **"Add game"**.
+
+Match on the class where possible and treat the label as a fallback.
+
+## The UI
+
+### Synthetic hover cannot trigger CSS `:hover`
+
+Dispatching `mouseover`/`mouseenter` runs React handlers but does **not** change
+the browser's hover state. Anything revealed purely by a CSS `:hover` rule stays
+at `opacity: 0`, and a snapshot correctly reports it hidden — which looks like a
+snapshot bug and is not.
+
+Either click it anyway (`ui_click` with `requireActionable: false`, since the
+event is dispatched on the element rather than at a coordinate), or use the
+harness's `realHover()`, which moves a real mouse over CDP.
+
+### Three ways a snapshot can silently go blank
+
+All three were real bugs in this extension, each of which deleted part or all of
+the UI from `ui_snapshot` rather than failing:
+
+1. **`display: contents` wrappers** generate no box, so `getClientRects()` is
+   empty while their children render normally. Pruning on that removed Vortex's
+   entire game grid. Zero client rects now only disqualifies an element from
+   being _clicked_.
+2. **`getComputedStyle().opacity` can be `""`**, and `Number("") === 0`, so a
+   naive zero-check reads an unresolved value as fully transparent. Only a value
+   that actually parses to 0 counts.
+3. **`aria-hidden` on the app root.** react-bootstrap sets it on Vortex's
+   `#content` and `#overlays` whenever a modal opens, so treating it as invisible
+   blanked the entire snapshot at exactly the moment an agent most needs one.
+   It means "hidden from assistive technology", not "not rendered" — it is
+   reported per node as `ariaHidden` instead.
+
+### Several widgets listen on `mousedown`, not `click`
+
+`HTMLElement.click()` dispatches only a `click` event, so dropdown toggles and
+table row selection never respond to it. Dispatch the full pointer/mouse
+sequence — which `ui_click` does.
+
+### React ignores a direct `.value` assignment
+
+React tracks the last value it wrote on the DOM node. Assigning `el.value`
+updates the DOM but leaves the tracker stale, so React swallows the synthetic
+`input` event and `onChange` never runs — the classic "typed into the box but
+nothing happened". Call the prototype's native setter first, as `ui_fill` does.
+
+### Virtualised rows are not in the DOM
+
+Vortex's mod, plugin and game lists are windowed: a row simply does not exist
+until the list is narrowed or scrolled to it. Filter with the search box rather
+than scrolling — far more reliable. And scrolling needs a real `scroll` **event**,
+not just a `scrollTop` assignment, or the new rows never mount.
+
+## Deployment
+
+### Deploying over another instance's files is blocked
+
+Vortex prompts _"Purge files from different instance?"_. Answer Cancel
+unattended: a real install can have tens of thousands of deployed files (31,102
+on the machine this was built on), and purging is the direction Vortex itself
+calls "less reliable". Use a disposable game directory to exercise deploy/purge.
+
+## Shutdown
+
+### Kill the process and you can corrupt the profile
+
+Vortex flushes pending state diffs only on a proper window close: the renderer
+writes them synchronously, then main waits for it to release its file handles. A
+hard kill skips that and can leave the state database half-written — which shows
+up much later as a stale or corrupt profile rather than as an error at the time.
+`vortex_quit` closes the window, which is the same path as clicking the X.
+
+### Windows holds file handles after exit
+
+The state database releases its handles a moment _after_ the process is gone, so
+an immediate `rmSync` loses the race with EPERM. Retry with backoff.
+
+Directory **renames** are worse: they can fail with EPERM for reasons unrelated
+to Vortex (an indexer or scanner holding a transient handle on any descendant),
+and retrying does not reliably help. Prefer building in place and writing a
+marker file last over the staging-directory-then-rename pattern.

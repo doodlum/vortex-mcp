@@ -22,6 +22,27 @@ URL) is never exercised outside unit tests — it can trigger a blocking
 "choose install type" modal for ambiguous archives, unsafe to risk
 unsupervised.
 
+## Driving the UI
+
+Beyond reading and writing Vortex's state, the extension can drive its
+**interface**: read what is on screen as an accessibility tree, click, type,
+hover, scroll, resize the window and scan for responsive-layout breakage. It
+runs in Vortex's renderer, so this is plain DOM work — no CDP attach and no
+patched Vortex.
+
+`harness/` adds what an extension cannot do: launch and cache a logged-in
+instance, take screenshots, move a real mouse, and hot-reload changes.
+
+```sh
+pnpm run ai:doctor   # check the setup, print fixes
+pnpm run ai:up       # start a ready-to-drive Vortex, logged in, game active
+```
+
+Verified against the released Vortex 2.6.3 — cold start ~90-140s, warm ~10-20s.
+See [harness/AGENTS.md](harness/AGENTS.md) for the operating manual and
+[KNOWLEDGE.md](KNOWLEDGE.md) for the Vortex behaviours that will otherwise cost
+you an afternoon.
+
 ## Stack
 
 - TypeScript, bundled to a single CommonJS `dist/index.js` via `tsup`
