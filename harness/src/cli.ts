@@ -34,7 +34,11 @@ interface ParsedArgs {
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const [command = "help", ...rest] = argv;
+  // `pnpm run ai -- status` forwards the `--` separator itself, so the first
+  // argument we see is "--" rather than the command. Dropping a leading bare
+  // separator makes the documented invocation work instead of printing help.
+  const args = argv[0] === "--" ? argv.slice(1) : argv;
+  const [command = "help", ...rest] = args;
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
 
