@@ -12,7 +12,12 @@ type IProfile = types.IProfile;
 // bridge (contextBridge), reachable because this extension shares the renderer
 // process. Unlike vortex-api this isn't a published contract Nexus Mods commits to
 // keeping stable; it can change across Vortex releases without warning.
-declare const window: { api?: { app?: { relaunch: (args?: string[]) => void } } };
+declare const window: {
+  api?: {
+    app?: { relaunch: (args?: string[]) => void };
+    window?: { getId: () => Promise<number>; close: (windowId: number) => Promise<void> };
+  };
+};
 
 /**
  * Restarts Vortex via its own graceful relaunch path (the same one behind Vortex's
@@ -26,6 +31,24 @@ export function restartVortex(): void {
     throw new Error("window.api.app.relaunch is unavailable (unexpected Vortex preload shape)");
   }
   relaunch();
+}
+
+/**
+ * Quits Vortex the same way clicking the window's close button does.
+ *
+ * Closing the window (rather than calling app.exit) is what makes this a *clean*
+ * shutdown: Vortex's close handler notifies the renderer, which synchronously
+ * flushes its pending state diffs, and main then waits for the renderer to
+ * release its file handles before quitting. app.exit skips all of that and can
+ * leave the state database half-written — which shows up later as a corrupt or
+ * stale profile rather than as an error here.
+ */
+export async function quitVortex(): Promise<void> {
+  const windowApi = window.api?.window;
+  if (windowApi === undefined) {
+    throw new Error("window.api.window is unavailable (unexpected Vortex preload shape)");
+  }
+  await windowApi.close(await windowApi.getId());
 }
 
 // Matches store.ts's FULL_BACKUP_PATH constant (not exported from @nexusmods/vortex-api),

@@ -277,22 +277,56 @@ function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
 }
 
-export function isVisible(el: Element): boolean {
-  const htmlEl = el as HTMLElement;
+/**
+ * Whether an element and everything inside it is hidden from the user.
+ *
+ * Only properties that genuinely hide a *subtree* count here, because the
+ * snapshot walk prunes the children of anything this rejects. Two things that
+ * look like they belong in this list deliberately do not:
+ *
+ * - **An empty `getClientRects()`**. An element with `display: contents`
+ *   generates no box of its own while its children render normally — a common
+ *   React/CSS wrapper. Treating it as hidden silently deletes whole visible
+ *   sections of the UI from the snapshot. (Found the hard way: Vortex's entire
+ *   game grid vanished, tiles and all, while plainly on screen.)
+ * - **A falsy `opacity`**. `getComputedStyle().opacity` can come back as an
+ *   empty string, and `Number("") === 0` — so a naive zero-check reads an
+ *   unresolved value as fully transparent and hides everything beneath it.
+ *   Only a value that actually parses to 0 counts.
+ * - **`aria-hidden="true"`**. It means "hidden from assistive technology", not
+ *   "not rendered", and the standard modal pattern sets it on the whole app
+ *   root while a dialog is open — which is exactly what Vortex does, on
+ *   `#content` and `#overlays`. Pruning on it blanked the entire snapshot
+ *   whenever any dialog was up: precisely the state an agent most needs to see.
+ *   It is reported per node as `ariaHidden` instead, so a caller can still tell.
+ */
+function isSubtreeHidden(el: Element): boolean {
   const style = win().getComputedStyle(el);
-  if (
-    style.display === "none" ||
-    style.visibility === "hidden" ||
-    style.visibility === "collapse"
-  ) {
-    return false;
-  }
-  if (Number(style.opacity) === 0) return false;
-  if (el.getAttribute("aria-hidden") === "true") return false;
-  if (typeof htmlEl.getClientRects === "function" && htmlEl.getClientRects().length === 0) {
-    return false;
-  }
-  return true;
+  if (style.display === "none") return true;
+  if (style.visibility === "hidden" || style.visibility === "collapse") return true;
+
+  const opacity = Number.parseFloat(style.opacity);
+  return Number.isFinite(opacity) && opacity === 0;
+}
+
+export function isVisible(el: Element): boolean {
+  return !isSubtreeHidden(el);
+}
+
+/**
+ * Whether an element can actually receive a click.
+ *
+ * Stricter than isVisible: here a zero-size box IS disqualifying, because there
+ * is no point on screen to dispatch the event at. This check belongs only on
+ * the action path — using it for snapshot pruning is exactly what hides
+ * `display: contents` wrappers along with all their visible children.
+ */
+function hasRenderedBox(el: Element): boolean {
+  const htmlEl = el as HTMLElement;
+  if (typeof htmlEl.getClientRects !== "function") return true;
+  if (htmlEl.getClientRects().length > 0) return true;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 || rect.height > 0;
 }
 
 function isDisabled(el: Element): boolean {
@@ -356,6 +390,8 @@ export interface SnapshotNode {
   value?: string;
   testId?: string;
   disabled?: boolean;
+  /** Hidden from assistive tech but still rendered — e.g. behind an open modal. */
+  ariaHidden?: boolean;
   checked?: boolean;
   expanded?: boolean;
   selected?: boolean;
@@ -446,6 +482,7 @@ export function snapshot(options: SnapshotOptions = {}): SnapshotResult {
     if (value !== undefined) node.value = truncate(value, 200);
     if (testId !== undefined) node.testId = testId;
     if (isDisabled(el)) node.disabled = true;
+    if (el.getAttribute("aria-hidden") === "true") node.ariaHidden = true;
 
     const checked = checkedState(el);
     if (checked !== undefined) node.checked = checked;
@@ -643,7 +680,7 @@ function scrollIntoView(el: Element): void {
 }
 
 function assertActionable(el: Element, action: string): void {
-  if (!isVisible(el)) {
+  if (!isVisible(el) || !hasRenderedBox(el)) {
     throw new Error(
       `Cannot ${action}: element <${el.tagName.toLowerCase()}> is not visible. ` +
         `It may be behind a modal, on an inactive tab, or scrolled out of a virtualised list.`,

@@ -6,8 +6,9 @@ type IExtensionContext = types.IExtensionContext;
 
 function main(context: IExtensionContext): void {
   context.once(() => {
-    // Before the server starts, so the buffer covers everything after this point
-    // rather than only what happens once a client first connects. Idempotent.
+    // Before the server starts, so the buffer covers everything from load
+    // onwards rather than only what happens once a client first connects.
+    // Idempotent.
     installConsoleCapture();
     startMcpServer(context.api);
   });

@@ -33,6 +33,11 @@ function setBody(html: string): void {
   document.body.innerHTML = html;
 }
 
+/** Depth-first list of every node in a snapshot tree. */
+function flatten(nodes: ReturnType<typeof snapshot>["tree"]): ReturnType<typeof snapshot>["tree"] {
+  return nodes.flatMap((node) => [node, ...flatten(node.children ?? [])]);
+}
+
 /** jsdom returns a zero rect for everything; give one element a real box. */
 function stubRect(el: Element, rect: Partial<DOMRect>): void {
   vi.spyOn(el, "getBoundingClientRect").mockReturnValue({
@@ -406,10 +411,57 @@ describe("console capture", () => {
   });
 });
 
+describe("subtree visibility regressions", () => {
+  it("keeps children of a display:contents wrapper", () => {
+    // display:contents generates no box, so getClientRects() is empty while the
+    // children render normally. Pruning on that emptied the entire game grid
+    // out of the snapshot in a live run.
+    setBody('<div style="display:contents"><button>Manage</button></div>');
+    vi.spyOn(Element.prototype, "getClientRects").mockImplementation(function (this: Element) {
+      const empty = (this as HTMLElement).style.display === "contents";
+      return (empty ? [] : [{ width: 1, height: 1 }]) as unknown as DOMRectList;
+    });
+
+    const names = flatten(snapshot().tree).map((n) => n.name);
+    expect(names).toContain("Manage");
+  });
+
+  it("does not treat an unresolved opacity as transparent", () => {
+    // getComputedStyle().opacity can be "", and Number("") === 0 — a naive
+    // zero-check would hide the element and everything under it.
+    setBody("<div><button>Deploy</button></div>");
+    const real = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el: Element) => {
+      const style = real(el);
+      return new Proxy(style, {
+        get: (target, prop) => (prop === "opacity" ? "" : Reflect.get(target, prop)),
+      }) as CSSStyleDeclaration;
+    });
+
+    expect(flatten(snapshot().tree).map((n) => n.name)).toContain("Deploy");
+  });
+
+  it("still hides a genuinely transparent subtree", () => {
+    setBody('<div style="opacity:0"><button>Ghost</button></div>');
+    expect(flatten(snapshot().tree).map((n) => n.name)).not.toContain("Ghost");
+  });
+});
+
 describe("isVisible", () => {
-  it("treats aria-hidden as not visible", () => {
-    setBody('<div aria-hidden="true">x</div>');
-    expect(isVisible(document.querySelector("div") as Element)).toBe(false);
+  it("does NOT treat aria-hidden as invisible", () => {
+    // aria-hidden is an accessibility semantic, not a rendering one. Vortex's
+    // modals set it on the whole app root, so pruning on it blanks the entire
+    // snapshot exactly when a dialog is open.
+    setBody('<div aria-hidden="true"><button>Behind the modal</button></div>');
+    expect(isVisible(document.querySelector("div") as Element)).toBe(true);
+    const names = flatten(snapshot().tree).map((n) => n.name);
+    expect(names).toContain("Behind the modal");
+  });
+
+  it("reports aria-hidden on the node instead", () => {
+    setBody('<button aria-hidden="true">Muted</button>');
+    const node = flatten(snapshot().tree).find((n) => n.name === "Muted");
+    expect(node?.ariaHidden).toBe(true);
   });
 
   it("treats display:none as not visible", () => {

@@ -1064,6 +1064,30 @@ function registerWriteTools(server: McpServer, api: IExtensionApi): void {
     },
   );
 
+  server.registerTool(
+    "vortex_quit",
+    {
+      description:
+        "Quit Vortex cleanly — the same path as clicking the window's close button, NOT a " +
+        "process kill. The renderer flushes its pending state diffs and main waits for it to " +
+        "release its file handles before quitting, which is what leaves the state database " +
+        "consistent on disk. Use this rather than killing the process whenever the on-disk " +
+        "state matters afterwards (snapshotting a profile, reusing the user-data directory for " +
+        "a later run): a hard kill can leave state half-written, and that surfaces later as a " +
+        "stale or corrupt profile rather than as an error here. The MCP connection drops and " +
+        "does not come back — unlike vortex_restart, nothing restarts it.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      // Respond before quitting so the caller sees this call succeed rather than
+      // a dropped connection.
+      setTimeout(() => {
+        void control.quitVortex();
+      }, 200);
+      return { content: [{ type: "text", text: "Quitting Vortex cleanly..." }] };
+    },
+  );
+
   registerUiWriteTools(server, api);
 }
 
