@@ -1039,8 +1039,17 @@ function registerWriteTools(server: McpServer, api: IExtensionApi): void {
       }),
     },
     async ({ gameId, expectedActiveGameId }) => {
-      await control.launchGame(api, gameId, { activeGameId: expectedActiveGameId });
-      return { content: [{ type: "text", text: `Launched ${gameId ?? "active game"}` }] };
+      const launched = await control.launchGame(api, gameId, {
+        activeGameId: expectedActiveGameId,
+      });
+      // Name the executable: which one runs depends on the profile's primary
+      // tool and on whether that tool's path still exists, and "Launched
+      // fallout4" hides both. This reports that the process was *started* —
+      // a launcher-style tool exits immediately by design, so it is not a
+      // claim that anything is still running.
+      return {
+        content: [{ type: "text", text: `Started ${launched} for ${gameId ?? "the active game"}` }],
+      };
     },
   );
 

@@ -663,33 +663,35 @@ describe("vortexControl: games", () => {
   });
 
   it("launchGame resolves the primary tool via settings.interface/gameMode.discovered and runs it", async () => {
-    vi.mocked(selectors.activeGameId).mockReturnValue("skyrimse");
-    const api = fakeApi();
-    (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
-      settings: {
-        interface: { primaryTool: { skyrimse: "skse64" } },
-        gameMode: {
-          discovered: {
-            skyrimse: {
-              tools: {
-                skse64: { path: "C:\\Games\\Skyrim\\skse64_loader.exe" },
-              },
-            },
-          },
+    // The tool has to exist on disk: launchGame skips one whose path is gone,
+    // so a made-up path here would exercise the fallback instead.
+    const toolRoot = await mkdtemp(path.join(os.tmpdir(), "vortex-mcp-test-tool-"));
+    const toolPath = path.join(toolRoot, "skse64_loader.exe");
+    await writeFile(toolPath, "");
+
+    try {
+      vi.mocked(selectors.activeGameId).mockReturnValue("skyrimse");
+      const api = fakeApi();
+      (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+        settings: {
+          interface: { primaryTool: { skyrimse: "skse64" } },
+          gameMode: { discovered: { skyrimse: { tools: { skse64: { path: toolPath } } } } },
         },
-      },
-    });
-    const runExecutable = vi.fn(async () => undefined);
-    (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+      });
+      const runExecutable = vi.fn(async () => undefined);
+      (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
 
-    await launchGame(api);
+      await launchGame(api);
 
-    expect(runExecutable).toHaveBeenCalledWith("C:\\Games\\Skyrim\\skse64_loader.exe", [], {
-      cwd: undefined,
-      shell: false,
-      detach: true,
-      suggestDeploy: true,
-    });
+      expect(runExecutable).toHaveBeenCalledWith(toolPath, [], {
+        cwd: undefined,
+        shell: false,
+        detach: true,
+        suggestDeploy: true,
+      });
+    } finally {
+      await rm(toolRoot, { recursive: true, force: true });
+    }
   });
 
   it("launchGame falls back to the game's own executable when no primary tool is set", async () => {
@@ -746,6 +748,42 @@ describe("vortexControl: games", () => {
         expect.objectContaining({ suggestDeploy: true }),
       );
     }
+  });
+
+  it("launchGame ignores a primary tool whose executable no longer exists", async () => {
+    // Profiles carry their recorded tools, so a seeded or restored instance
+    // routinely names a path that is gone. Vortex spawns it anyway, the process
+    // dies immediately, and the launch looks like it worked — so an unusable
+    // tool is worse than no tool at all.
+    vi.mocked(selectors.knownGames).mockReturnValue([
+      { id: "skyrimse", executable: "SkyrimSE.exe" },
+    ] as never);
+    const api = fakeApi();
+    (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+      settings: {
+        interface: { primaryTool: { skyrimse: "skse" } },
+        gameMode: {
+          discovered: {
+            skyrimse: {
+              path: "C:/Games/SkyrimSE",
+              tools: { skse: { path: "C:/Games/SkyrimSE/_old_backup/skse_loader.exe" } },
+            },
+          },
+        },
+      },
+    });
+    const runExecutable = vi.fn(async () => undefined);
+    (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+    const launched = await launchGame(api, "skyrimse");
+
+    expect(runExecutable).toHaveBeenCalledTimes(1);
+    expect(runExecutable).toHaveBeenCalledWith(
+      expect.stringContaining("SkyrimSE.exe"),
+      [],
+      expect.objectContaining({ suggestDeploy: true }),
+    );
+    expect(launched).toContain("SkyrimSE.exe");
   });
 
   it("launchGame prefers the executable discovery recorded over the extension's", async () => {

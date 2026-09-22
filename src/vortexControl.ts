@@ -1433,11 +1433,12 @@ interface DiscoveredTool {
  * suggestDeploy: true mirrors Vortex's own "Play" button, which is what actually
  * surfaces the "files changed outside Vortex" prompt list_dialogs/closeDialog exist for.
  */
+/** Returns the executable actually launched, which is not always the one asked for. */
 export async function launchGame(
   api: IExtensionApi,
   gameId?: string,
   expectedContext?: ExpectedContext,
-): Promise<void> {
+): Promise<string> {
   assertExpectedContext(api, expectedContext);
   const st = state(api);
   const targetGameId = resolveGameId(gameId, st);
@@ -1470,14 +1471,28 @@ export async function launchGame(
     if (tool === undefined) {
       throw new Error(`Primary tool '${toolId}' for ${targetGameId} is not in discovered tools.`);
     }
-    await api.runExecutable(tool.path, tool.parameters ?? [], {
-      cwd: tool.workingDirectory,
-      shell: tool.shell ?? false,
-      detach: tool.detach ?? true,
-      suggestDeploy: true,
-    });
-    log("info", "[vortex-mcp] launched game", { gameId: targetGameId, toolId, path: tool.path });
-    return;
+    // A recorded tool can outlive the file it points at: profiles carry their
+    // tools with them, so a seeded or restored instance routinely names a path
+    // that no longer exists. Vortex spawns it regardless, the process dies at
+    // once, and the launch "succeeds" — so an unusable tool is worse than none.
+    // Prefer the game's own executable in that case rather than launching a
+    // path that cannot work.
+    if (await executableMissing(tool.path)) {
+      log("warn", "[vortex-mcp] primary tool is missing; falling back to the game executable", {
+        gameId: targetGameId,
+        toolId,
+        path: tool.path,
+      });
+    } else {
+      await api.runExecutable(tool.path, tool.parameters ?? [], {
+        cwd: tool.workingDirectory,
+        shell: tool.shell ?? false,
+        detach: tool.detach ?? true,
+        suggestDeploy: true,
+      });
+      log("info", "[vortex-mcp] launched game", { gameId: targetGameId, toolId, path: tool.path });
+      return tool.path;
+    }
   }
 
   // No primary tool: fall back to the game's own executable, which is what
@@ -1513,6 +1528,22 @@ export async function launchGame(
     gameId: targetGameId,
     path: fullPath,
   });
+  return fullPath;
+}
+
+/**
+ * Whether a recorded executable no longer exists.
+ *
+ * Treats an unreadable path as missing: the question being asked is "can this be
+ * launched", and anything that cannot be stat'd cannot.
+ */
+async function executableMissing(executablePath: string): Promise<boolean> {
+  try {
+    await stat(executablePath);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 /**
