@@ -420,6 +420,11 @@ async function main(): Promise<number> {
     }
 
     case "collection": {
+      // Checked before anything is started or connected to. A collection cannot
+      // be fetched anonymously, so without a key this run is going to fail —
+      // and it should fail here, saying what to do, rather than after a cold
+      // start and a download that gets rejected.
+      requireApiKey(config);
       const mcp = await requireRunning(config);
       const target = typeof flags.url === "string" ? flags.url : positional[0];
       if (target === undefined) {

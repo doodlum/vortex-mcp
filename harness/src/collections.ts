@@ -215,14 +215,25 @@ export async function installCollection(
   const report = options.onProgress ?? ((): void => undefined);
   const timeoutMs = options.timeoutMs ?? 60 * 60 * 1000;
 
-  const loggedIn = await mcp.call<boolean>("vortex_query", { selector: "isLoggedIn" });
-  if (loggedIn !== true) {
+  // `isLoggedIn` is not the right question here. Vortex defines it as
+  // `truthy(APIKey) || truthy(OAuthCredentials)`, so an API key alone satisfies
+  // it — but this build authenticates collection downloads with OAuth, and an
+  // API key gets a 401 surfaced as "You are not logged in to Nexus Mods!" well
+  // after the download has been dispatched. Ask for what is actually needed.
+  const oauth = await mcp
+    .call<unknown>("vortex_query", {
+      path: ["confidential", "account", "nexus", "OAuthCredentials"],
+    })
+    .catch(() => undefined);
+  if (oauth === undefined || oauth === null) {
     throw new CollectionError(
-      "Not logged in to Nexus Mods, and collections cannot be downloaded anonymously.\n\n" +
-        "  Either sign in through Vortex's own Log in button, or set a personal API key:\n" +
-        "    https://next.nexusmods.com/settings/api-keys\n" +
-        "    echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env\n" +
-        "    pnpm run ai:up --fresh",
+      "Not signed in to Nexus with OAuth, and collection downloads require it on this\n" +
+        "Vortex build. An API key is NOT enough: it satisfies Vortex's isLoggedIn check,\n" +
+        "so the download starts and then fails with a 401.\n\n" +
+        "  Sign in through Vortex's own Log in button — the OAuth flow has a captcha,\n" +
+        "  so it cannot be automated and the user has to do it once.\n\n" +
+        "  It persists in the live instance, but NOT across `up --fresh`, which\n" +
+        "  re-seeds from the snapshot.\n",
     );
   }
 

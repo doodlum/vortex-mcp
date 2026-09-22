@@ -217,15 +217,30 @@ export function extensionRoot(): string {
 
 export const MCP_EXTENSION_ID = "vortex-mcp";
 
-/** Throw a directly actionable error when the one optional secret is missing. */
+/**
+ * The Nexus API key, or a directly actionable error saying how to supply one.
+ *
+ * Call this **before** starting or connecting to anything, in any operation that
+ * touches Nexus. Everything else in this harness works signed out, so the key is
+ * checked at the point of need rather than at startup — but at that point it is
+ * a hard requirement, and the run should stop here saying what is missing rather
+ * than cold-start an instance and fail on a rejected download minutes later.
+ *
+ * A key cannot be guessed, derived, or read out of an existing Vortex install —
+ * it is the user's credential. An agent that hits this asks the user for one and
+ * writes it to `harness/.env` once; it is gitignored and reused from then on.
+ */
 export function requireApiKey(config: HarnessConfig): string {
   if (config.apiKey === undefined || config.apiKey.trim() === "") {
     throw new ConfigError(
-      "No Nexus API key configured. It is only needed for Nexus downloads; everything else " +
-        "works signed out.\n\n" +
+      "No Nexus API key configured, and this operation needs one — Nexus downloads " +
+        "cannot be made anonymously.\n\n" +
+        "  Ask the user for a personal API key; it is theirs to give and cannot be " +
+        "obtained any other way.\n\n" +
         "  1. Open https://next.nexusmods.com/settings/api-keys\n" +
-        "  2. Copy your personal API key\n" +
-        "  3. echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env\n",
+        "  2. Copy the personal API key\n" +
+        "  3. echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env   # gitignored\n\n" +
+        "  Stored once, it is reused by every later run, including cold ones.\n",
     );
   }
   return config.apiKey.trim();

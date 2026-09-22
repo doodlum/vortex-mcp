@@ -52,7 +52,7 @@ a change to Vortex:
   inside this repo, and builds it. No fork yet? It stops and tells you how to
   make one; the suite builds _your_ fork because you cannot push to upstream.
 
-Plus, optionally: **a Nexus Mods personal API key — only for Nexus downloads.**
+Plus, for anything that talks to Nexus: **a Nexus Mods personal API key.**
 
 Everything else works signed out: driving the UI, managing a game, installing a
 mod from a local archive, deploying, purging, responsive testing, hot reload.
@@ -61,16 +61,39 @@ mod from a local archive, deploying, purging, responsive testing, hot reload.
 echo 'VORTEX_AI_NEXUS_API_KEY=<your key>' >> harness/.env   # gitignored
 ```
 
-### Why an API key, and not a username and password
+### The rule for credentials
+
+**Check for a key before starting anything that needs one, and if it is absent,
+ask the user for it.** A key is the user's credential: it cannot be guessed,
+derived, or read out of an existing Vortex install, so there is nothing to fall
+back on and nothing to infer. `requireApiKey()` is that check, and Nexus-facing
+commands call it before they launch or connect to anything — a run that is going
+to fail on authentication should say so up front, not after a cold start and a
+rejected download.
+
+Store it once in `harness/.env`. It is gitignored, it survives `up --fresh`, and
+every later run reuses it. Never commit it, and never print it.
+
+### An API key is not enough for collections
 
 Vortex's `isLoggedIn` is
-`truthy(state.confidential.account.nexus.APIKey) || truthy(...OAuthCredentials)`.
-Setting the API key is therefore a _complete_ login as far as the app is
-concerned — no browser, no OAuth redirect, and critically **no captcha**.
+`truthy(state.confidential.account.nexus.APIKey) || truthy(...OAuthCredentials)`,
+so an API key satisfies it — no browser, no redirect, **no captcha** — and that
+is enough for the API calls the harness makes directly.
 
-The captcha is exactly why Vortex's own E2E suite has an interactive
-`auth:capture` step a human has to sit through. That can never satisfy "from
-scratch with no user input". An API key can.
+It is **not** enough to download a collection. This Vortex build authenticates
+that path with OAuth, so with only an API key the download is dispatched and
+then fails with a 401, surfaced as _"You are not logged in to Nexus Mods!"_ —
+long after `isLoggedIn` said yes. `installCollection` therefore checks for
+`OAuthCredentials` specifically and refuses up front.
+
+OAuth means the captcha, which is exactly why Vortex's own E2E suite has an
+interactive `auth:capture` step a human sits through. So **collections cannot be
+installed "from scratch with no user input"** on this build: someone has to click
+Log in once. That login lives in the live instance and does _not_ survive
+`up --fresh`, which re-seeds from the snapshot.
+
+Everything else in this suite still meets the no-user-input bar.
 
 ### Everything else is checked for you
 
