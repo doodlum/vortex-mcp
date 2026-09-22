@@ -15,6 +15,7 @@ import { readMarker, snapshotDir, liveDir } from "./bootstrap";
 import { extensionRoot, findInstalledVortex, type HarnessConfig } from "./config";
 import { KNOWN_GAMES, findGamePath, steamLibraryRoots } from "./gameSetup";
 import { VortexMcpClient } from "./mcpClient";
+import { detectGitHubUser, hasVortexSource, vortexSourceDir } from "./source";
 
 export interface Check {
   name: string;
@@ -35,6 +36,7 @@ export async function runDoctor(config: HarnessConfig): Promise<DoctorReport> {
   const checks: Check[] = [];
 
   checks.push(checkApiKey(config));
+  checks.push(await checkSource());
   checks.push(checkVortex(config));
   checks.push(checkExtension());
   checks.push(checkGame(config));
@@ -68,6 +70,31 @@ function checkApiKey(config: HarnessConfig): Check {
  * whole system is built to work against a released install, and silently
  * falling back to something else would hide the thing worth knowing.
  */
+/**
+ * The Vortex clone this repo manages.
+ *
+ * Advisory, not required: you can drive an installed Vortex without ever
+ * cloning. But when the task is working ON Vortex, this is the first thing that
+ * has to exist, so it is reported before the target.
+ */
+async function checkSource(): Promise<Check> {
+  const dir = vortexSourceDir();
+  if (hasVortexSource(dir)) {
+    return { name: "Vortex source", ok: true, advisory: true, detail: dir };
+  }
+  const user = await detectGitHubUser();
+  return {
+    name: "Vortex source",
+    ok: false,
+    advisory: true,
+    detail:
+      user === undefined
+        ? "not cloned; could not detect your GitHub user either"
+        : `not cloned (would use github.com/${user}/Vortex)`,
+    fix: "pnpm run ai:source",
+  };
+}
+
 function checkVortex(config: HarnessConfig): Check {
   const { target } = config;
   if (target.executable === "" || !fs.existsSync(target.executable)) {

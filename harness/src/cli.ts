@@ -26,6 +26,14 @@ import { ensureExtensionBuilt } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
+import {
+  buildVortexSource,
+  detectGitHubUser,
+  ensureVortexSource,
+  hasVortexSource,
+  resolveVortexRepo,
+  vortexSourceDir,
+} from "./source";
 
 interface ParsedArgs {
   command: string;
@@ -68,10 +76,15 @@ function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
   const overrides: Partial<HarnessConfig> = {};
   if (typeof flags.game === "string") overrides.gameId = flags.game;
   if (typeof flags["game-path"] === "string") overrides.gamePath = flags["game-path"];
-  if (typeof flags["dev-dir"] === "string" || typeof flags.exe === "string") {
+  if (
+    typeof flags["dev-dir"] === "string" ||
+    typeof flags.exe === "string" ||
+    flags.installed === true
+  ) {
     overrides.target = resolveTarget({
       devDir: typeof flags["dev-dir"] === "string" ? flags["dev-dir"] : undefined,
       exe: typeof flags.exe === "string" ? flags.exe : undefined,
+      preferInstalled: flags.installed === true,
     });
   }
   if (typeof flags.port === "string") overrides.mcpPort = Number(flags.port);
@@ -106,6 +119,12 @@ Drives a stock, officially released Vortex. No patched build required.
 
 Setup
   doctor                 Check everything needed, and say what is missing
+  source                 Find your Vortex fork on GitHub, clone it into
+                         .vortex-src here, and build it. Everything needed to go
+                         from a fresh checkout to building Vortex.
+    --update             Fetch origin + upstream on an existing clone
+    --no-build           Clone only; skip install and build
+    --where              Print the clone path and exit
   bootstrap              Build the cached, logged-in profile (cold; run once)
     --rebuild-snapshot   Discard the cache and rebuild it from cold
     --rebuild-extension  Rebuild the extension from source first
@@ -138,7 +157,9 @@ Testing
     --build              Rebuild the extension yourself on each change
 
 Which Vortex
-  (default)              The installed, released Vortex
+  (default)              The .vortex-src clone if present, else the installed
+                         released Vortex
+  --installed            Force the installed build even when a clone exists
   --exe <path>           A specific Vortex.exe
   --dev-dir <path>       A Vortex source checkout — only needed to hot-reload
                          changes to Vortex's OWN renderer code
@@ -344,6 +365,39 @@ async function main(): Promise<number> {
         fullPage: flags["full-page"] === true,
       });
       log(file);
+      return 0;
+    }
+
+    case "source": {
+      // Everything needed to go from "just cloned this repo" to "can build and
+      // test Vortex", in one command.
+      if (flags.where === true) {
+        log(vortexSourceDir());
+        return 0;
+      }
+
+      if (!hasVortexSource() || flags.update === true) {
+        if (!hasVortexSource()) {
+          const user = await detectGitHubUser();
+          log(`GitHub user: ${user ?? "(unknown)"}`);
+          const repo = await resolveVortexRepo();
+          log(`Fork:        ${repo.fullName}`);
+        }
+        const source = await ensureVortexSource({
+          update: flags.update === true,
+          onProgress: (m) => log(`  ${m}`),
+        });
+        log(source.cloned ? `Cloned to ${source.dir}` : `Using existing clone at ${source.dir}`);
+      } else {
+        log(`Clone already present at ${vortexSourceDir()}`);
+      }
+
+      if (flags.build !== false && flags["no-build"] !== true) {
+        await buildVortexSource({ onProgress: (m) => log(`  ${m}`) });
+      }
+
+      log("");
+      log("Ready. `pnpm run ai:up` will now drive this clone.");
       return 0;
     }
 

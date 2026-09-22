@@ -68,8 +68,13 @@ function fingerprint(value: string): string {
 export const ANONYMOUS = "anonymous";
 
 export function snapshotDir(config: HarnessConfig, apiKey: string): string {
+  // The target is part of the key because the two builds are not
+  // interchangeable: a released Vortex keeps startup.json under appData/Vortex
+  // and a source checkout under appData/@vortex/main, so reusing one build's
+  // snapshot for the other makes Vortex quit on a missing startup.json.
   const key = fingerprint(
-    `${String(SNAPSHOT_SCHEMA_VERSION)}:${apiKey}:${config.gameId}:${config.gamePath ?? "auto"}`,
+    `${String(SNAPSHOT_SCHEMA_VERSION)}:${apiKey}:${config.gameId}:${config.gamePath ?? "auto"}:` +
+      `${config.target.kind}:${config.target.appName}`,
   );
   return path.join(config.cacheDir, `snapshot-${key}`);
 }
@@ -210,8 +215,11 @@ export async function bootstrap(
     fs.cpSync(snapshot, live, { recursive: true });
   }
 
-  // Always refresh the extension: it is the thing most likely to have been
-  // rebuilt since the snapshot was taken, and copying it is trivially cheap.
+  // Both are idempotent, and both matter on the warm path, which does not go
+  // through buildSnapshot: the extension is the thing most likely to have been
+  // rebuilt since the snapshot was taken, and the appData layout must exist
+  // before Vortex starts.
+  prepareUserDataDir(live, config.target.appName);
   installMcpExtension(live);
 
   report(`launching Vortex (${tier})`);

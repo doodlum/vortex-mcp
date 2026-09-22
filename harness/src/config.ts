@@ -115,6 +115,18 @@ function installedVortexCandidates(): string[] {
   ].filter((p) => p !== "");
 }
 
+/**
+ * The Vortex clone this repo manages, at `.vortex-src`, or undefined.
+ *
+ * Deliberately the only place a source checkout is looked for. The suite never
+ * goes hunting around the filesystem for a Vortex repo: "some checkout
+ * somewhere" is not something it can reason about, build from, or push to.
+ */
+function managedSourceDir(): string | undefined {
+  const dir = process.env.VORTEX_AI_SOURCE_DIR ?? path.join(REPO_ROOT, ".vortex-src");
+  return fs.existsSync(path.join(dir, "src", "main", "package.json")) ? dir : undefined;
+}
+
 export function findInstalledVortex(): string | undefined {
   const explicit = process.env.VORTEX_AI_EXE;
   if (explicit !== undefined && explicit !== "" && fs.existsSync(explicit)) return explicit;
@@ -122,14 +134,21 @@ export function findInstalledVortex(): string | undefined {
 }
 
 /**
- * Resolve how to start Vortex, preferring a real installation.
+ * Resolve how to start Vortex.
  *
- * A source checkout is used only when explicitly pointed at, because running
- * against the released build is the case that proves the extension needs no
- * patched Vortex.
+ * The extension itself is written to work against a stock released build, and
+ * that constraint still holds — but this suite's job is building and testing
+ * Vortex, so a clone it manages takes precedence once one exists.
  */
-export function resolveTarget(overrides: { devDir?: string; exe?: string } = {}): VortexTarget {
-  const devDir = overrides.devDir ?? process.env.VORTEX_AI_DEV_DIR;
+export function resolveTarget(
+  overrides: { devDir?: string; exe?: string; preferInstalled?: boolean } = {},
+): VortexTarget {
+  // Precedence: an explicit --dev-dir, then the clone this repo manages, then an
+  // installed Vortex. The clone wins because if you have gone to the trouble of
+  // cloning Vortex here, working on it is the whole point — but --installed
+  // puts the released build back in front.
+  const managed = overrides.preferInstalled === true ? undefined : managedSourceDir();
+  const devDir = overrides.devDir ?? process.env.VORTEX_AI_DEV_DIR ?? managed;
   if (devDir !== undefined && devDir !== "") {
     const mainDir = path.join(devDir, "src", "main");
     const resolved = fs.existsSync(mainDir) ? mainDir : devDir;
@@ -144,13 +163,15 @@ export function resolveTarget(overrides: { devDir?: string; exe?: string } = {})
 
   const exe = overrides.exe ?? findInstalledVortex();
   if (exe === undefined) {
-    throw new ConfigError(
-      "Could not find an installed Vortex.\n\n" +
-        "  Install it from https://www.nexusmods.com/about/vortex/ — the harness drives the\n" +
-        "  released build and needs no patched or self-built copy.\n\n" +
-        "  Installed somewhere unusual? Set VORTEX_AI_EXE to its Vortex.exe.\n" +
-        "  Working on Vortex itself? Point VORTEX_AI_DEV_DIR at your checkout instead.",
-    );
+    throw new ConfigError(`No Vortex to drive.
+
+  Work on Vortex itself:     pnpm run ai:source
+     (finds your GitHub fork, clones it into .vortex-src here, and builds it)
+
+  Or drive a released build:  install it from
+     https://www.nexusmods.com/about/vortex/
+
+  Or point at one directly:   VORTEX_AI_EXE / VORTEX_AI_DEV_DIR`);
   }
   return { kind: "installed", executable: exe, args: [], appName: "Vortex" };
 }

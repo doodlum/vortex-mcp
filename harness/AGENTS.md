@@ -43,8 +43,16 @@ a change to Vortex:
 
 ## What you have to provide
 
-1. **Vortex, installed.** <https://www.nexusmods.com/about/vortex/>
-2. **A Nexus Mods personal API key — only if you want Nexus downloads.**
+**One of these**, depending on what you are doing:
+
+- **Driving Vortex** (the common case) — an installed Vortex:
+  <https://www.nexusmods.com/about/vortex/>
+- **Working on Vortex** — a GitHub fork of `Nexus-Mods/Vortex`. Run
+  `pnpm run ai:source` and it finds your fork, clones it to `.vortex-src/`
+  inside this repo, and builds it. No fork yet? It stops and tells you how to
+  make one; the suite builds _your_ fork because you cannot push to upstream.
+
+Plus, optionally: **a Nexus Mods personal API key — only for Nexus downloads.**
 
 Everything else works signed out: driving the UI, managing a game, installing a
 mod from a local archive, deploying, purging, responsive testing, hot reload.
@@ -206,13 +214,17 @@ Reloading the renderer re-runs extension initialisation, so your new tool code i
 live without restarting Vortex. It deliberately does not own the build, so it
 composes with whatever produced the output.
 
-Working on **Vortex itself** rather than the extension? Point the harness at a
-source checkout and it will also watch Vortex's renderer bundle:
+Working on **Vortex itself** rather than the extension? Once `ai:source` has
+cloned it, `ai:up` drives that clone automatically and `watch` also watches
+Vortex's own renderer bundle:
 
 ```bash
-pnpm run ai -- up --dev-dir C:/dev/vortex
-pnpm run ai -- watch
+pnpm run ai:source        # once
+pnpm run ai:up            # now targets .vortex-src
+pnpm run ai:watch
 ```
+
+`--installed` forces the released build back to the front when you want it.
 
 A change to Vortex's **main** process can never be hot-reloaded — nothing in the
 renderer can reload main — so `watch` says so explicitly instead of reloading and

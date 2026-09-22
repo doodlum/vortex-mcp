@@ -25,6 +25,7 @@
     "ci": "pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run test && pnpm run build",
     "ai": "tsx harness/src/cli.ts",
     "ai:doctor": "tsx harness/src/cli.ts doctor",
+    "ai:source": "tsx harness/src/cli.ts source",
     "ai:up": "tsx harness/src/cli.ts up",
     "ai:down": "tsx harness/src/cli.ts down",
     "ai:watch": "tsx harness/src/cli.ts watch",

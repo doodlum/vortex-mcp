@@ -292,21 +292,34 @@ async function manageGameViaUi(
 
   // Reveal the tile's actions with a REAL hover.
   //
-  // Vortex hides them in a `.hover-content` wrapper at `opacity: 0`, revealed by
-  // a CSS `:hover` rule. `ui_hover` dispatches DOM events, which run React
-  // handlers but never change the browser's own hover state — so the button
-  // stays at opacity 0 and the snapshot correctly reports it as hidden. Only a
-  // real mouse move, which is CDP-only, works here.
-  const tile = `.game-thumbnail:has(img[alt="${gameName}"])`;
-  await realHover(config, tile);
+  // Vortex hides them in a wrapper at `opacity: 0`, revealed by a CSS `:hover`
+  // rule. `ui_hover` dispatches DOM events, which run React handlers but never
+  // change the browser's own hover state — so the button stays transparent and
+  // the snapshot correctly reports it hidden. Only a real mouse move, which is
+  // CDP-only, does it.
+  //
+  // The markup differs between Vortex versions, so try the specific class first
+  // and fall back to anything game-ish wrapping this game's artwork. Matching on
+  // the image's alt text is what keeps "Fallout 4" from hitting "Fallout 4 VR".
+  const tile = await realHoverFirst(config, [
+    `.game-thumbnail:has(img[alt="${gameName}"])`,
+    `.game-list-item:has(img[alt="${gameName}"])`,
+    `[class*="game"]:has(> img[alt="${gameName}"])`,
+    `[class*="game"]:has(img[alt="${gameName}"])`,
+  ]);
   await new Promise((resolve) => setTimeout(resolve, 800));
 
-  // Prefer Vortex's own stable class over the label, which differs across
+  // Prefer Vortex's own stable class over the label, which moves between
   // versions ("Manage" on 2.6.x, "Add game" on newer layouts).
-  await mcp.call("ui_click", { selector: `${tile} button.action-manage` }).catch(async () => {
+  const clicked = await tryClick(mcp, [
+    ...(tile === undefined ? [] : [`${tile} button.action-manage`]),
+    "button.action-manage",
+  ]);
+
+  if (!clicked) {
     const manage = await waitForNode(mcp, { role: "button", name: /^(manage|add game)$/i }, 15_000);
     await mcp.call("ui_click", { ref: manage.ref });
-  });
+  }
 
   // "Game not discovered" should not appear — the path was registered before
   // this ran — but a stale discovery entry can still produce it, and leaving it
@@ -316,6 +329,34 @@ async function manageGameViaUi(
     const cont = findNodes(dialog, { role: "button", name: "Continue" })[0];
     if (cont !== undefined) await mcp.call("ui_click", { ref: cont.ref });
   }
+}
+
+/** Real-hover the first selector that matches, returning it. */
+async function realHoverFirst(
+  config: HarnessConfig,
+  selectors: string[],
+): Promise<string | undefined> {
+  for (const selector of selectors) {
+    try {
+      await realHover(config, selector, { timeoutMs: 4_000 });
+      return selector;
+    } catch {
+      // Try the next shape of markup.
+    }
+  }
+  return undefined;
+}
+
+/** Click the first selector that resolves; false when none do. */
+async function tryClick(mcp: VortexMcpClient, selectors: string[]): Promise<boolean> {
+  for (const selector of selectors) {
+    const ok = await mcp
+      .call("ui_click", { selector })
+      .then(() => true)
+      .catch(() => false);
+    if (ok) return true;
+  }
+  return false;
 }
 
 /** The games filter box, by test id where available and by role otherwise. */

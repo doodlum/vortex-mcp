@@ -1,0 +1,79 @@
+---
+name: vortex-dev
+description: Fix a bug in Vortex, add a feature to it, or reproduce and test a change in the real app. Use for any request about Vortex's own behaviour — "this is broken", "add X to the mods page", "does Y still happen" — as opposed to work on this MCP/automation suite itself. Covers getting the fork cloned and built, making the change, and verifying it in a running Vortex.
+---
+
+# Working on Vortex itself
+
+A request to fix, test or add something means **Vortex the application**, not
+this automation suite — unless the user explicitly says otherwise. Do the whole
+loop without asking: get the source, build it, run it, drive it, report what
+actually happened.
+
+## One-time: get the source
+
+```bash
+pnpm run ai:source
+```
+
+Finds the operator's Vortex fork on GitHub, clones it to `.vortex-src/` inside
+this repo, wires up `upstream`, installs and builds. If they have no fork it
+stops and tells them how to make one — the suite builds _their_ fork, because
+you cannot push to `Nexus-Mods/Vortex`.
+
+It never searches the filesystem for a Vortex checkout. `.vortex-src` is the
+only source tree, and it is gitignored.
+
+`pnpm run ai:doctor` reports whether it is there before anything else.
+
+## The loop
+
+```bash
+pnpm run ai:up            # drives .vortex-src automatically once it exists
+pnpm run ai:watch         # reload on rebuild, in a second shell
+```
+
+Then make the change in `.vortex-src/`, rebuild, and the running app picks it up.
+
+| Change               | Rebuild                              | Picked up by                      |
+| -------------------- | ------------------------------------ | --------------------------------- |
+| Renderer (React, UI) | `pnpm nx run @vortex/renderer:build` | `ai:watch` → renderer reload      |
+| Main process         | `node src/main/build.mjs`            | full restart (`ai:down && ai:up`) |
+| This extension       | `pnpm run build` (in this repo)      | `ai:watch` → renderer reload      |
+
+Nothing in the renderer can reload main — `watch` says so explicitly rather than
+reloading and appearing to do nothing.
+
+## Verifying a change
+
+Drive the real app rather than reasoning about the diff. See the
+`drive-vortex` skill for the snapshot → act → wait loop, and:
+
+```bash
+pnpm run ai -- screenshot --label after
+pnpm run ai -- responsive --screenshots     # if the change touches layout
+```
+
+Unit tests are scoped from the owning project directory — the root `test`
+script runs the whole nx graph and cannot be narrowed:
+
+```bash
+cd .vortex-src/src/renderer && pnpm exec vitest run <path>
+```
+
+Be honest about which suite ran. A full `pnpm run verify` in Vortex can fail for
+reasons that predate the change (broken bundled extensions with missing native
+modules); say so rather than reporting it as a regression or hiding it.
+
+## Git
+
+Branch from `master`; never commit to it. `origin` is the fork, `upstream` is
+`Nexus-Mods/Vortex` — push to `origin`. Don't commit, push or open a PR unless
+asked.
+
+## Before blaming your change
+
+`KNOWLEDGE.md` in this repo catalogues Vortex behaviours that fail _silently_ —
+an extension parsed as ESM, a game that will not activate, a snapshot that comes
+back empty. Several look exactly like a bug you just introduced. Check there
+first.

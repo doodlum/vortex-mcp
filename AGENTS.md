@@ -13,18 +13,33 @@ nothing here requires a patched or self-built Vortex.
 | `harness/AGENTS.md` | **The operating manual.** Start here to actually use any of this                 |
 | `KNOWLEDGE.md`      | Non-obvious Vortex behaviours that fail silently. Read before debugging          |
 | `ARCHITECTURE.md`   | Why the extension reflects Vortex's API instead of wrapping it                   |
-| `.claude/skills/`   | Skills for driving Vortex and writing UI tests                                   |
+| `.claude/skills/`   | Skills: working on Vortex, driving its UI, writing UI tests                      |
+| `.vortex-src/`      | The Vortex clone this suite manages (gitignored, created by `ai:source`)         |
 
 ## Getting to a driveable Vortex
 
 ```bash
 pnpm install
-pnpm run build
+pnpm run build        # build the extension
 pnpm run ai:doctor    # reports every prerequisite and how to fix it
 pnpm run ai:up        # prints the `claude mcp add` line for your agent
 ```
 
-Requires an **installed** Vortex (<https://www.nexusmods.com/about/vortex/>).
+That drives your **installed** Vortex
+(<https://www.nexusmods.com/about/vortex/>).
+
+To work on Vortex's own code instead:
+
+```bash
+pnpm run ai:source    # finds YOUR GitHub fork, clones it to .vortex-src, builds it
+pnpm run ai:up        # now drives that clone
+```
+
+`ai:source` looks your fork up on GitHub from the identity git already knows —
+no `gh auth login` needed — and stops with instructions if you do not have one
+yet. It clones **inside this repo**; the suite never searches the filesystem for
+a Vortex checkout, so there is exactly one source tree and it is gitignored.
+
 A Nexus API key is optional and only enables Nexus downloads.
 
 ## Verification

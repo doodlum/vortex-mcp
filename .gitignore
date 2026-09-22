@@ -3,3 +3,6 @@ dist/
 *.log
 .env
 coverage/
+
+# Vortex clone this suite manages (see harness/src/source.ts)
+.vortex-src/
