@@ -22,7 +22,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { MCP_EXTENSION_ID, type HarnessConfig } from "./config";
+import { ConfigError, MCP_EXTENSION_ID, type HarnessConfig } from "./config";
 import { ensureGameManaged, type EnsureGameResult } from "./gameSetup";
 import {
   ensureExtensionBuilt,
@@ -51,6 +51,15 @@ export interface SnapshotMarker {
   createdAt: string;
   /** Fingerprint of the API key — never the key itself. */
   apiKeyFingerprint: string;
+  /**
+   * Whether an interactive Nexus login was captured into this snapshot.
+   *
+   * Recorded as a flag rather than detected by inspecting the stored
+   * credential: knowing *that* someone logged in is all the harness needs, and
+   * reading the credential to find out would be handling a secret for no
+   * reason.
+   */
+  loginCaptured?: boolean;
 }
 
 function fingerprint(value: string): string {
@@ -239,6 +248,16 @@ export async function bootstrap(
       : `active game: ${game.gameId} (${game.gamePath})`,
   );
 
+  // Said on every start until it is done, because the cost of not knowing is
+  // paid much later: collections are the one thing an API key cannot buy, and
+  // the failure otherwise shows up as a download that 401s minutes into a run.
+  if (readMarker(snapshot)?.loginCaptured !== true) {
+    report(
+      "no Nexus login captured yet — collections will not install. Log in through " +
+        "Vortex's Log in button, then run `vortex-ai save-login` once.",
+    );
+  }
+
   return { instance, tier: liveUsable ? "warm" : tier, game, elapsedMs: Date.now() - started };
 }
 
@@ -250,6 +269,59 @@ export async function bootstrap(
  * half-written state database, and the damage would not show up until some
  * later warm start behaved oddly.
  */
+/**
+ * Promote the running instance's working directory to be the new snapshot.
+ *
+ * This is how an interactive Nexus login is kept. Collections need OAuth, OAuth
+ * needs a captcha, and a captcha cannot be automated — so the login is done by
+ * hand once and then has to survive, or every `--fresh` costs another one.
+ *
+ * It copies the directory wholesale rather than reading the credential out of
+ * Vortex's state and re-seeding it the way the API key is. Copying keeps the
+ * secret as opaque bytes that this code never looks at, which is both safer and
+ * considerably less work than reproducing whatever shape Vortex stores tokens
+ * in. Vortex is shut down cleanly first: it flushes pending state on window
+ * close, and a snapshot taken around a half-written state database is worse
+ * than no snapshot, because it fails much later and looks like corruption.
+ */
+export async function captureLogin(
+  config: HarnessConfig,
+  options: { onProgress?: (message: string) => void } = {},
+): Promise<string> {
+  const report = options.onProgress ?? ((): void => undefined);
+  const live = liveDir(config);
+  if (!fs.existsSync(path.join(live, "userData"))) {
+    throw new ConfigError(
+      "There is no working directory to capture. Start an instance with `vortex-ai up`, " +
+        "log in through Vortex's Log in button, then run this again.",
+    );
+  }
+
+  const apiKey =
+    config.apiKey?.trim() === "" || config.apiKey === undefined ? ANONYMOUS : config.apiKey.trim();
+  const snapshot = snapshotDir(config, apiKey);
+  const existing = readMarker(snapshot);
+
+  report("stopping Vortex so its state is flushed to disk");
+  await stopStaleInstance(config);
+
+  report("copying the working directory over the snapshot");
+  removeInstanceDir(snapshot);
+  fs.cpSync(live, snapshot, { recursive: true });
+
+  const marker: SnapshotMarker = {
+    schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+    gameId: config.gameId,
+    gamePath: existing?.gamePath ?? config.gamePath ?? "",
+    createdAt: new Date().toISOString(),
+    apiKeyFingerprint: fingerprint(apiKey),
+    loginCaptured: true,
+  };
+  fs.writeFileSync(path.join(snapshot, MARKER_FILE), JSON.stringify(marker, null, 2));
+  report(`snapshot updated at ${snapshot}`);
+  return snapshot;
+}
+
 async function buildSnapshot(
   config: HarnessConfig,
   apiKey: string,
@@ -309,6 +381,7 @@ async function buildSnapshot(
     gamePath: game.gamePath,
     createdAt: new Date().toISOString(),
     apiKeyFingerprint: fingerprint(apiKey),
+    loginCaptured: false,
   };
   fs.writeFileSync(path.join(snapshot, MARKER_FILE), JSON.stringify(marker, null, 2));
   report(`cold: snapshot cached at ${snapshot}`);

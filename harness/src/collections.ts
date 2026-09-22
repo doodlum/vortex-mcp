@@ -232,8 +232,8 @@ export async function installCollection(
         "so the download starts and then fails with a 401.\n\n" +
         "  Sign in through Vortex's own Log in button — the OAuth flow has a captcha,\n" +
         "  so it cannot be automated and the user has to do it once.\n\n" +
-        "  It persists in the live instance, but NOT across `up --fresh`, which\n" +
-        "  re-seeds from the snapshot.\n",
+        "  Then run `vortex-ai save-login` once: it folds the signed-in instance\n" +
+        "  into the snapshot, so cold starts restore the login instead of losing it.\n",
     );
   }
 

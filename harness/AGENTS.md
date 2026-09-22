@@ -87,11 +87,32 @@ then fails with a 401, surfaced as _"You are not logged in to Nexus Mods!"_ —
 long after `isLoggedIn` said yes. `installCollection` therefore checks for
 `OAuthCredentials` specifically and refuses up front.
 
-### Automating the OAuth step
+### Setup requires logging in once, by hand
 
-Clicking **Log in** opens a dialog that says _"Please click 'authorise' on the
-website"_ and sends the default browser to Nexus's consent page. What happens
-there decides whether an agent can finish it:
+**This is a required setup step, not an optional extra.** Collections are
+authenticated with OAuth, OAuth means a captcha, and a captcha cannot be
+automated by anyone — so one interactive login has to happen before the suite
+can install a collection:
+
+```bash
+pnpm run ai:up                 # start an instance
+#  ... click Log in in Vortex, complete the Nexus flow in the browser ...
+pnpm run ai -- save-login      # fold that login into the snapshot
+```
+
+`save-login` copies the working directory over the snapshot, so every later
+cold start — `up --fresh` included — comes up already signed in. Do it once per
+machine. Until it is done, `up` says so on every start, because otherwise the
+omission surfaces much later as a download that 401s minutes into a run.
+
+It copies the directory wholesale rather than reading the token out of Vortex's
+state: the credential stays opaque bytes that the harness never inspects, which
+is both safer and less brittle than reproducing whatever shape Vortex stores
+tokens in.
+
+If the login is ever revoked or expires, log in again and re-run `save-login`.
+
+### What an agent can and cannot drive here
 
 | In the browser Vortex opens      | Automatable?                        |
 | -------------------------------- | ----------------------------------- |
@@ -99,27 +120,15 @@ there decides whether an agent can finish it:
 | Signed out (email/password form) | **No** — credential entry           |
 | Captcha shown                    | **No** — never solve one            |
 
-So the whole thing hinges on the browser already holding a Nexus session. Give
-the agent a browser that has one and the consent click is ordinary automation;
-without it the flow lands on a password form and a captcha, and it stops there.
-
-Two things that make this awkward in practice, both worth knowing before
-planning around it:
+Two things that make this awkward in practice:
 
 - **An API key hides the Log in button.** It satisfies `isLoggedIn`, so Vortex
   shows an account as signed in and offers only **Logout**. Reaching the OAuth
   flow means logging out first — which is the user's session to end, so ask.
 - **Reading the OAuth URL out of `vortex.log` is not a shortcut.** Scraping logs
-  for authorisation URLs or tokens is credential handling, and is refused. Drive
-  the browser window Vortex opened instead.
-
-The credential itself lives in the live instance and does **not** survive
-`up --fresh`, which re-seeds from the snapshot. If a run needs collections,
-either keep the instance warm or expect to re-authorise once after a reset.
-
-So **collections cannot be installed "from scratch with no user input"** unless
-a signed-in browser is available to the agent. Everything else in this suite
-still meets that bar.
+  for authorisation URLs or tokens is credential handling, and is refused. The
+  dialog's own "Website didn't open?" field holds the same URL, which is the
+  affordance the app offers the user.
 
 ### Everything else is checked for you
 

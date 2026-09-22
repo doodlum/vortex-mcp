@@ -40,7 +40,27 @@ no `gh auth login` needed — and stops with instructions if you do not have one
 yet. It clones **inside this repo**; the suite never searches the filesystem for
 a Vortex checkout, so there is exactly one source tree and it is gitignored.
 
-A Nexus API key is optional and only enables Nexus downloads.
+## Signing in (one manual step, once per machine)
+
+A Nexus API key covers most Nexus access:
+
+```bash
+echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env   # gitignored
+```
+
+**Collections need more than that.** They are authenticated with OAuth, OAuth
+means a captcha, and a captcha cannot be automated — so one interactive login
+has to happen by hand:
+
+```bash
+pnpm run ai:up                 # start an instance
+#  ... click Log in in Vortex, finish the flow in the browser ...
+pnpm run ai -- save-login      # fold that login into the snapshot
+```
+
+After that every cold start, `up --fresh` included, comes up already signed in.
+`up` nags on every start until it is done. See `harness/AGENTS.md` for why an
+API key is not enough, and for what an agent can and cannot drive here.
 
 ## Verification
 

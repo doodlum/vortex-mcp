@@ -26,6 +26,7 @@ import { ensureExtensionBuilt } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
+import { captureLogin } from "./bootstrap";
 import { installCollection } from "./collections";
 import { deployMods, needsDeployment, purgeGame } from "./deployment";
 import {
@@ -148,6 +149,14 @@ Driving the UI (one-shot; needs a running instance)
   screenshot             Save a PNG of the window (captured over CDP)
     --full-page          Capture the whole scrollable page
   tools                  List every MCP tool the instance exposes
+
+Login
+  save-login             Capture the running instance's Nexus login into the
+                         snapshot, so cold starts restore it. Run this once,
+                         after logging in through Vortex's Log in button.
+                         Collections need OAuth, and OAuth needs a captcha that
+                         cannot be automated — so the login is done by hand once
+                         and reused from then on.
 
 Collections (needs a Nexus API key — they cannot be downloaded anonymously)
   collection <url>       Download and install a Nexus collection, then wait for
@@ -470,6 +479,16 @@ async function main(): Promise<number> {
       await purgeGame(mcp, { allowForeignPurge: true, onProgress: (m) => log(`  ${m}`) });
       log("");
       log(`Purged ${config.gameId}; the game directory is back to unmodded.`);
+      return 0;
+    }
+
+    case "save-login": {
+      const snapshot = await captureLogin(config, { onProgress: (m) => log(`  ${m}`) });
+      log("");
+      log("Login captured. `up --fresh` will now start already signed in.");
+      log(`  ${snapshot}`);
+      log("");
+      log("Vortex was stopped to flush its state; bring it back with `vortex-ai up`.");
       return 0;
     }
 
