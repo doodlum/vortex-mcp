@@ -11,6 +11,7 @@ import { z } from "zod";
 import type { types } from "@nexusmods/vortex-api";
 import { log } from "@nexusmods/vortex-api";
 import * as control from "./vortexControl";
+import * as ui from "./uiAutomation";
 
 type IExtensionApi = types.IExtensionApi;
 
@@ -127,6 +128,7 @@ function registerReadTools(server: McpServer, api: IExtensionApi): void {
   registerDownloadAndRuleTools(server, api);
   registerDiagnosticTools(server, api);
   registerDialogTools(server, api);
+  registerUiReadTools(server, api);
 }
 
 // Split from one large registerReadTools by domain — vortex_describe/scan_extension_actions/
@@ -1059,6 +1061,425 @@ function registerWriteTools(server: McpServer, api: IExtensionApi): void {
       // to flush before triggering it regardless.
       setTimeout(() => control.restartVortex(), 200);
       return { content: [{ type: "text", text: "Restarting Vortex..." }] };
+    },
+  );
+
+  registerUiWriteTools(server, api);
+}
+
+// ---------------------------------------------------------------------------
+// UI automation tools
+// ---------------------------------------------------------------------------
+
+// Shared target shape for every tool that acts on one element. `ref` is the
+// normal path (it comes straight out of ui_snapshot and survives virtualised
+// list recycling via the generation check); `selector` is the escape hatch for
+// something a snapshot pruned, and for stable hooks like [data-testid].
+const uiTargetSchema = {
+  ref: z
+    .string()
+    .optional()
+    .describe(
+      "Element ref from the most recent ui_snapshot (e.g. 'e42'). Refs are invalidated by the " +
+        "next ui_snapshot — a stale one throws rather than silently resolving to a different " +
+        "element, which matters because Vortex's mod/plugin tables are virtualised and recycle " +
+        "rows as they scroll.",
+    ),
+  selector: z
+    .string()
+    .optional()
+    .describe(
+      "CSS selector, as an alternative to `ref`. Prefer [data-testid=...] where one exists; " +
+        "Vortex's class names are largely generated and not stable across builds.",
+    ),
+};
+
+/**
+ * Read-only UI tools. These observe the renderer without changing it, so they
+ * follow the same no-token-needed rule as every other read tool here.
+ */
+function registerUiReadTools(server: McpServer, api: IExtensionApi): void {
+  const jsonText = makeJsonText(api);
+
+  server.registerTool(
+    "ui_snapshot",
+    {
+      description:
+        "Read what is actually ON SCREEN in Vortex right now, as a compact accessibility tree " +
+        "with a stable `ref` per node — the primary 'look at the UI' call, and the one that " +
+        "hands out the refs every ui_click/ui_fill/ui_hover consumes. Complements, rather than " +
+        "replaces, the state tools: vortex_query/list_mods tell you what Vortex BELIEVES, " +
+        "ui_snapshot tells you what it is SHOWING, and the two genuinely disagree (a pending " +
+        "render, a mod hidden by an active filter, a modal covering the page). Layout wrappers " +
+        "with no role, name, test id or own text are collapsed into their children, so the tree " +
+        "describes controls rather than React's div soup. Hidden elements are excluded by " +
+        "default. Any open modal's text is ALSO surfaced at the top level as `activeDialogs` — " +
+        "check it first when a click appears to do nothing, since a modal is the most common " +
+        "reason. Every call allocates a new ref generation and invalidates the previous one.",
+      inputSchema: z.object({
+        selector: z
+          .string()
+          .optional()
+          .describe("Snapshot only within this CSS selector. Defaults to the whole document body."),
+        includeHidden: z
+          .boolean()
+          .optional()
+          .describe("Include elements that are present but not visible. Defaults to false."),
+        maxDepth: z.number().int().optional().describe("Maximum tree depth. Defaults to 25."),
+        maxNodes: z
+          .number()
+          .int()
+          .optional()
+          .describe("Stop after this many nodes and set `truncated`. Defaults to 1500."),
+        includeBox: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include each node's bounding box. Off by default — roughly doubles the response " +
+              "size; turn it on when reasoning about layout or overlap.",
+          ),
+      }),
+    },
+    async ({ selector, includeHidden, maxDepth, maxNodes, includeBox }) => ({
+      content: [jsonText(ui.snapshot({ selector, includeHidden, maxDepth, maxNodes, includeBox }))],
+    }),
+  );
+
+  server.registerTool(
+    "ui_wait_for",
+    {
+      description:
+        "Poll until a CSS selector or a piece of visible text reaches the given state, then " +
+        "return how long it took. Use this instead of guessing at sleeps after an action that " +
+        "kicks off real work — installing a mod, deploying, switching profile — all of which " +
+        "take wildly variable wall-clock time. Returns `matched: false` on timeout rather than " +
+        "throwing, so a caller can branch on it; a timeout is not by itself an error, since " +
+        "'the notification never appeared' is sometimes the expected outcome.",
+      inputSchema: z.object({
+        selector: z.string().optional().describe("CSS selector to wait for."),
+        text: z
+          .string()
+          .optional()
+          .describe(
+            "Substring of the document's visible text to wait for. Use instead of selector.",
+          ),
+        state: z
+          .enum(["visible", "hidden", "attached", "detached"])
+          .optional()
+          .describe("State to wait for. Defaults to 'visible'."),
+        timeoutMs: z
+          .number()
+          .int()
+          .optional()
+          .describe("Give up after this long. Defaults to 10000."),
+        pollMs: z.number().int().optional().describe("Poll interval. Defaults to 100."),
+      }),
+    },
+    async ({ selector, text, state, timeoutMs, pollMs }) => ({
+      content: [jsonText(await ui.waitFor({ selector, text, state, timeoutMs, pollMs }))],
+    }),
+  );
+
+  server.registerTool(
+    "ui_get_viewport",
+    {
+      description:
+        "Report the Electron window's outer size, the renderer's inner (CSS px) size, and the " +
+        "device pixel ratio. The two sizes differ by the window chrome, so compare layout " +
+        "findings against `inner`, not `window`.",
+      inputSchema: z.object({}),
+    },
+    async () => ({ content: [jsonText(await ui.getViewport())] }),
+  );
+
+  server.registerTool(
+    "ui_detect_layout_issues",
+    {
+      description:
+        "Scan the rendered UI at its CURRENT size for responsive-layout breakage: content " +
+        "overflowing the right edge, elements pushed fully offscreen, text clipped by an " +
+        "overflow:hidden box with no way to scroll to it, and interactive targets that shrank " +
+        "below 24px. Heuristic and purely advisory — it reports, it never fails. A horizontal " +
+        "scrollbar on a deliberately-scrollable pane is normal and will show up here, so the " +
+        "caller decides what counts as a regression; the useful signal is a DIFFERENCE between " +
+        "two widths, which is what ui_responsive_sweep automates. Each issue carries a " +
+        "descriptive selector so it can be re-examined with ui_snapshot.",
+      inputSchema: z.object({
+        maxIssues: z.number().int().optional().describe("Cap the issue list. Defaults to 60."),
+      }),
+    },
+    async ({ maxIssues }) => ({ content: [jsonText(ui.detectLayoutIssues({ maxIssues }))] }),
+  );
+
+  server.registerTool(
+    "ui_read_console",
+    {
+      description:
+        "Read the renderer's console output and uncaught errors/rejections from an in-process " +
+        "ring buffer (500 entries, oldest dropped), captured since this extension loaded. This " +
+        "is the only way to see a React render error or a failed fetch over MCP: DevTools is " +
+        "not reachable from here, and Vortex's own log file only carries what Vortex explicitly " +
+        "logs, not what the browser runtime reports. Non-destructive — pass the returned " +
+        "`lastSeq` back as `since` to get only what is new. `dropped: true` means the buffer " +
+        "wrapped and entries were lost between your last poll and this one.",
+      inputSchema: z.object({
+        since: z.number().int().optional().describe("Only return entries after this seq."),
+        levels: z
+          .array(z.enum(["log", "info", "warn", "error", "debug"]))
+          .optional()
+          .describe("Filter to these levels. Omit for all."),
+        limit: z.number().int().optional().describe("Max entries returned. Defaults to 200."),
+      }),
+    },
+    async ({ since, levels, limit }) => ({
+      content: [jsonText(ui.readConsole({ since, levels, limit }))],
+    }),
+  );
+
+  server.registerTool(
+    "ui_screenshot",
+    {
+      description:
+        "Capture the Vortex window as a PNG image. Needs the `window:capturePage` addition to " +
+        "Vortex core — an extension cannot reach webContents.capturePage itself, because " +
+        "extensions are renderer-only in Vortex 2.x (onceMain is deprecated). Against a stock " +
+        "Vortex this throws with that explanation rather than failing obscurely; use ui_snapshot " +
+        "for structure, which needs no core change at all. Prefer ui_snapshot generally: it is " +
+        "far cheaper and it gives you refs to act on. Reach for a screenshot when the question " +
+        "is genuinely visual — spacing, overlap, theming, an icon that renders wrong.",
+      inputSchema: z.object({
+        x: z.number().int().optional().describe("Crop origin x. Omit to capture the whole window."),
+        y: z.number().int().optional().describe("Crop origin y."),
+        width: z.number().int().optional().describe("Crop width."),
+        height: z.number().int().optional().describe("Crop height."),
+      }),
+    },
+    async ({ x, y, width, height }) => {
+      const rect =
+        x !== undefined && y !== undefined && width !== undefined && height !== undefined
+          ? { x, y, width, height }
+          : undefined;
+      const base64 = await ui.captureScreenshot(rect);
+      return { content: [{ type: "image", data: base64, mimeType: "image/png" }] };
+    },
+  );
+}
+
+/**
+ * UI tools that change something — click, type, resize, reload.
+ *
+ * Write-tier for the same reason the Redux write tools are: these drive the
+ * user's real, logged-in Vortex. A click here can start a download, delete a mod
+ * or launch a game, so it sits behind the same VORTEX_MCP_TOKEN gate rather than
+ * being treated as harmless because it "only" moves a mouse. Resizing is in this
+ * tier too: it visibly moves the window of whoever is sitting in front of it.
+ */
+function registerUiWriteTools(server: McpServer, api: IExtensionApi): void {
+  const jsonText = makeJsonText(api);
+
+  server.registerTool(
+    "ui_click",
+    {
+      description:
+        "Click an element, addressed by `ref` from ui_snapshot or by CSS `selector`. Dispatches " +
+        "a full pointer/mouse sequence (pointerdown, mousedown, focus, pointerup, mouseup, " +
+        "click) rather than HTMLElement.click(), because several Vortex widgets — dropdown " +
+        "toggles, table row selection — listen on mousedown and ignore a bare click event. " +
+        "Refuses to click an invisible or disabled element with an explanatory error instead of " +
+        "silently doing nothing; pass requireActionable=false to force it anyway. Scrolls the " +
+        "element into view first. This performs a REAL action in a REAL Vortex: it can start " +
+        "downloads, remove mods, or launch a game.",
+      inputSchema: z.object({
+        ...uiTargetSchema,
+        button: z.enum(["left", "right", "middle"]).optional().describe("Defaults to 'left'."),
+        clickCount: z.number().int().optional().describe("2 for a double-click. Defaults to 1."),
+        modifiers: z
+          .array(z.enum(["Alt", "Control", "Meta", "Shift"]))
+          .optional()
+          .describe("Modifier keys held during the click (e.g. ['Control'] for multi-select)."),
+        requireActionable: z
+          .boolean()
+          .optional()
+          .describe(
+            "Throw when the element is hidden or disabled. Defaults to true — turning it off " +
+              "is for deliberately testing that a disabled control does nothing.",
+          ),
+      }),
+    },
+    async (args) => ({ content: [jsonText(ui.click(args))] }),
+  );
+
+  server.registerTool(
+    "ui_fill",
+    {
+      description:
+        "Set the value of an <input>, <textarea> or contenteditable, then fire input+change so " +
+        "React's onChange actually runs. Uses the prototype's native value setter first: " +
+        "assigning `.value` directly updates the DOM but leaves React's internal value tracker " +
+        "stale, so React swallows the event and the component never updates — the classic " +
+        "'typed into the box but nothing happened' failure. Replaces the existing value rather " +
+        "than appending. For a <select> use ui_select_option; for a button use ui_click.",
+      inputSchema: z.object({
+        ...uiTargetSchema,
+        value: z.string().describe("The full new value (replaces whatever is there)."),
+      }),
+    },
+    async (args) => ({ content: [jsonText(ui.fill(args))] }),
+  );
+
+  server.registerTool(
+    "ui_press_key",
+    {
+      description:
+        "Dispatch a keydown/keypress/keyup on a target element, or on whatever currently has " +
+        "focus when no target is given. Use for Escape (dismiss a Vortex modal), Enter (submit " +
+        "a search/filter), Tab, and arrow-key navigation. Note this dispatches DOM key events " +
+        "only — it does not drive the OS-level keyboard, so it will not reach a native menu or " +
+        "an OS file-picker dialog.",
+      inputSchema: z.object({
+        ...uiTargetSchema,
+        key: z
+          .string()
+          .describe("Key value, e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown', or a single char."),
+        modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).optional(),
+      }),
+    },
+    async (args) => ({ content: [jsonText(ui.pressKey(args))] }),
+  );
+
+  server.registerTool(
+    "ui_hover",
+    {
+      description:
+        "Move the pointer over an element, firing the pointerover/mouseover/mouseenter sequence. " +
+        "Needed before clicking controls that only exist on hover — Vortex's game tiles reveal " +
+        "their 'Manage' button this way, and several table rows reveal row actions on hover — " +
+        "so a click without a prior hover finds nothing to click.",
+      inputSchema: z.object(uiTargetSchema),
+    },
+    async (args) => ({ content: [jsonText(ui.hover(args))] }),
+  );
+
+  server.registerTool(
+    "ui_select_option",
+    {
+      description:
+        "Choose an option in a native <select>, by `value` or by visible `label`, firing " +
+        "input+change. Lists every available option in the error when nothing matches, so a " +
+        "failed guess immediately tells you what the valid choices were. Does NOT work on " +
+        "Vortex's custom React dropdowns, which are not <select> elements — drive those with " +
+        "ui_click on the toggle, then ui_click on the revealed item.",
+      inputSchema: z.object({
+        ...uiTargetSchema,
+        value: z.string().optional().describe("Option value attribute to select."),
+        label: z
+          .string()
+          .optional()
+          .describe("Visible option text to select. Use instead of value."),
+      }),
+    },
+    async (args) => ({ content: [jsonText(ui.selectOption(args))] }),
+  );
+
+  server.registerTool(
+    "ui_scroll",
+    {
+      description:
+        "Scroll the window, or a specific scrollable element when given a ref/selector. Also " +
+        "dispatches a scroll event, which is what makes Vortex's virtualised tables actually " +
+        "mount the newly-revealed rows — without it the rows stay absent from the DOM and a " +
+        "following ui_snapshot still cannot see them.",
+      inputSchema: z.object({
+        ...uiTargetSchema,
+        deltaX: z.number().optional().describe("Horizontal pixels; positive scrolls right."),
+        deltaY: z.number().optional().describe("Vertical pixels; positive scrolls down."),
+      }),
+    },
+    async (args) => ({ content: [jsonText(ui.scroll(args))] }),
+  );
+
+  server.registerTool(
+    "ui_set_viewport",
+    {
+      description:
+        "Resize the real Electron window to test responsive layout. Unmaximises first, because " +
+        "setSize on a maximised window is silently ignored on Windows — without that, every " +
+        "size in a sweep reports the same maximised dimensions and the results are meaningless. " +
+        "Returns both the requested and the ACTUAL resulting size: the OS enforces the window's " +
+        "minimum, so a request below it is clamped, and comparing the two is how you tell. " +
+        "This moves the window of whoever is sitting in front of Vortex.",
+      inputSchema: z.object({
+        width: z.number().int().describe("Target outer window width in px."),
+        height: z.number().int().describe("Target outer window height in px."),
+      }),
+    },
+    async ({ width, height }) => ({
+      content: [jsonText(await ui.setViewport({ width, height }))],
+    }),
+  );
+
+  server.registerTool(
+    "ui_responsive_sweep",
+    {
+      description:
+        "Resize through a list of viewports, running the ui_detect_layout_issues scan at each, " +
+        "then restore the original size — the restore runs even if the sweep fails partway, so " +
+        "it cannot strand the user's window at 1024x720. Defaults to 1024x720, 1280x800, " +
+        "1600x900 and 1920x1080. Read the results as a DIFF across sizes rather than as pass/" +
+        "fail: an issue present at every width is usually a pre-existing quirk, while one that " +
+        "appears only below a threshold is the actual responsive regression. Optionally captures " +
+        "a screenshot per viewport (needs Vortex core's window:capturePage — see ui_screenshot).",
+      inputSchema: z.object({
+        viewports: z
+          .array(z.object({ width: z.number().int(), height: z.number().int() }))
+          .optional()
+          .describe("Sizes to test, in order. Defaults to the four standard ones."),
+        settleMs: z
+          .number()
+          .int()
+          .optional()
+          .describe("Wait after each resize before scanning, for re-layout. Defaults to 400."),
+        maxIssuesPerViewport: z.number().int().optional().describe("Defaults to 25."),
+        screenshots: z
+          .boolean()
+          .optional()
+          .describe("Capture a base64 PNG per viewport. Defaults to false."),
+      }),
+    },
+    async ({ viewports, settleMs, maxIssuesPerViewport, screenshots }) => ({
+      content: [
+        jsonText(
+          await ui.responsiveSweep({ viewports, settleMs, maxIssuesPerViewport, screenshots }),
+        ),
+      ],
+    }),
+  );
+
+  server.registerTool(
+    "ui_reload_renderer",
+    {
+      description:
+        "Reload the renderer window, picking up a rebuilt renderer bundle WITHOUT restarting " +
+        "Electron — the hot-reload path after editing renderer code. Much cheaper than " +
+        "vortex_restart: the main process, and so the open state database, survives. Does NOT " +
+        "pick up a change to MAIN-process code (nothing in the renderer can reload main) — use " +
+        "vortex_restart for that. All ui_snapshot refs are invalidated; take a fresh snapshot " +
+        "after the reload settles. The MCP connection drops briefly while the renderer tears " +
+        "down and this extension re-registers.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      ui.reloadRenderer();
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Reloading the renderer. Wait ~2-5s, then ui_wait_for a known element before " +
+              "taking a fresh ui_snapshot — all previous refs are now invalid.",
+          },
+        ],
+      };
     },
   );
 }
