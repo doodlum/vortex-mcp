@@ -148,6 +148,54 @@ updates the DOM but leaves the tracker stale, so React swallows the synthetic
 `input` event and `onChange` never runs — the classic "typed into the box but
 nothing happened". Call the prototype's native setter first, as `ui_fill` does.
 
+### Stacked modals: `:nth-of-type()` cannot select between them
+
+Vortex mounts each modal under its own parent, so two open dialogs are not
+siblings. Every `div:nth-of-type(n)` therefore matches *both*, `querySelector`
+keeps returning the first, and the second dialog is unaddressable by CSS alone.
+
+The failure is silent and misleading. A purge prompt stacked behind a collection
+report went unanswered for the whole run: the policy matched its text fine, but
+the scoped lookup kept landing in the wrong dialog, so it read as "no policy for
+this dialog" — while the unanswered modal blocked the install driver, which read
+as a hung collection.
+
+`ui_snapshot` takes an `index` alongside `selector` for this: the nth *match*,
+which is the thing CSS cannot express. Note that `[role="dialog"]` can match
+several nested elements of a single dialog, so indices are not one-per-dialog —
+confirm with the dialog's text before acting, as `clickInsideDialog` does.
+
+### FOMOD steps do not have a predictably-named forward button
+
+Vortex labels a FOMOD installer's forward action after the step it is showing,
+so a single collection puts up `Next`, `Install`, `Finish`, `Default Settings`,
+`Installation`, `Readme and information` and
+`Basic - name reordering for weapon/apparel - Language` across consecutive mods.
+
+Matching on the label therefore handles a few mods and then sits forever on one
+it does not recognise. Nothing errors: the install driver is simply waiting on a
+modal, so it reads as a hung collection. This stalled the harness at 8 of 12
+mods.
+
+Match on **position** instead: `#fomod-installer-dialog .fomod-nav-buttons`
+holds Back (when there is a previous step), a progress bar, and the forward
+action last. Cancel is not in that bar — it is `#fomod-cancel` in the dialog
+header — so the forward action is just the bar's last button. `advanceFomod()`
+does this.
+
+Two things that look like details and are not:
+
+- **Scope to the nav bar, never to the dialog or the page.** "Click the last
+  button in the dialog" generalises the rule and breaks it: on "Purge files from
+  different instance?" the last button is _Purge_, against a real game install.
+  A page-wide search is worse still — Vortex's titlebar has a button called
+  `Close`, so answering a dialog's `Close` by name finds the window control and
+  shuts the app down mid-install. Both have happened here.
+- **Do not skip disabled buttons before taking the last one.** A step can render
+  with its forward button briefly greyed out; filtering disabled entries first
+  makes the rule fall through to _Back_ and walk the wizard backwards forever.
+  Take the last button as it is, and if it is disabled, do nothing and re-poll.
+
 ### Virtualised rows are not in the DOM
 
 Vortex's mod, plugin and game lists are windowed: a row simply does not exist

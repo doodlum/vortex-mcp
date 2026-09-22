@@ -369,6 +369,16 @@ const SKIPPED_TAGS = new Set(["script", "style", "noscript", "template", "svg", 
 export interface SnapshotOptions {
   /** CSS selector to snapshot within. Defaults to the whole document body. */
   selector?: string;
+  /**
+   * Which match of `selector` to use, when it matches more than one. Defaults to 0.
+   *
+   * CSS cannot express this. `:nth-of-type()` counts position among siblings of
+   * the same tag, so with two modals mounted under different parents every
+   * `div:nth-of-type(n)` matches both and `querySelector` keeps returning the
+   * first — which made the second of two stacked dialogs unaddressable, and a
+   * caller trying to answer it silently operate on the wrong one.
+   */
+  index?: number;
   /** Include elements that are present but not visible. Defaults to false. */
   includeHidden?: boolean;
   /** Maximum tree depth to walk. Defaults to 25. */
@@ -418,9 +428,29 @@ export interface SnapshotResult {
  * are collapsed into their children rather than emitted, which is what stops a
  * React tree's dozens of layout divs per control from drowning the signal.
  */
+/**
+ * The `index`-th element matching `selector`, with a message that distinguishes
+ * "nothing matches" from "fewer matches than you asked for" — the two have very
+ * different causes and the same symptom.
+ */
+function matchAt(selector: string, index: number): Element {
+  const all = doc().querySelectorAll(selector);
+  const el = all[index];
+  if (el === undefined) {
+    throw new Error(
+      all.length === 0
+        ? `No element matches selector ${JSON.stringify(selector)}.`
+        : `Selector ${JSON.stringify(selector)} matches ${String(all.length)} element(s), ` +
+            `so index ${String(index)} is out of range.`,
+    );
+  }
+  return el;
+}
+
 export function snapshot(options: SnapshotOptions = {}): SnapshotResult {
   const {
     selector,
+    index = 0,
     includeHidden = false,
     maxDepth = 25,
     maxNodes = 1500,
@@ -431,12 +461,7 @@ export function snapshot(options: SnapshotOptions = {}): SnapshotResult {
 
   const document = doc();
   const root: Element =
-    selector !== undefined
-      ? (document.querySelector(selector) ??
-        (() => {
-          throw new Error(`No element matches selector ${JSON.stringify(selector)}.`);
-        })())
-      : (document.body as Element);
+    selector === undefined ? (document.body as Element) : matchAt(selector, index);
 
   let emitted = 0;
   let truncated = false;

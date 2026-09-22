@@ -13,7 +13,7 @@
  * download sits there looking like an ordinary archive.
  */
 import type { VortexMcpClient } from "./mcpClient";
-import { autoAnswerDialogs, type AnsweredDialog } from "./uiDriver";
+import { autoAdvanceFomods, autoAnswerDialogs, clickByName, type AnsweredDialog } from "./uiDriver";
 
 export class CollectionError extends Error {}
 
@@ -74,6 +74,70 @@ export function toNxmUrl(ref: CollectionRef): string {
   return ref.revision === undefined ? base : `${base}/revisions/${String(ref.revision)}`;
 }
 
+export interface ResolvedCollection extends CollectionRef {
+  collectionId: number;
+  revisionId: number;
+  revisionNumber: number;
+  name: string;
+  modCount: number;
+}
+
+/**
+ * Look the collection up on Nexus to get its real ids.
+ *
+ * Vortex's own "Add to Vortex" button passes collectionId, revisionId and
+ * revisionNumber alongside the nxm URL, and it needs them: given only a slug the
+ * download never resolves — no error, no download, nothing at all, which is a
+ * miserable thing to debug. This is the public GraphQL API and needs no token,
+ * so resolution works before the instance is even logged in.
+ */
+export async function resolveCollection(ref: CollectionRef): Promise<ResolvedCollection> {
+  const query = `query { collection(slug: "${ref.slug}", domainName: "${ref.gameId}", viewAdultContent: true) { id slug name currentRevision { id revisionNumber modCount } } }`;
+
+  const response = await fetch("https://api.nexusmods.com/v2/graphql", {
+    method: "POST",
+    headers: { "content-type": "application/json", "user-agent": "vortex-mcp-harness/1.0" },
+    body: JSON.stringify({ query }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) {
+    throw new CollectionError(
+      `Nexus returned ${String(response.status)} looking up ${ref.gameId}/${ref.slug}.`,
+    );
+  }
+
+  const body = (await response.json()) as {
+    data?: {
+      collection?: {
+        id: number;
+        name: string;
+        currentRevision?: { id: number; revisionNumber: number; modCount: number };
+      } | null;
+    };
+    errors?: { message: string }[];
+  };
+
+  if (body.errors !== undefined && body.errors.length > 0) {
+    throw new CollectionError(`Nexus rejected the lookup: ${body.errors[0]?.message ?? "unknown"}`);
+  }
+  const collection = body.data?.collection;
+  if (collection == null || collection.currentRevision == null) {
+    throw new CollectionError(
+      `No collection "${ref.slug}" for ${ref.gameId} on Nexus. Check the URL — the slug is the ` +
+        `short code at the end, e.g. .../collections/pmmttm.`,
+    );
+  }
+
+  return {
+    ...ref,
+    collectionId: collection.id,
+    revisionId: collection.currentRevision.id,
+    revisionNumber: ref.revision ?? collection.currentRevision.revisionNumber,
+    name: collection.name,
+    modCount: collection.currentRevision.modCount,
+  };
+}
+
 export interface InstallCollectionOptions {
   /** How long to allow for the whole download+install. Collections are big. */
   timeoutMs?: number;
@@ -85,8 +149,18 @@ export interface InstallCollectionOptions {
 export interface InstallCollectionResult {
   ref: CollectionRef;
   modId: string | undefined;
+  /** Member mods actually installed. */
   modCount: number;
+  /** Members the collection *requires*; optional ones are not counted. */
+  expectedModCount: number;
+  complete: boolean;
   answeredDialogs: AnsweredDialog[];
+}
+
+interface CollectionRule {
+  /** "requires" for a member that must install, "recommends" for an optional one. */
+  type: string;
+  reference: { description?: string; logicalFileName?: string };
 }
 
 interface CollectionMod {
@@ -94,15 +168,43 @@ interface CollectionMod {
   name?: string;
   type?: string;
   attributes?: { collectionSlug?: string; revisionNumber?: number };
+  rules?: CollectionRule[];
+}
+
+/**
+ * How many member mods installing this collection should actually produce.
+ *
+ * Nexus's `modCount` counts everything the collection lists, optional mods
+ * included, and Vortex only installs the required ones. Waiting for `modCount`
+ * therefore waits for mods that are never coming: the FallUI Series collection
+ * reports 11 and installs 8, so a complete install looked like a stall and then
+ * a timeout. The collection mod's own `requires` rules are what Vortex works
+ * from, so count those and fall back to `modCount` only before they exist.
+ */
+function requiredMemberCount(collectionMod: CollectionMod, fallback: number): number {
+  const required = (collectionMod.rules ?? []).filter((r) => r.type === "requires");
+  return required.length > 0 ? required.length : fallback;
 }
 
 /**
  * Download and install a collection, waiting for it to actually finish.
  *
- * "Finished" is judged from state rather than from the download callback: the
- * callback fires when the *collection archive* has downloaded, which is the
- * start of the work, not the end. The driver then pulls down every member mod,
- * which is where the minutes go.
+ * Four steps, and skipping any of them leaves the collection looking installed
+ * when it is not:
+ *
+ *   1. Resolve the collection on Nexus for its real ids.
+ *   2. Download it. This installs the *collection mod* — a manifest — and
+ *      nothing else. Vortex reports "Collection incomplete" at this point.
+ *   3. Start the install driver, which is what pulls down the member mods. The
+ *      UI gates this behind an "Install Now" button; there is no event that
+ *      skips it, so the harness clicks it.
+ *   4. Wait for the members. The download callback fires at the end of step 2,
+ *      so treating it as completion is the mistake that makes a collection look
+ *      installed with zero mods in it.
+ *
+ * Blocking modals are answered throughout, not at fixed points: the version
+ * mismatch appears before the first mod, the purge prompt partway through, and
+ * a cancellation confirm can appear at any time.
  */
 export async function installCollection(
   mcp: VortexMcpClient,
@@ -117,7 +219,7 @@ export async function installCollection(
   if (loggedIn !== true) {
     throw new CollectionError(
       "Not logged in to Nexus Mods, and collections cannot be downloaded anonymously.\n\n" +
-        "  Set a personal API key and restart the instance:\n" +
+        "  Either sign in through Vortex's own Log in button, or set a personal API key:\n" +
         "    https://next.nexusmods.com/settings/api-keys\n" +
         "    echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env\n" +
         "    pnpm run ai:up --fresh",
@@ -127,56 +229,175 @@ export async function installCollection(
   const controller = new AbortController();
   const answering = autoAnswerDialogs(mcp, {
     signal: controller.signal,
-    onAnswer: (a) => report(`answered "${a.dialog.slice(0, 60)}..." with "${a.clicked}"`),
+    pollMs: 1_500,
+    onAnswer: (a) => report(`answered [${a.clicked}] ${a.dialog.slice(0, 55)}`),
+  });
+  // Member mods ship FOMOD installers that block the driver until someone picks
+  // options. Unattended is the whole point of this function, so accept their
+  // defaults; the collection manifest already encodes the curator's choices.
+  const advancing = autoAdvanceFomods(mcp, {
+    signal: controller.signal,
+    onAdvance: (label) => report(`fomod step [${label}]`),
   });
 
   try {
-    report(`starting ${toNxmUrl(ref)}`);
-    await mcp.call(
-      "vortex_dispatch",
-      {
-        action: "start-download",
-        args: [
-          [toNxmUrl(ref)],
-          {
-            game: ref.gameId,
-            source: "nexus",
-            // Vortex identifies a download as a collection by these ids. The
-            // slug and game are all we can know without the GraphQL API; Vortex
-            // fills in the rest once it resolves the revision.
-            nexus: { ids: { gameId: ref.gameId, collectionSlug: ref.slug } },
-          },
-          undefined,
-          "__CALLBACK__",
-        ],
-      },
-      15 * 60 * 1000,
+    const resolved = await resolveCollection(ref);
+    report(
+      `${resolved.name} — revision ${String(resolved.revisionNumber)}, ${String(resolved.modCount)} mods`,
     );
 
-    report("collection archive downloaded; installing members (this is the slow part)");
-    const mod = await waitForCollectionInstalled(mcp, ref, timeoutMs, report);
+    const existing = await findCollectionMod(mcp, ref);
+    if (existing === undefined) {
+      const url = toNxmUrl({ ...ref, revision: resolved.revisionNumber });
+      report(`downloading ${url}`);
+      await startCollectionDownload(mcp, ref, resolved, url);
+      await waitForCollectionMod(mcp, ref, 15 * 60 * 1000, report);
+    } else {
+      report("collection already added; resuming its install");
+    }
+
+    const collectionMod = await waitForCollectionMod(mcp, ref, 60_000, report);
+    await startInstallDriver(mcp, ref, collectionMod.id, report);
+
+    const expected = requiredMemberCount(collectionMod, resolved.modCount);
+    if (expected !== resolved.modCount) {
+      report(`${String(expected)} of the ${String(resolved.modCount)} listed mods are required`);
+    }
+    const installed = await waitForMembers(mcp, ref, expected, timeoutMs, report);
 
     return {
       ref,
-      modId: mod?.id,
-      modCount: await countCollectionMods(mcp, ref.gameId),
-      answeredDialogs: await Promise.resolve(answering).catch(() => []),
+      modId: collectionMod.id,
+      modCount: installed,
+      expectedModCount: expected,
+      complete: installed >= expected,
+      answeredDialogs: [],
     };
   } finally {
     controller.abort();
     await answering.catch(() => undefined);
+    await advancing.catch(() => undefined);
   }
 }
 
-/** Poll until a mod of type `collection` matching this slug appears installed. */
-async function waitForCollectionInstalled(
+async function startCollectionDownload(
+  mcp: VortexMcpClient,
+  ref: CollectionRef,
+  resolved: ResolvedCollection,
+  url: string,
+): Promise<void> {
+  await mcp.call(
+    "vortex_dispatch",
+    {
+      action: "start-download",
+      args: [
+        [url],
+        {
+          game: ref.gameId,
+          source: "nexus",
+          name: resolved.name,
+          // Exactly what Vortex's own "Add to Vortex" button sends. These ids
+          // are what make it a *collection* download rather than an archive.
+          nexus: {
+            ids: {
+              gameId: ref.gameId,
+              collectionId: resolved.collectionId,
+              revisionId: resolved.revisionId,
+              collectionSlug: ref.slug,
+              revisionNumber: resolved.revisionNumber,
+            },
+          },
+        },
+        // fileName. Vortex's own collections code passes `undefined`, but newer
+        // builds validate this event's arguments with zod and require a string —
+        // and a rejected argument list means the handler never runs, so the
+        // download silently never starts and the awaited callback never fires.
+        `${ref.slug}-rev${String(resolved.revisionNumber)}.7z`,
+        "__CALLBACK__",
+      ],
+    },
+    15 * 60 * 1000,
+  );
+}
+
+/**
+ * Get the install driver moving.
+ *
+ * `resume-collection` is the event Vortex's own "Resume" notification uses, but
+ * it refuses with "already installing a collection" when a session is live — so
+ * a failure here is frequently the good case, and the "Install Now" click is
+ * what actually matters. The button only exists while the driver is waiting for
+ * confirmation, so its absence is equally fine.
+ */
+async function startInstallDriver(
+  mcp: VortexMcpClient,
+  ref: CollectionRef,
+  modId: string,
+  report: (message: string) => void,
+): Promise<void> {
+  await mcp
+    .call("vortex_dispatch", { action: "resume-collection", args: [ref.gameId, modId] }, 120_000)
+    .catch(() => undefined);
+
+  await new Promise((resolve) => setTimeout(resolve, 4_000));
+
+  const clicked = await clickByName(mcp, { role: "button", name: /^install now$/i })
+    .then(() => true)
+    .catch(() => false);
+  report(clicked ? "clicked Install Now" : "driver already running (no Install Now button)");
+}
+
+async function findCollectionMod(
+  mcp: VortexMcpClient,
+  ref: CollectionRef,
+): Promise<CollectionMod | undefined> {
+  const mods = await mcp
+    .call<Record<string, CollectionMod> | null>("vortex_query", {
+      path: ["persistent", "mods", ref.gameId],
+    })
+    .catch(() => null);
+  return Object.values(mods ?? {}).find((m) => m.type === "collection");
+}
+
+async function waitForCollectionMod(
   mcp: VortexMcpClient,
   ref: CollectionRef,
   timeoutMs: number,
   report: (message: string) => void,
-): Promise<CollectionMod | undefined> {
+): Promise<CollectionMod> {
   const started = Date.now();
-  let lastCount = -1;
+  for (;;) {
+    const found = await findCollectionMod(mcp, ref);
+    if (found !== undefined) return found;
+    if (Date.now() - started > timeoutMs) {
+      throw new CollectionError(
+        `The collection archive for "${ref.slug}" never finished downloading. ` +
+          `Check list_notifications and list_dialogs — a modal may be waiting.`,
+      );
+    }
+    report("waiting for the collection archive");
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+}
+
+/**
+ * Wait for the member mods, reporting progress as they land.
+ *
+ * Counts rather than waits for a completion event: the driver installs members
+ * one at a time over minutes, and a count that stops climbing is the signal
+ * worth surfacing. Returns what was installed even on timeout via the thrown
+ * message, so a partial result is diagnosable.
+ */
+async function waitForMembers(
+  mcp: VortexMcpClient,
+  ref: CollectionRef,
+  expected: number,
+  timeoutMs: number,
+  report: (message: string) => void,
+): Promise<number> {
+  const started = Date.now();
+  let last = -1;
+  let lastChange = Date.now();
 
   for (;;) {
     const mods = await mcp
@@ -184,38 +405,31 @@ async function waitForCollectionInstalled(
         path: ["persistent", "mods", ref.gameId],
       })
       .catch(() => null);
+    // The collection mod itself is not a member.
+    const members = Object.values(mods ?? {}).filter((m) => m.type !== "collection").length;
 
-    const all = Object.values(mods ?? {});
-    const collection = all.find(
-      (m) => m.type === "collection" && m.attributes?.collectionSlug === ref.slug,
-    );
-
-    // Surface progress, since a large collection takes long enough that silence
-    // is indistinguishable from being stuck.
-    if (all.length !== lastCount) {
-      lastCount = all.length;
-      report(`${String(all.length)} mods present`);
+    if (members !== last) {
+      last = members;
+      lastChange = Date.now();
+      report(`${String(members)}/${String(expected)} member mods installed`);
     }
-
-    if (collection !== undefined) return collection;
+    if (members >= expected) return members;
 
     if (Date.now() - started > timeoutMs) {
       throw new CollectionError(
-        `The collection "${ref.slug}" did not finish installing within ` +
-          `${String(Math.round(timeoutMs / 60000))} minutes. ` +
-          `${String(all.length)} mods are installed so far — check Vortex's notifications ` +
-          `(list_notifications) and any open dialog (list_dialogs).`,
+        `"${ref.slug}" stopped at ${String(members)}/${String(expected)} mods after ` +
+          `${String(Math.round(timeoutMs / 60000))} minutes. Check list_dialogs for a modal the ` +
+          `harness does not know how to answer, and list_notifications for install failures.`,
+      );
+    }
+    // A long stall with no new mods almost always means a modal appeared that
+    // no policy matched; say so rather than sitting silently until timeout.
+    if (Date.now() - lastChange > 5 * 60 * 1000) {
+      lastChange = Date.now();
+      report(
+        `no progress for 5 minutes at ${String(members)}/${String(expected)} — check for a modal`,
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
-}
-
-async function countCollectionMods(mcp: VortexMcpClient, gameId: string): Promise<number> {
-  const mods = await mcp
-    .call<Record<string, CollectionMod> | null>("vortex_query", {
-      path: ["persistent", "mods", gameId],
-    })
-    .catch(() => null);
-  return Object.keys(mods ?? {}).length;
 }

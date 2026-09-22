@@ -109,8 +109,16 @@ export function findOne(snap: Snapshot, query: NodeQuery): SnapshotNode {
   );
 }
 
-export async function snapshot(mcp: VortexMcpClient, selector?: string): Promise<Snapshot> {
-  return mcp.call<Snapshot>("ui_snapshot", selector === undefined ? {} : { selector });
+export async function snapshot(
+  mcp: VortexMcpClient,
+  selector?: string,
+  index?: number,
+): Promise<Snapshot> {
+  if (selector === undefined) return mcp.call<Snapshot>("ui_snapshot", {});
+  return mcp.call<Snapshot>(
+    "ui_snapshot",
+    index === undefined ? { selector } : { selector, index },
+  );
 }
 
 /**
@@ -198,6 +206,14 @@ export interface DialogPolicy {
  */
 export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
   {
+    // Must come first: clicking the wrong button here throws away an install
+    // that is halfway done, and Vortex raises it whenever anything looks like a
+    // cancellation — including a stray Escape.
+    match: /cancel the installation/i,
+    button: /^close$/i,
+    because: "never abandon an install we started; Close dismisses without cancelling",
+  },
+  {
     match: /purge files from different instance/i,
     button: /^cancel$/i,
     because:
@@ -205,9 +221,21 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
       "remove real files the operator did not ask to lose",
   },
   {
+    match: /game version mismatch/i,
+    button: /^continue$/i,
+    because:
+      "the collection targets a different game build; mods may misbehave, but stopping here " +
+      "would make every collection untestable on an updated game",
+  },
+  {
     match: /game not discovered|hasn't been automatically discovered/i,
     button: /^continue$/i,
     because: "the harness already registered the game's path explicitly",
+  },
+  {
+    match: /external changes/i,
+    button: /^(apply|continue|save changes)$/i,
+    because: "files changed outside Vortex; keeping them is the non-destructive answer",
   },
 ];
 
@@ -217,14 +245,21 @@ export interface AnsweredDialog {
   because: string;
 }
 
+/** Containers Vortex renders modals into, most specific first. */
+const DIALOG_SELECTORS = ['[role="dialog"]', ".modal.in", ".modal.show", "dialog[open]"];
+
 /**
  * Watch for modals and answer the known ones until stopped.
  *
- * Runs alongside a long operation (activation, deployment) rather than being
- * called at a fixed point, because these dialogs appear at times the caller
- * cannot predict — mid-activation, after a deploy starts — and a blocked
- * operation otherwise just times out with no indication that something was
- * waiting for an answer.
+ * Runs alongside a long operation (activation, a collection install) rather than
+ * at a fixed point, because these dialogs appear at moments the caller cannot
+ * predict — and a blocked operation otherwise just times out with no indication
+ * that something was waiting for an answer.
+ *
+ * The button is looked up **inside the dialog**, never across the page. That is
+ * not a tidiness point: Vortex's titlebar has a button called "Close", so a
+ * page-wide search for a dialog's "Close" action finds the window control first
+ * and shuts the application down mid-install. Which is exactly what happened.
  */
 export function autoAnswerDialogs(
   mcp: VortexMcpClient,
@@ -251,13 +286,12 @@ export function autoAnswerDialogs(
         const policy = policies.find((p) => p.match.test(text));
         if (policy === undefined) continue;
 
-        const button = findNodes(snap, { role: "button", name: policy.button })[0];
-        if (button === undefined) continue;
+        const clicked = await clickInsideDialog(mcp, text, policy.button);
+        if (clicked === undefined) continue;
 
-        await mcp.call("ui_click", { ref: button.ref }).catch(() => undefined);
         const record: AnsweredDialog = {
           dialog: text.slice(0, 160),
-          clicked: button.name ?? String(policy.button),
+          clicked,
           because: policy.because,
         };
         answered.push(record);
@@ -265,5 +299,123 @@ export function autoAnswerDialogs(
       }
     }
     return answered;
+  })();
+}
+
+/**
+ * Click a button within the dialog whose text matches, and only within it.
+ *
+ * Each modal container is snapshotted separately so refs are scoped to that
+ * subtree; the right container is identified by its text matching the dialog we
+ * decided to answer, which matters when two modals are stacked.
+ */
+async function clickInsideDialog(
+  mcp: VortexMcpClient,
+  dialogText: string,
+  button: string | RegExp,
+): Promise<string | undefined> {
+  const marker = dialogText.slice(0, 20);
+
+  for (const selector of DIALOG_SELECTORS) {
+    // `index` picks the nth *match*, which is not what `:nth-of-type(n)` means.
+    // That counts position among same-tag siblings, so with two modals mounted
+    // under different parents every `div:nth-of-type(n)` matched both and
+    // querySelector kept returning the first. The second of two stacked dialogs
+    // was therefore unreachable: a purge prompt sat unanswered behind a
+    // collection report and blocked an install, looking like a policy that
+    // failed to match.
+    for (let index = 0; index < 4; index++) {
+      const snap = await snapshot(mcp, selector, index).catch(() => undefined);
+      if (snap === undefined || snap.nodeCount === 0) break;
+
+      // Only answer the dialog we actually matched on.
+      const flat = flatten(snap.tree);
+      const text = flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" ");
+      if (!text.includes(marker)) continue;
+
+      const target = findNodes(snap, { role: "button", name: button })[0];
+      if (target === undefined) continue;
+
+      await mcp.call("ui_click", { ref: target.ref }).catch(() => undefined);
+      return target.name ?? String(button);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The FOMOD installer's own dialog, and the bar holding its step actions.
+ *
+ * Scoping to these is a safety property, not a tidiness one. A rule like "click
+ * the dialog's last button" reads naturally and is badly wrong here: on the
+ * "Purge files from different instance?" prompt the last button is *Purge*, and
+ * the harness runs against a real Fallout 4 install with tens of thousands of
+ * deployed files. Only the FOMOD nav bar is ever driven automatically.
+ *
+ * The bar holds Back (when there is a previous step), a progress bar, and the
+ * forward action last. Cancel is not in it — it lives in the dialog header as
+ * `#fomod-cancel` — so the forward action is simply the last enabled button.
+ */
+const FOMOD_DIALOG = "#fomod-installer-dialog";
+const FOMOD_NAV = `${FOMOD_DIALOG} .fomod-nav-buttons`;
+
+/**
+ * Advance a FOMOD installer by one step, accepting whatever it has pre-selected.
+ *
+ * FOMOD steps do not have a predictably-named action button: Vortex labels it
+ * after the step itself, so one collection produces "Next", "Install", "Finish"
+ * and "Default Settings" across consecutive mods. Matching on labels handles
+ * some and silently stalls on the rest, which is indistinguishable from a hung
+ * install — it is what stalled this harness at 8 of 12 mods.
+ *
+ * So the match is positional: the last enabled button in the nav bar. Defaults
+ * are taken as-is, which is what a collection wants, since the curator's choices
+ * are already recorded in the collection manifest.
+ *
+ * Returns the label clicked, or undefined when no FOMOD dialog is open.
+ */
+export async function advanceFomod(mcp: VortexMcpClient): Promise<string | undefined> {
+  const snap = await snapshot(mcp, FOMOD_NAV).catch(() => undefined);
+  if (snap === undefined || snap.nodeCount === 0) return undefined;
+
+  // Deliberately includes disabled buttons, because position is what identifies
+  // the forward action. Filtering them out first would make a step with a
+  // greyed-out Next fall through to Back and walk the wizard backwards forever.
+  const buttons = findNodes(snap, { role: "button", enabledOnly: false });
+  const forward = buttons[buttons.length - 1];
+  if (forward === undefined || forward.disabled === true) return undefined;
+
+  await mcp.call("ui_click", { ref: forward.ref });
+  return forward.name ?? "(unnamed)";
+}
+
+/**
+ * Click through FOMOD installers until stopped.
+ *
+ * Kept separate from autoAnswerDialogs because the two decide on opposite
+ * principles: that one matches known prompts by text and deliberately picks the
+ * conservative answer, while this one accepts defaults on anything the FOMOD
+ * installer puts up. Enabling it is therefore an explicit choice, made where an
+ * unattended install is already the intent.
+ */
+export function autoAdvanceFomods(
+  mcp: VortexMcpClient,
+  options: { signal: AbortSignal; pollMs?: number; onAdvance?: (label: string) => void },
+): Promise<number> {
+  const pollMs = options.pollMs ?? 1_500;
+  let advanced = 0;
+
+  return (async () => {
+    while (!options.signal.aborted) {
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+      if (options.signal.aborted) break;
+
+      const label = await advanceFomod(mcp).catch(() => undefined);
+      if (label !== undefined) {
+        advanced += 1;
+        options.onAdvance?.(label);
+      }
+    }
+    return advanced;
   })();
 }

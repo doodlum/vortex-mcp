@@ -1145,6 +1145,14 @@ function registerUiReadTools(server: McpServer, api: IExtensionApi): void {
           .string()
           .optional()
           .describe("Snapshot only within this CSS selector. Defaults to the whole document body."),
+        index: z
+          .number()
+          .int()
+          .optional()
+          .describe(
+            "Which match of `selector` to snapshot when it matches several, 0-based. Defaults to 0. " +
+              "Needed for stacked modals: CSS `:nth-of-type()` cannot select between them.",
+          ),
         includeHidden: z
           .boolean()
           .optional()

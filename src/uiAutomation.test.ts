@@ -112,6 +112,32 @@ describe("accessibleName", () => {
 });
 
 describe("snapshot", () => {
+  it("scopes to the nth match of a selector, not the nth of its type", () => {
+    // Two modals mounted under different parents. Every `div:nth-of-type(n)`
+    // matches BOTH, so the CSS-only approach kept returning the first and made
+    // the second unreachable: a purge prompt stacked behind a collection report
+    // went unanswered and blocked an install, looking like a policy that failed
+    // to match.
+    setBody(
+      '<div id="a"><div role="dialog"><button>Alpha</button></div></div>' +
+        '<div id="b"><div role="dialog"><button>Beta</button></div></div>',
+    );
+
+    const first = snapshot({ selector: '[role="dialog"]' });
+    const second = snapshot({ selector: '[role="dialog"]', index: 1 });
+
+    expect(JSON.stringify(first.tree).match(/Alpha|Beta/g)).toEqual(["Alpha"]);
+    expect(JSON.stringify(second.tree).match(/Alpha|Beta/g)).toEqual(["Beta"]);
+  });
+
+  it("says an index is out of range rather than falling back to the first match", () => {
+    // Distinguishing this from "nothing matches" matters: silently clamping to
+    // index 0 is what makes a caller act on the wrong dialog.
+    setBody('<div role="dialog"><button>Only</button></div>');
+    expect(() => snapshot({ selector: '[role="dialog"]', index: 3 })).toThrow(/out of range/i);
+    expect(() => snapshot({ selector: ".nothing-here" })).toThrow(/No element matches/i);
+  });
+
   it("collapses layout wrappers but keeps the control inside", () => {
     setBody('<div class="a"><div class="b"><button>Deploy</button></div></div>');
     const result = snapshot();

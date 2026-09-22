@@ -12,7 +12,8 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    // harness/**/*.spec.ts are Playwright e2e and deliberately not matched.
+    include: ["src/**/*.test.ts", "harness/src/**/*.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

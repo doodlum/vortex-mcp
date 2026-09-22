@@ -150,8 +150,11 @@ Driving the UI (one-shot; needs a running instance)
 
 Collections (needs a Nexus API key — they cannot be downloaded anonymously)
   collection <url>       Download and install a Nexus collection, then wait for
-                         every member mod to finish. Accepts a website URL, an
-                         nxm:// link, or <game>/<slug>.
+                         every required member mod to finish. Accepts a website
+                         URL, an nxm:// link, or <game>/<slug>.
+                         Runs unattended: member mods' FOMOD installers are
+                         advanced on their defaults, which are the choices the
+                         collection already records.
 
 Testing
   responsive             Sweep window sizes, report width-dependent issues
@@ -420,7 +423,15 @@ async function main(): Promise<number> {
       log("");
       log(`Installed collection ${result.ref.slug} (${result.ref.gameId})`);
       log(`  mod id: ${result.modId ?? "unknown"}`);
-      log(`  mods now installed: ${String(result.modCount)}`);
+      log(
+        `  required mods installed: ${String(result.modCount)}/${String(result.expectedModCount)}`,
+      );
+      if (!result.complete) {
+        log("");
+        log("  Not every required mod installed. `View failed mods` on the");
+        log("  collection page says which, and its archive is usually already");
+        log("  downloaded, so a retry from there does not re-fetch it.");
+      }
       return 0;
     }
 
