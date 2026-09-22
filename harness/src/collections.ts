@@ -167,8 +167,32 @@ interface CollectionMod {
   id: string;
   name?: string;
   type?: string;
+  /** "installing" until the installer finishes, then "installed". */
+  state?: string;
   attributes?: { collectionSlug?: string; revisionNumber?: number };
   rules?: CollectionRule[];
+}
+
+/**
+ * Members that have actually finished installing.
+ *
+ * A mod row appears in state the moment its install *starts*, not when it
+ * finishes — it sits at `state: "installing"`, keeps its archive filename
+ * instead of its real name, and stays disabled while its FOMOD wizard is still
+ * open. Counting rows therefore counts installs that have merely begun, and a
+ * collection reports itself complete while several installers are still waiting
+ * for input. Deploying on that signal writes a half-installed set into the game
+ * directory, which is what happened here.
+ */
+function installedMembers(mods: Record<string, CollectionMod> | null): CollectionMod[] {
+  // The collection mod itself is not a member.
+  return Object.values(mods ?? {}).filter(
+    (m) => m.type !== "collection" && m.state === "installed",
+  );
+}
+
+function stillInstalling(mods: Record<string, CollectionMod> | null): CollectionMod[] {
+  return Object.values(mods ?? {}).filter((m) => m.state === "installing");
 }
 
 /**
@@ -416,15 +440,21 @@ async function waitForMembers(
         path: ["persistent", "mods", ref.gameId],
       })
       .catch(() => null);
-    // The collection mod itself is not a member.
-    const members = Object.values(mods ?? {}).filter((m) => m.type !== "collection").length;
+    const members = installedMembers(mods).length;
+    const pending = stillInstalling(mods).length;
 
     if (members !== last) {
       last = members;
       lastChange = Date.now();
-      report(`${String(members)}/${String(expected)} member mods installed`);
+      report(
+        `${String(members)}/${String(expected)} member mods installed` +
+          (pending > 0 ? ` (${String(pending)} still installing)` : ""),
+      );
     }
-    if (members >= expected) return members;
+    // Both conditions matter. The count alone can be reached while later members
+    // are still installing, and "nothing installing" alone is true in the gap
+    // before the next install starts.
+    if (members >= expected && pending === 0) return members;
 
     if (Date.now() - started > timeoutMs) {
       throw new CollectionError(

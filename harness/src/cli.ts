@@ -460,8 +460,9 @@ async function main(): Promise<number> {
 
     case "deploy": {
       const mcp = await requireRunning(config);
-      await deployMods(mcp, {
+      await deployMods(mcp, config.gameId, {
         allowForeignPurge: flags.purge === true,
+        allowIncomplete: flags["allow-incomplete"] === true,
         onProgress: (m) => log(`  ${m}`),
       });
       const pending = await needsDeployment(mcp, config.gameId);

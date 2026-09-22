@@ -28,7 +28,40 @@ export interface DeploymentOptions {
    * fixture that has to start clean.
    */
   allowForeignPurge?: boolean;
+  /**
+   * Deploy even while mods are still installing. Off by default.
+   *
+   * Almost never what you want: a mod is in state from the moment its install
+   * starts, so deploying then links a half-extracted set into the game
+   * directory and the result looks like a broken collection rather than an
+   * unfinished one.
+   */
+  allowIncomplete?: boolean;
   timeoutMs?: number;
+}
+
+interface ModState {
+  id: string;
+  name?: string;
+  state?: string;
+}
+
+/**
+ * Mods whose installer has not finished.
+ *
+ * `state` is "installing" from the moment an install begins until its installer
+ * completes — which, for a mod with a FOMOD wizard, means until someone answers
+ * it. So this is also how an unattended run notices that a dialog is sitting
+ * there waiting.
+ */
+export async function modsStillInstalling(
+  mcp: VortexMcpClient,
+  gameId: string,
+): Promise<ModState[]> {
+  const mods = await mcp
+    .call<Record<string, ModState> | null>("vortex_query", { path: ["persistent", "mods", gameId] })
+    .catch(() => null);
+  return Object.values(mods ?? {}).filter((m) => m.state === "installing");
 }
 
 /**
@@ -56,8 +89,22 @@ export async function purgeGame(
 /** Link every enabled mod into the game directory. */
 export async function deployMods(
   mcp: VortexMcpClient,
+  gameId: string,
   options: DeploymentOptions = {},
 ): Promise<AnsweredDialog[]> {
+  if (options.allowIncomplete !== true) {
+    const pending = await modsStillInstalling(mcp, gameId);
+    if (pending.length > 0) {
+      throw new DeploymentError(
+        `${String(pending.length)} mod(s) are still installing, so deploying now would link a ` +
+          `half-installed set into the game directory:\n` +
+          pending.map((m) => `    ${m.name ?? m.id}`).join("\n") +
+          `\n\n  An installer dialog is usually what is holding them up. Wait for the ` +
+          `install to finish,\n  or pass --allow-incomplete if that is genuinely what you want.\n`,
+      );
+    }
+  }
+
   return runAnswering(mcp, options, "deploy", async (timeoutMs) => {
     await mcp.call("vortex_dispatch", { action: "deploy-mods", args: ["__CALLBACK__"] }, timeoutMs);
   });
