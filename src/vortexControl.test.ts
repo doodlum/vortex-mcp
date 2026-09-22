@@ -653,6 +653,15 @@ describe("vortexControl: listCategories", () => {
 });
 
 describe("vortexControl: games", () => {
+  // The launch-fallback tests below override knownGames. Restore the module
+  // mock's default afterwards, or the override leaks into unrelated suites —
+  // it silently broke listRuntimeErrors, which just wants fallout4 to exist.
+  afterEach(() => {
+    vi.mocked(selectors.knownGames).mockImplementation(
+      () => [{ id: "skyrimse" }, { id: "skyrimvr" }, { id: "fallout4" }] as never,
+    );
+  });
+
   it("launchGame resolves the primary tool via settings.interface/gameMode.discovered and runs it", async () => {
     vi.mocked(selectors.activeGameId).mockReturnValue("skyrimse");
     const api = fakeApi();
@@ -683,13 +692,90 @@ describe("vortexControl: games", () => {
     });
   });
 
-  it("launchGame throws when the game has no primary tool configured", async () => {
+  it("launchGame falls back to the game's own executable when no primary tool is set", async () => {
+    // The overwhelmingly common case — a freshly-managed game has no primary
+    // tool — and it used to throw, making "launch the game" unusable for
+    // exactly the profiles this harness creates.
+    vi.mocked(selectors.knownGames).mockReturnValue([
+      { id: "skyrimse", executable: "SkyrimSE.exe" },
+    ] as never);
+    const api = fakeApi();
+    (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+      settings: {
+        interface: { primaryTool: {} },
+        gameMode: { discovered: { skyrimse: { path: "C:/Games/SkyrimSE" } } },
+      },
+    });
+    const runExecutable = vi.fn(async () => undefined);
+    (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+    await launchGame(api, "skyrimse");
+
+    expect(runExecutable).toHaveBeenCalledWith(
+      expect.stringContaining("SkyrimSE.exe"),
+      [],
+      expect.objectContaining({ suggestDeploy: true }),
+    );
+  });
+
+  it("launchGame prefers the executable discovery recorded over the extension's", async () => {
+    // Someone who renamed or relocated the binary is recorded in discovery and
+    // nowhere else, so that has to win.
+    vi.mocked(selectors.knownGames).mockReturnValue([
+      { id: "skyrimse", executable: "SkyrimSE.exe" },
+    ] as never);
+    const api = fakeApi();
+    (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+      settings: {
+        interface: { primaryTool: {} },
+        gameMode: {
+          discovered: { skyrimse: { path: "C:/Games/SkyrimSE", executable: "skse64_loader.exe" } },
+        },
+      },
+    });
+    const runExecutable = vi.fn(async () => undefined);
+    (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+    await launchGame(api, "skyrimse");
+
+    expect(runExecutable).toHaveBeenCalledWith(
+      expect.stringContaining("skse64_loader.exe"),
+      [],
+      expect.anything(),
+    );
+  });
+
+  it("launchGame falls back to requiredFiles when the extension declares no executable", async () => {
+    vi.mocked(selectors.knownGames).mockReturnValue([
+      { id: "skyrimse", requiredFiles: ["SkyrimSE.exe"] },
+    ] as never);
+    const api = fakeApi();
+    (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+      settings: {
+        interface: { primaryTool: {} },
+        gameMode: { discovered: { skyrimse: { path: "C:/Games/SkyrimSE" } } },
+      },
+    });
+    const runExecutable = vi.fn(async () => undefined);
+    (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+    await launchGame(api, "skyrimse");
+
+    expect(runExecutable).toHaveBeenCalledWith(
+      expect.stringContaining("SkyrimSE.exe"),
+      [],
+      expect.anything(),
+    );
+  });
+
+  it("launchGame throws when there is neither a primary tool nor a discovered path", async () => {
+    vi.mocked(selectors.knownGames).mockReturnValue([{ id: "skyrimse" }] as never);
     const api = fakeApi();
     (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
       settings: { interface: { primaryTool: {} }, gameMode: { discovered: {} } },
     });
 
-    await expect(launchGame(api, "skyrimse")).rejects.toThrow(/No primary tool configured/);
+    await expect(launchGame(api, "skyrimse")).rejects.toThrow(/no discovered install path/);
   });
 
   it("launchGame throws when the configured primary tool isn't in discovered tools", async () => {

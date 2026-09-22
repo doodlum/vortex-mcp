@@ -1441,33 +1441,97 @@ export async function launchGame(
   assertExpectedContext(api, expectedContext);
   const st = state(api);
   const targetGameId = resolveGameId(gameId, st);
+
+  const discovery = queryStatePath(api, ["settings", "gameMode", "discovered", targetGameId]) as
+    | { path?: string; executable?: string }
+    | undefined;
+
   const toolId = queryStatePath(api, ["settings", "interface", "primaryTool", targetGameId]) as
     | string
     | undefined;
-  if (toolId === undefined) {
+
+  if (toolId !== undefined) {
+    const tool = queryStatePath(api, [
+      "settings",
+      "gameMode",
+      "discovered",
+      targetGameId,
+      "tools",
+      toolId,
+    ]) as DiscoveredTool | undefined;
+    if (tool === undefined) {
+      throw new Error(`Primary tool '${toolId}' for ${targetGameId} is not in discovered tools.`);
+    }
+    await api.runExecutable(tool.path, tool.parameters ?? [], {
+      cwd: tool.workingDirectory,
+      shell: tool.shell ?? false,
+      detach: tool.detach ?? true,
+      suggestDeploy: true,
+    });
+    log("info", "[vortex-mcp] launched game", { gameId: targetGameId, toolId, path: tool.path });
+    return;
+  }
+
+  // No primary tool: fall back to the game's own executable, which is what
+  // Vortex's Play button does and what this tool's description has always
+  // promised ("or the vanilla exe if none is set"). Throwing instead meant
+  // "launch the game" failed on any profile where nobody had picked a tool —
+  // which is most of them, and every freshly-managed game.
+  // Only the fallback needs the install path — a primary tool carries its own
+  // absolute path and can live anywhere.
+  if (discovery?.path === undefined) {
     throw new Error(
-      `No primary tool configured for ${targetGameId} (settings.interface.primaryTool). ` +
-        "Set one in Vortex's Tools page first.",
+      `${targetGameId} has no primary tool configured and no discovered install path, ` +
+        `so there is nothing to launch.`,
     );
   }
-  const tool = queryStatePath(api, [
-    "settings",
-    "gameMode",
-    "discovered",
-    targetGameId,
-    "tools",
-    toolId,
-  ]) as DiscoveredTool | undefined;
-  if (tool === undefined) {
-    throw new Error(`Primary tool '${toolId}' for ${targetGameId} is not in discovered tools.`);
+
+  const executable = resolveGameExecutable(api, targetGameId, discovery);
+  if (executable === undefined) {
+    throw new Error(
+      `No primary tool is configured for ${targetGameId} and its executable could not be ` +
+        `determined from the game extension. Set a primary tool in Vortex's Tools page.`,
+    );
   }
-  await api.runExecutable(tool.path, tool.parameters ?? [], {
-    cwd: tool.workingDirectory,
-    shell: tool.shell ?? false,
-    detach: tool.detach ?? true,
+
+  const fullPath = path.isAbsolute(executable) ? executable : path.join(discovery.path, executable);
+  await api.runExecutable(fullPath, [], {
+    cwd: path.dirname(fullPath),
+    shell: false,
+    detach: true,
     suggestDeploy: true,
   });
-  log("info", "[vortex-mcp] launched game", { gameId: targetGameId, toolId, path: tool.path });
+  log("info", "[vortex-mcp] launched game executable", {
+    gameId: targetGameId,
+    path: fullPath,
+  });
+}
+
+/**
+ * The game's own executable, preferring what discovery recorded over what the
+ * extension declares: a user who relocated or renamed the binary is recorded
+ * there and nowhere else.
+ */
+function resolveGameExecutable(
+  api: IExtensionApi,
+  gameId: string,
+  discovery: { executable?: string },
+): string | undefined {
+  if (discovery.executable !== undefined && discovery.executable !== "") {
+    return discovery.executable;
+  }
+
+  const known = selectors.knownGames(state(api)) as {
+    id: string;
+    executable?: string;
+    requiredFiles?: string[];
+  }[];
+  const game = known.find((g) => g.id === gameId);
+  if (game?.executable !== undefined && game.executable !== "") return game.executable;
+
+  // Last resort: an extension that declares no executable almost always lists
+  // the binary among the files it requires to consider the game installed.
+  return game?.requiredFiles?.[0];
 }
 
 export interface DownloadSummary {

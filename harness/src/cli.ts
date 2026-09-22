@@ -26,6 +26,7 @@ import { ensureExtensionBuilt } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
+import { installCollection } from "./collections";
 import {
   buildVortexSource,
   detectGitHubUser,
@@ -147,6 +148,11 @@ Driving the UI (one-shot; needs a running instance)
     --full-page          Capture the whole scrollable page
   tools                  List every MCP tool the instance exposes
 
+Collections (needs a Nexus API key — they cannot be downloaded anonymously)
+  collection <url>       Download and install a Nexus collection, then wait for
+                         every member mod to finish. Accepts a website URL, an
+                         nxm:// link, or <game>/<slug>.
+
 Testing
   responsive             Sweep window sizes, report width-dependent issues
     --screenshots        Also save a PNG per size
@@ -176,7 +182,7 @@ A Nexus API key is needed only for Nexus downloads. See AGENTS.md.
 `;
 
 async function main(): Promise<number> {
-  const { command, flags } = parseArgs(process.argv.slice(2));
+  const { command, flags, positional } = parseArgs(process.argv.slice(2));
 
   if (command === "help" || flags.help === true) {
     log(HELP);
@@ -398,6 +404,23 @@ async function main(): Promise<number> {
 
       log("");
       log("Ready. `pnpm run ai:up` will now drive this clone.");
+      return 0;
+    }
+
+    case "collection": {
+      const mcp = await requireRunning(config);
+      const target = typeof flags.url === "string" ? flags.url : positional[0];
+      if (target === undefined) {
+        throw new ConfigError(`collection needs a collection to install, e.g.
+  vortex-ai collection https://next.nexusmods.com/fallout4/collections/<slug>`);
+      }
+      const result = await installCollection(mcp, target, {
+        onProgress: (m) => log(`  ${m}`),
+      });
+      log("");
+      log(`Installed collection ${result.ref.slug} (${result.ref.gameId})`);
+      log(`  mod id: ${result.modId ?? "unknown"}`);
+      log(`  mods now installed: ${String(result.modCount)}`);
       return 0;
     }
 
