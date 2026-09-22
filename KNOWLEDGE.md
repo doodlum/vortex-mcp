@@ -42,6 +42,44 @@ Vortex expects `<appData>/<appName>/startup.json` to exist before launch.
 Create the wrong one and Vortex quits during startup with an unrecoverable
 ENOENT on `startup.json`, which reads like a corrupt profile.
 
+## Accounts
+
+### An API key logs you in, but not for collections
+
+`isLoggedIn` is `truthy(APIKey) || truthy(OAuthCredentials)`, so setting an API
+key satisfies every check the UI makes — the account shows as signed in, and the
+Log in button disappears.
+
+Collection downloads are authenticated separately, with OAuth. With only an API
+key the download is dispatched and _then_ 401s, surfaced as _"You are not logged
+in to Nexus Mods!"_, long after everything said you were signed in. So a
+collection install must check for `OAuthCredentials` specifically; checking
+`isLoggedIn` passes and then fails minutes later.
+
+Two consequences worth planning around:
+
+- **The API key hides the way to fix it.** Because it satisfies `isLoggedIn`,
+  Vortex offers only Logout, and the OAuth flow is unreachable until you log
+  out — someone's account session, so ask before ending it.
+- **OAuth means a captcha**, which nothing can automate. One interactive login
+  is unavoidable.
+
+### Keep the login by copying the directory, not the token
+
+The credential lives in the instance's working directory, so a reset loses it
+and the next collection install fails. `save-login` copies that directory over
+the snapshot, which cold starts are seeded from.
+
+Copying beats reading the token out of state and re-seeding it the way the API
+key is seeded: the credential stays opaque bytes, and there is no dependence on
+whatever shape Vortex stores tokens in. Stop Vortex cleanly first — it flushes
+state only on window close, and a snapshot taken around a half-written state
+database surfaces much later as apparent corruption.
+
+The marker records _that_ a login was captured, as a flag. Knowing the step was
+done is all the harness needs; inspecting the credential to find out would be
+handling a secret for no reason.
+
 ## Isolation
 
 ### `VORTEX_E2E=1` is load-bearing, and hostile to discovery
