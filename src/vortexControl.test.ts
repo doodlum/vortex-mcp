@@ -750,6 +750,45 @@ describe("vortexControl: games", () => {
     }
   });
 
+  it("launchGame falls back when the primary tool starts nothing", async () => {
+    // A stale loader — an F4SE built for another game version, say — exists on
+    // disk and spawns cleanly, then exits having started nothing. That is
+    // indistinguishable from a loader that handed off correctly, because both
+    // leave no tool process behind, so the game itself is what gets watched.
+    const toolRoot = await mkdtemp(path.join(os.tmpdir(), "vortex-mcp-test-tool-"));
+    const toolPath = path.join(toolRoot, "loader.exe");
+    await writeFile(toolPath, "");
+
+    try {
+      vi.mocked(selectors.knownGames).mockReturnValue([
+        { id: "skyrimse", executable: "DefinitelyNotRunning.exe" },
+      ] as never);
+      const api = fakeApi();
+      (api as unknown as { store: { getState: () => unknown } }).store.getState = () => ({
+        settings: {
+          interface: { primaryTool: { skyrimse: "skse" } },
+          gameMode: {
+            discovered: {
+              skyrimse: { path: "C:/Games/SkyrimSE", tools: { skse: { path: toolPath } } },
+            },
+          },
+        },
+      });
+      const runExecutable = vi.fn(async () => undefined);
+      (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
+
+      const launched = await launchGame(api, "skyrimse", { processWaitMs: 0 });
+
+      // The tool first, then the game itself once nothing showed up.
+      expect(runExecutable).toHaveBeenCalledTimes(2);
+      expect(runExecutable.mock.calls[0]?.[0]).toBe(toolPath);
+      expect(String(runExecutable.mock.calls[1]?.[0])).toContain("DefinitelyNotRunning.exe");
+      expect(launched).toContain("DefinitelyNotRunning.exe");
+    } finally {
+      await rm(toolRoot, { recursive: true, force: true });
+    }
+  });
+
   it("launchGame ignores a primary tool whose executable no longer exists", async () => {
     // Profiles carry their recorded tools, so a seeded or restored instance
     // routinely names a path that is gone. Vortex spawns it anyway, the process

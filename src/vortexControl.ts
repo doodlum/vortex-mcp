@@ -1,8 +1,12 @@
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { open, readdir, readFile, stat } from "node:fs/promises";
 
 import { actions, selectors, util, fs, log, types } from "@nexusmods/vortex-api";
+
+const execFileAsync = promisify(execFile);
 
 type IExtensionApi = types.IExtensionApi;
 type IMod = types.IMod;
@@ -1434,10 +1438,18 @@ interface DiscoveredTool {
  * surfaces the "files changed outside Vortex" prompt list_dialogs/closeDialog exist for.
  */
 /** Returns the executable actually launched, which is not always the one asked for. */
+export interface LaunchOptions extends ExpectedContext {
+  /**
+   * How long to wait for the game's process to appear before deciding the
+   * primary tool started nothing. Exposed so tests need not wait it out.
+   */
+  processWaitMs?: number;
+}
+
 export async function launchGame(
   api: IExtensionApi,
   gameId?: string,
-  expectedContext?: ExpectedContext,
+  expectedContext?: LaunchOptions,
 ): Promise<string> {
   assertExpectedContext(api, expectedContext);
   const st = state(api);
@@ -1490,8 +1502,33 @@ export async function launchGame(
         detach: tool.detach ?? true,
         suggestDeploy: true,
       });
-      log("info", "[vortex-mcp] launched game", { gameId: targetGameId, toolId, path: tool.path });
-      return tool.path;
+
+      // Spawning the tool proves nothing about whether the game started. A
+      // loader-style tool exits as soon as it has handed off, so the tool's own
+      // process is not the thing to watch — and a stale one (a backup F4SE
+      // built for another game version, say) exits the same way having started
+      // nothing. Both look identical from here, so watch for the *game*.
+      const gameExe = resolveGameExecutable(api, targetGameId, discovery ?? {});
+      const started =
+        gameExe === undefined ||
+        (await waitForProcess(path.basename(gameExe), expectedContext?.processWaitMs));
+      if (started) {
+        log("info", "[vortex-mcp] launched game", {
+          gameId: targetGameId,
+          toolId,
+          path: tool.path,
+        });
+        return tool.path;
+      }
+      log(
+        "warn",
+        "[vortex-mcp] primary tool started nothing; falling back to the game executable",
+        {
+          gameId: targetGameId,
+          toolId,
+          path: tool.path,
+        },
+      );
     }
   }
 
@@ -1537,6 +1574,39 @@ export async function launchGame(
  * Treats an unreadable path as missing: the question being asked is "can this be
  * launched", and anything that cannot be stat'd cannot.
  */
+/**
+ * Wait for a process with this image name to appear.
+ *
+ * Deliberately a poll on the OS process list rather than anything Vortex
+ * tracks: Vortex records the PID of the tool it spawned, which for a loader is
+ * a process that is *supposed* to be gone moments later.
+ *
+ * A false positive is possible — the game may already have been running — and
+ * is the right way to be wrong: it means "do not launch a second copy".
+ */
+async function waitForProcess(imageName: string, timeoutMs: number = 15_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await processRunning(imageName)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  return false;
+}
+
+async function processRunning(imageName: string): Promise<boolean> {
+  const [command, args] =
+    process.platform === "win32"
+      ? (["tasklist", ["/FI", `IMAGENAME eq ${imageName}`, "/NH"]] as const)
+      : (["pgrep", ["-x", imageName]] as const);
+  try {
+    const { stdout } = await execFileAsync(command, [...args], { windowsHide: true });
+    return stdout.toLowerCase().includes(imageName.toLowerCase());
+  } catch {
+    // pgrep exits non-zero when nothing matches, which is an answer, not a fault.
+    return false;
+  }
+}
+
 async function executableMissing(executablePath: string): Promise<boolean> {
   try {
     await stat(executablePath);
