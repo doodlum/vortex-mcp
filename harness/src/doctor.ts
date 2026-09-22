@@ -117,7 +117,7 @@ function checkVortex(config: HarnessConfig): Check {
       detail: built
         ? `source build at ${target.sourceDir ?? "?"}`
         : `source checkout at ${target.sourceDir ?? "?"} is not built`,
-      fix: "pnpm nx run @vortex/main:build (in the Vortex checkout)",
+      fix: "pnpm run ai:source   (installs and builds the clone)",
     };
   }
 
