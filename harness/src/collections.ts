@@ -244,6 +244,8 @@ export async function installCollection(
     signal: controller.signal,
     pollMs: 1_500,
     onAnswer: (a) => report(`answered [${a.clicked}] ${a.dialog.slice(0, 55)}`),
+    onUnanswerable: (d, wanted) =>
+      report(`STUCK: no button matching ${wanted} in "${d.slice(0, 60)}"`),
   });
   // Member mods ship FOMOD installers that block the driver until someone picks
   // options. Unattended is the whole point of this function, so accept their

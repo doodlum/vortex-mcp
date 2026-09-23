@@ -267,9 +267,16 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
     because: "the harness already registered the game's path explicitly",
   },
   {
+    // The footer is Cancel / Confirm; the rows are per-file dropdowns that
+    // Vortex has already defaulted. Confirm accepts those defaults. An earlier
+    // version matched /^(apply|continue|save changes)$/, which matches none of
+    // the real buttons — so the policy looked present, never fired, and a purge
+    // sat behind an unanswered modal until it timed out.
     match: /external changes/i,
-    button: /^(apply|continue|save changes)$/i,
-    because: "files changed outside Vortex; keeping them is the non-destructive answer",
+    button: /^confirm$/i,
+    because:
+      "files changed outside Vortex; Confirm accepts the per-file defaults it has " +
+      "already chosen, which during a purge means letting the removals stand",
   },
 ];
 
@@ -302,11 +309,22 @@ export function autoAnswerDialogs(
     signal: AbortSignal;
     pollMs?: number;
     onAnswer?: (answered: AnsweredDialog) => void;
+    /**
+     * A policy matched the dialog but its button was not found.
+     *
+     * Worth surfacing loudly. The dialog stays open and blocks whatever raised
+     * it, and from the outside that is indistinguishable from a hang — an
+     * External Changes policy whose button regex matched none of the real
+     * buttons silently stalled a purge here until it timed out.
+     */
+    onUnanswerable?: (dialog: string, wanted: string) => void;
   },
 ): Promise<AnsweredDialog[]> {
   const policies = options.policies ?? DEFAULT_DIALOG_POLICIES;
   const pollMs = options.pollMs ?? 1_000;
   const answered: AnsweredDialog[] = [];
+  // Report each stuck dialog once, not on every poll.
+  const warned = new Set<string>();
 
   return (async () => {
     while (!options.signal.aborted) {
@@ -321,7 +339,13 @@ export function autoAnswerDialogs(
         if (policy === undefined) continue;
 
         const clicked = await clickInsideDialog(mcp, text, policy.button);
-        if (clicked === undefined) continue;
+        if (clicked === undefined) {
+          if (!warned.has(text)) {
+            warned.add(text);
+            options.onUnanswerable?.(text.slice(0, 160), String(policy.button));
+          }
+          continue;
+        }
 
         const record: AnsweredDialog = {
           dialog: text.slice(0, 160),

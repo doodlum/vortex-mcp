@@ -133,6 +133,8 @@ async function runAnswering(
     signal: controller.signal,
     pollMs: 1_000,
     onAnswer: (a) => report(`answered [${a.clicked}] ${a.dialog.slice(0, 55)}`),
+    onUnanswerable: (d, wanted) =>
+      report(`STUCK: no button matching ${wanted} in "${d.slice(0, 60)}"`),
   });
 
   try {
