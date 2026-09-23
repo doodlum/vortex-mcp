@@ -20,6 +20,12 @@ import { ensureExtensionBuilt, stopStaleInstance } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
+import { startRecording } from "./recording";
+import {
+  formatPullRequestChecks,
+  inspectPullRequestChecks,
+  pullRequestChecksPassed,
+} from "./prChecks";
 import { captureLogin } from "./bootstrap";
 import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
 import { sandboxConfig } from "./sandbox";
@@ -173,6 +179,8 @@ Instance lifecycle
     --update             Fetch origin and upstream in an existing clone
     --no-build           Clone only
     --where              Print managed source path
+  pr-checks <pr>         Diagnose current GitHub checks and their failed steps
+    --repo <owner/name>  Repository to inspect (default: Nexus-Mods/Vortex)
 
 Driving a running instance
   tools --json           Discover every live tool and its full input schema
@@ -183,6 +191,7 @@ Driving a running instance
   fill --ref <ref> --value <text>
   press --key <Enter>     DOM key events; native typing/defaults require CDP
   screenshot             Save PNG; --label <name>, --full-page
+  record                 Save WebM; --ffmpeg <path> --seconds <1-60> --label <name>
   install <archive>      Install local ZIP/7z through Vortex; no account needed
   collection <url>       Install exact Nexus collection/revision using OAuth
   deploy                 Deploy enabled mods for the active game
@@ -220,6 +229,17 @@ async function main(): Promise<number> {
   if (command === "help" || flags.help === true) {
     log(HELP);
     return 0;
+  }
+
+  if (command === "pr-checks") {
+    const ref = positional[0];
+    if (ref === undefined) throw new ConfigError("pr-checks needs a PR number or URL.");
+    const report = await inspectPullRequestChecks(
+      ref,
+      typeof flags.repo === "string" ? flags.repo : undefined,
+    );
+    log(flags.json === true ? JSON.stringify(report, null, 2) : formatPullRequestChecks(report));
+    return pullRequestChecksPassed(report) ? 0 : 1;
   }
 
   const config = configFrom(flags);
@@ -463,6 +483,32 @@ async function main(): Promise<number> {
           }
         },
       });
+      return 0;
+    }
+
+    case "record": {
+      const seconds = Number(flags.seconds ?? 15);
+      if (
+        !Number.isFinite(seconds) ||
+        seconds < 1 ||
+        seconds > 60 ||
+        typeof flags.ffmpeg !== "string"
+      ) {
+        throw new ConfigError(
+          "record requires --ffmpeg <executable> and --seconds between 1 and 60",
+        );
+      }
+      await requireRunning(config);
+      const recording = await startRecording(config, {
+        encoder: flags.ffmpeg,
+        label: typeof flags.label === "string" ? flags.label : "recording",
+      });
+      log(`Recording Vortex for ${seconds} seconds`);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+      } finally {
+        log(await recording.stop());
+      }
       return 0;
     }
 

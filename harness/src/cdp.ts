@@ -87,7 +87,22 @@ export async function captureScreenshot(
     const label = (options.label ?? "screenshot").replace(/[^a-zA-Z0-9._-]/g, "_");
     const file = path.join(config.artifactDir, `${label}-${stamp}.png`);
 
-    await handle.page.screenshot({ path: file, fullPage: options.fullPage === true });
+    if (options.fullPage === true) {
+      await handle.page.screenshot({ path: file, fullPage: true });
+    } else {
+      // Playwright's viewport clip can crop Electron windows at non-default zoom.
+      // Let Chromium capture its surface without deriving a clip from CSS pixels.
+      const session = await handle.page.context().newCDPSession(handle.page);
+      try {
+        const result = await session.send("Page.captureScreenshot", {
+          format: "png",
+          captureBeyondViewport: false,
+        });
+        fs.writeFileSync(file, Buffer.from(result.data, "base64"));
+      } finally {
+        await session.detach();
+      }
+    }
     return file;
   } finally {
     // Only close what we opened; a caller-supplied handle stays alive so a
@@ -112,6 +127,27 @@ export async function realHover(
   const handle = options.handle ?? (await attachToRenderer(config));
   try {
     await handle.page.hover(selector, { timeout: options.timeoutMs ?? 15_000 });
+  } finally {
+    if (options.handle === undefined) await handle.close();
+  }
+}
+
+/** Send a native wheel gesture, including modifiers; DOM scroll does not exercise zoom shortcuts. */
+export async function realWheel(
+  config: HarnessConfig,
+  selector: string,
+  deltaY: number,
+  options: { handle?: RendererHandle; control?: boolean } = {},
+): Promise<void> {
+  const handle = options.handle ?? (await attachToRenderer(config));
+  try {
+    await handle.page.hover(selector);
+    if (options.control) await handle.page.keyboard.down("Control");
+    try {
+      await handle.page.mouse.wheel(0, deltaY);
+    } finally {
+      if (options.control) await handle.page.keyboard.up("Control");
+    }
   } finally {
     if (options.handle === undefined) await handle.close();
   }

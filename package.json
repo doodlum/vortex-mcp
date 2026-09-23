@@ -30,6 +30,7 @@
     "ai:down": "tsx harness/src/cli.ts down",
     "ai:watch": "tsx harness/src/cli.ts watch",
     "ai:test": "playwright test --config harness/playwright.config.ts",
+    "ai:test:zoom": "tsx harness/src/tests/zoom.e2e.ts",
     "ai:test:nexus": "tsx harness/src/tests/nexus-collection.e2e.ts",
     "install-plugin": "node scripts/install-local.mjs",
     "docs:tools": "node scripts/generate-readme-tools-table.mjs",

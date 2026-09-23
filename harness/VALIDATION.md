@@ -4,15 +4,19 @@ Validated on Windows on 2026-09-23 against released Vortex 2.6.3, with a separat
 authenticated installation run against the managed source build. These results
 describe this environment; they do not certify every game or extension.
 
-Final results: 230 unit tests and all 18 real-app tests passed. The opt-in Nexus
+Final results: 242 unit tests and all 18 stock-app tests passed. The opt-in zoom
+workflow also passed against the source build in signed-in and signed-out states.
+The opt-in Nexus
 smoke command passed with five required members and 474 verified deployed files.
 The documented `setup --oauth` command also captured and restored an existing
 login automatically. The original harness session was restored after review.
 
 | Layer             | Evidence                                                                                                                                               |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Repository gate   | `pnpm run ci`: extension/harness types, lint, formatting, 230 unit tests, build                                                                        |
+| Repository gate   | `pnpm run ci`: extension/harness types, lint, formatting, 242 unit tests, build                                                                        |
 | Real app          | `pnpm run ai:test`: disposable profiles and ports, sandbox game, no account                                                                            |
+| Zoom feature      | `pnpm run ai:test:zoom`: signed-in/out shortcuts, timers, focus, persistence, legacy isolation, every-frame geometry, recordings                       |
+| Pull requests     | `pr-checks 24274`: exact current head and green checks; unit fixtures distinguish test failures from report encryption/upload failures                 |
 | Lifecycle         | Cold, warm, fresh, no-game, game switch, clean shutdown, unsigned capture rejection                                                                    |
 | UI                | React search/fill/clear, exact targeting, disabled control, stale refs, keys, select, scroll, real hover, waits, screenshots, console, renderer reload |
 | Responsive        | Width and height changes independently, recorded dimensions, PNGs and JSON findings, original size restored                                            |

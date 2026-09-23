@@ -35,6 +35,40 @@ export function hasVortexSource(dir = vortexSourceDir()): boolean {
 
 export class ForkError extends Error {}
 
+export interface PackageManagerCommand {
+  cmd: string;
+  args: string[];
+  version: string;
+  exact: boolean;
+}
+
+/** Parse the package manager declared by a source checkout, ignoring Corepack's hash suffix. */
+export function parsePnpmVersion(packageManager: string | undefined): string {
+  const match = /^pnpm@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+.*)?$/.exec(packageManager ?? "");
+  if (match?.[1] === undefined) {
+    throw new ForkError(
+      `Vortex must declare an exact pnpm version in package.json; found ${packageManager ?? "nothing"}.`,
+    );
+  }
+  return match[1];
+}
+
+/** Use the installed pnpm only when it exactly matches; otherwise bootstrap the pinned version. */
+export function selectPnpmCommand(
+  wantedVersion: string,
+  installedVersion: string | undefined,
+): PackageManagerCommand {
+  if (installedVersion === wantedVersion) {
+    return { cmd: "pnpm", args: [], version: wantedVersion, exact: true };
+  }
+  return {
+    cmd: "pnpm",
+    args: ["dlx", `pnpm@${wantedVersion}`],
+    version: wantedVersion,
+    exact: false,
+  };
+}
+
 /**
  * Environment for a nested package-manager run.
  *
@@ -100,14 +134,32 @@ function runStreaming(
   });
 }
 
-async function tryExec(cmd: string, args: string[]): Promise<string | undefined> {
+async function tryExec(
+  cmd: string,
+  args: string[],
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync(cmd, args, { shell: true, timeout: 20_000 });
+    const { stdout } = await execFileAsync(cmd, args, {
+      shell: true,
+      timeout: 20_000,
+      cwd: options.cwd,
+      env: options.env,
+    });
     const out = stdout.trim();
     return out === "" ? undefined : out;
   } catch {
     return undefined;
   }
+}
+
+async function sourcePnpmCommand(dir: string): Promise<PackageManagerCommand> {
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")) as {
+    packageManager?: string;
+  };
+  const wanted = parsePnpmVersion(manifest.packageManager);
+  const installed = await tryExec("pnpm", ["--version"], { cwd: dir, env: childEnv() });
+  return selectPnpmCommand(wanted, installed);
 }
 
 /**
@@ -297,13 +349,22 @@ export async function buildVortexSource(options: EnsureSourceOptions = {}): Prom
   }
 
   report("installing dependencies (slow: native modules are rebuilt)");
+  const pnpm = await sourcePnpmCommand(dir);
+  report(
+    pnpm.exact
+      ? `using Vortex's pinned pnpm ${pnpm.version}`
+      : `installed pnpm does not match; bootstrapping Vortex's pinned pnpm ${pnpm.version} with pnpm dlx`,
+  );
   // Minutes, not seconds: an Electron binary download plus six native module
   // rebuilds. The output is streamed so that is visible rather than looking hung.
-  await runStreaming("pnpm", ["install"], { cwd: dir, label: "Installing Vortex's dependencies" });
+  await runStreaming(pnpm.cmd, [...pnpm.args, "install"], {
+    cwd: dir,
+    label: "Installing Vortex's dependencies",
+  });
 
   report("building renderer and main");
   try {
-    await runStreaming("pnpm", ["nx", "run", "@vortex/main:build"], {
+    await runStreaming(pnpm.cmd, [...pnpm.args, "nx", "run", "@vortex/main:build"], {
       cwd: dir,
       label: "Building Vortex",
     });

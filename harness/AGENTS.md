@@ -45,9 +45,28 @@ Normal UI commands only need the running instance's MCP port and token.
 
 If pnpm reports a dependency-layout mismatch or asks to remove node_modules,
 check `pnpm --version` against package.json before changing the lockfile. Use the
-repository's pinned package manager. A sandboxed agent may need approval to
+repository's pinned package manager. `vortex-ai source` checks the Vortex
+checkout's `packageManager` field and bootstraps that exact version with
+`pnpm dlx` when the pnpm on `PATH` differs. A sandboxed agent may need approval to
 launch subprocesses or GUI applications; that is a host permission, not an OAuth
 or Vortex setup step.
+
+## Recording a feature
+
+`vortex-ai record --ffmpeg <executable> --seconds 15 --label zoom-demo` records
+only the Vortex renderer to a WebM in the artifact directory. Drive the app from
+another CLI or MCP session while it records. Durations are limited to 60 seconds.
+The encoder must support MJPEG input and VP8/WebM output; Playwright's bundled
+FFmpeg (`pnpm exec playwright install ffmpeg`) supports both. `startRecording`
+in `harness/src/recording.ts` also supports scripted demos with an explicit stop.
+The recorder repeats unchanged frames, preserving real pauses and popup timers.
+
+For inline PR media, GitHub CLI 2.99+ supports `gh pr edit --attach <file>`.
+Use Markdown image references to the same local paths in `--body-file`; the CLI
+uploads them as native attachments and rewrites those references. This avoids a
+media branch or browser upload. Check repository push access first. GIFs and
+images must be under 10 MB. Preserve actual recording durations when converting
+videos so timer demonstrations remain accurate.
 
 ## Optional Nexus setup: interact once, cache automatically
 
@@ -152,22 +171,23 @@ Virtualized rows must first be filtered or scrolled into the DOM. Check
 snapshot/action sequences against its background dialog watchers; independent
 clients still need to coordinate UI actions.
 
-| Tool/path                                        | Use                                                                         |
-| ------------------------------------------------ | --------------------------------------------------------------------------- |
-| `ui_snapshot`                                    | Rendered tree, accessible names, refs, active dialogs; selector/index scope |
-| `ui_click`, `ui_fill`                            | Mouse sequence and React-compatible input changes                           |
-| `ui_press_key`                                   | DOM keyboard handlers; not native OS dialogs or browser text insertion      |
-| `ui_select_option`                               | Native select; custom dropdowns need click-then-click                       |
-| `ui_scroll`                                      | Scroll plus events for virtualized lists                                    |
-| `ui_wait_for`                                    | Poll selector/text; inspect `matched` because timeout returns false         |
-| `ui_hover`                                       | JavaScript hover handlers only                                              |
-| harness `realHover()`                            | Real mouse over CDP, including CSS `:hover`                                 |
-| `ui_get_viewport`, `ui_set_viewport`             | Read/resize actual window and renderer dimensions                           |
-| `ui_detect_layout_issues`, `ui_responsive_sweep` | Advisory layout findings                                                    |
-| `ui_read_console`                                | Renderer console/errors since a sequence number                             |
-| `nexus_auth_status`                              | Credential-presence booleans, never credentials                             |
-| `automation_status`                              | Isolated profile path and renderer lifetime ID                              |
-| `vortex_query`, `vortex_dispatch`                | Inspect state, invoke documented actions/events                             |
+| Tool/path                                        | Use                                                                                       |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| `ui_snapshot`                                    | Rendered tree, accessible names, refs, active dialogs; selector/index scope               |
+| `ui_click`, `ui_fill`                            | Mouse sequence and React-compatible input changes                                         |
+| `ui_press_key`                                   | DOM keyboard handlers; not native OS dialogs or browser text insertion                    |
+| `ui_select_option`                               | Native select; custom dropdowns need click-then-click                                     |
+| `ui_scroll`                                      | Scroll plus events for virtualized lists                                                  |
+| `ui_wait_for`                                    | Poll selector/text; inspect `matched` because timeout returns false                       |
+| `ui_hover`                                       | JavaScript hover handlers only                                                            |
+| harness `realHover()`                            | Real mouse over CDP, including CSS `:hover`                                               |
+| harness `realWheel()`                            | Native wheel input over CDP, optionally holding Control; releases the key even on failure |
+| `ui_get_viewport`, `ui_set_viewport`             | Read/resize actual window and renderer dimensions                                         |
+| `ui_detect_layout_issues`, `ui_responsive_sweep` | Advisory layout findings                                                                  |
+| `ui_read_console`                                | Renderer console/errors since a sequence number                                           |
+| `nexus_auth_status`                              | Credential-presence booleans, never credentials                                           |
+| `automation_status`                              | Isolated profile path and renderer lifetime ID                                            |
+| `vortex_query`, `vortex_dispatch`                | Inspect state, invoke documented actions/events                                           |
 
 Harness `clickByName`/`fillByName` use exact case-insensitive strings, or explicit
 regular expressions for partial matches, and reject ambiguous targets. Use
@@ -229,6 +249,44 @@ CI runs typechecking, lint, formatting checks, unit tests, and a build. The sepa
 Playwright suite drives real Vortex through MCP and asserts through Playwright or
 the filesystem. Say which suite ran and disclose skips. The app may make its own
 background network requests even when no Nexus account is needed for the test.
+
+For a Vortex pull request, run `pnpm run ai -- pr-checks <number-or-url>` first.
+It reads the current head through the authenticated `gh` CLI and expands failed
+jobs into their exact failed steps. In particular, it distinguishes a failing
+test step from successful tests followed by report encryption or upload failure.
+It exits nonzero while any check is pending or failed and supports
+`--repo <owner/name>` and `--json` for other repositories or automation.
+
+For an upstream E2E CI failure, first run its exact failing spec from
+`.vortex-src/packages/e2e` with `CI=1`, `VORTEX_E2E_HEADED` unset, and
+`pnpm exec playwright test src/tests/<spec>.spec.ts --workers=1 --retries=0`.
+Save before/after logs. Do not substitute the harness's visible app for that
+reproduction. Check the workflow's launch flags, credentials and actual test
+summary, not just its step conclusion. Animation tests need a rendered window;
+see the hidden-window entry in `KNOWLEDGE.md`. Test missing-credential skips with
+the account environment variables empty, alongside a signed-out smoke test.
+
+`pnpm run ai:test:zoom -- --signed-out` starts a separate anonymous profile on
+the next MCP/CDP ports, checks the same controls without an account, and stops it.
+Its cache lives under `zoom-signed-out`; it never logs out the active profile.
+
+`pnpm run ai:test:zoom` is an opt-in feature check against an already running
+source build with zoom controls. It exercises native Ctrl+wheel, the title-bar
+popover, Ctrl+plus/minus/zero, the three-second popup timer, reload persistence, bounds, and multiple
+window sizes. It also compares title-bar and popup screen coordinates from 50–150%
+in the modern layout, then checks that legacy has no zoom controls or chrome scaling
+overrides. When signed in, it also checks the profile menu's inline zoom
+controls and verifies the profile button stays fixed when the magnifier appears.
+It samples animation frames to check fade-in, fade-out, collapsing space, centered
+positioning, and reduced-motion behavior. It also checks matching icon sizes,
+outside-click dismissal, and the three-second timer when + or - reaches 100%.
+It also samples every animation frame during rapid zoom changes to catch transient
+movement of the title bar, icon, or popup. It restores the original zoom, layout, and window size
+and saves screenshots under `harness/.artifacts`. It needs no game or account.
+It is separate from the stock-compatible suite because released Vortex may not
+have these controls yet. `realWheel(config, selector, deltaY, { control: true })`
+is the reusable shortcut input path; `ui_scroll` changes scroll position and
+does not emulate a native wheel gesture.
 
 Run responsive checks in each relevant state, with distinct artifact labels.
 Test both width and height, inspect actual sizes after OS clamping, and visually

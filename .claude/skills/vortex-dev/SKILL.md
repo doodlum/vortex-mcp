@@ -81,6 +81,10 @@ Be honest about which suite ran. A full `pnpm run verify` in Vortex can fail for
 reasons that predate the change (broken bundled extensions with missing native
 modules); say so rather than reporting it as a regression or hiding it.
 
+For an upstream pull request, use `pnpm run ai -- pr-checks <pr>` before changing
+code. It reports the exact head and failed workflow steps, including whether the
+tests passed and only artifact post-processing failed.
+
 ## Git
 
 Branch from `master`; never commit to it. `origin` is the fork, `upstream` is

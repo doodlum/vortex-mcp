@@ -42,7 +42,9 @@ pnpm run ai:test
 
 Working on **Vortex itself** rather than this extension? `pnpm run ai:source`
 finds your Vortex fork on GitHub, clones it into `.vortex-src/` here, and builds
-it; `ai:up` then drives that clone instead of the installed app.
+it with the checkout's exact pinned pnpm; `ai:up` then drives that clone instead
+of the installed app. `pnpm run ai -- pr-checks <pr>` diagnoses the current PR
+head and tells test failures apart from artifact encryption or upload failures.
 
 For collections, run `pnpm run ai -- setup --installed --oauth` once and finish
 the browser login. Setup waits and caches automatically; refreshed credentials

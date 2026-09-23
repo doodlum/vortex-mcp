@@ -1,5 +1,29 @@
 # Vortex behaviours worth knowing
 
+### Transient zoom movement needs frame checks
+
+Settled bounds can pass even while chrome visibly jumps during a zoom gesture.
+Electron's native zoom updates can replay an older factor after React has already
+rendered compensation for a newer one. Modern zoom now uses CSS scaling and a
+shared CSS variable for the fixed chrome. `ai:test:zoom` samples every animation
+frame during rapid scaling, in addition to checking settled geometry.
+
+### A running source app can block verification
+
+Even without a dev watcher, the source app holds plugin DLLs such as `libloot.dll`
+open. Nx cache restoration reports only "Access is denied"; an uncached build
+reveals the locked file in `copy-extensions`. Stop the harness instance cleanly
+with `vortex-ai down` before the complete Vortex `verify` gate, then restart it.
+
+### Electron zoom and screenshot clipping
+
+At non-default `webFrame` zoom, Playwright's viewport screenshot can derive a
+CSS-pixel clip that crops the right and bottom of the actual Electron surface.
+This can falsely make title-bar buttons look off-screen. The harness now uses
+CDP `Page.captureScreenshot` without a clip and with `captureBeyondViewport: false`
+for viewport captures. Full-page captures retain Playwright's separate path.
+Check rendered bounds as well as screenshots when testing zoom.
+
 Things learned the hard way building and running this against a real Vortex.
 Every one of them fails _silently_, or with a message that points somewhere else.
 If you are debugging something baffling, start here.
@@ -136,6 +160,14 @@ faster than a scan and deterministic across machines anyway.
 
 ## Building Vortex from here
 
+### Electron window events can precede navigation
+
+Playwright can emit `window` while the main renderer still has an `about:blank`
+URL. Checking only that event for `index.html` misses a fully working Vortex and
+times out in fixture setup. Watch navigation on candidate windows too. After a
+renderer reload, wait for the title bar before asserting state: extension loading
+can outlast the default five-second assertion timeout.
+
 ### A nested package-manager run inherits the wrong pnpm
 
 `pnpm exec` exports a pile of `npm_*` / `PNPM_*` environment variables, and they
@@ -151,7 +183,12 @@ ERR_PNPM_SPEC_NOT_SUPPORTED_BY_ANY_RESOLVER  node@runtime:24.17.0
 
 Neither message mentions a version mismatch. The lockfile is fine; pnpm 9 just
 cannot read one pnpm 11 wrote, and does not understand `node@runtime:` specs.
-`childEnv()` in `harness/src/source.ts` strips those variables.
+`childEnv()` in `harness/src/source.ts` strips those variables. The source setup
+also reads Vortex's exact `packageManager` version: it uses `pnpm` directly only
+when that version matches, otherwise it runs the pinned version through
+`pnpm dlx`.
+This prevents a newer global pnpm from silently deciding to replace an existing
+dependency layout in a non-interactive session.
 
 ### Capturing output makes a slow step look like a hang
 
@@ -183,6 +220,29 @@ tile → the manage button.
 Match on the class where possible and treat the label as a fallback.
 
 ## The UI
+
+### A hidden Electron window does not paint like a visible one
+
+The upstream E2E suite defaults to `VORTEX_E2E_HEADLESS=1` and `--disable-gpu`.
+A local headed pass is not a CI pass. In the zoom regression, a hidden window
+produced only three animation frames in 2.2 seconds, and Headless UI's exit
+transition remained mounted after the three-second timer had fired. Both failures
+reproduced locally with `CI=1` and `VORTEX_E2E_HEADED` unset. Setting
+`webContents.setBackgroundThrottling(false)` did not help; Vortex already uses it.
+
+Tests that assert animation frames must render their own window:
+`const window = await vortexApp.browserWindow(vortexWindow);`
+`await window.evaluate(window => window.showInactive());`
+This retains the normal CI launch and GPU settings without taking keyboard focus.
+Keep the frame-count, geometry and timer assertions; do not lower them to make
+hidden-window throttling pass. Other tests can keep their windows hidden.
+
+CI also runs account tests without secrets on fork PRs, and its encrypted report
+step prompts and exits 255 when the password is empty. Separate these failures
+from UI regressions. A test step marked successful with `continue-on-error` does
+not mean its tests passed; read the Playwright summary in the log. The harness's
+`pr-checks` command correlates PR checks with workflow job steps and calls this
+out as a post-processing failure when the actual test step succeeded.
 
 ### Synthetic hover cannot trigger CSS `:hover`
 

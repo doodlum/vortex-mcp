@@ -13,6 +13,16 @@ test needs a capability that is missing; verify the workflow after adding it.
 
 ## The shape of a test
 
+When reproducing upstream CI, run the failing spec from `.vortex-src/packages/e2e`
+using its default hidden-window mode (`CI=1`, `VORTEX_E2E_HEADED` unset). Keep a
+failing log before editing and rerun that same command afterward. Our visible
+harness app alone does not reproduce CI's painting behavior. See `KNOWLEDGE.md`
+for the hidden-window animation issue and keep login/report-secret failures
+separate from feature assertions. Use real pointer and keyboard input to check
+`:focus-visible`; synthetic clicks cannot establish the browser's input modality.
+Start with `pnpm run ai -- pr-checks <pr>`: it expands failed GitHub jobs and
+separates test failures from report encryption/upload failures.
+
 Drive through **MCP**, assert through **Playwright**. That separation is the
 whole point: asserting an MCP tool's effect with the same MCP tools would pass
 even if both sides were wrong together.
@@ -57,6 +67,13 @@ app per assertion.
   than equality.
 - **Point at a disposable game directory** before running anything that deploys —
   see [harness/AGENTS.md](../../../harness/AGENTS.md).
+- For wheel shortcuts use harness `realWheel()` over CDP, with `control: true`
+  for Ctrl+wheel. It releases Control in a finally block. `ui_scroll` does not
+  exercise native wheel or browser zoom behavior. The opt-in `ai:test:zoom`
+  script checks applied scaling and UI behavior, including every rendered frame
+  during rapid zoom changes. Run it with `--signed-out` for an isolated anonymous
+  profile. `vortex-ai record --ffmpeg <path> --seconds 15 --label demo` captures
+  real-time WebM clips while another MCP/CLI session drives the app.
 
 ## Extension-level unit tests
 
