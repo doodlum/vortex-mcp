@@ -266,6 +266,26 @@ summary, not just its step conclusion. Animation tests need a rendered window;
 see the hidden-window entry in `KNOWLEDGE.md`. Test missing-credential skips with
 the account environment variables empty, alongside a signed-out smoke test.
 
+`pnpm run ai:test:large-library` is an opt-in performance check against a running
+sandbox instance, for reports that only large mod lists reproduce. It seeds
+3,000 small mods (`seedLibrary` in `harness/src/largeLibrary.ts` writes real staging
+folders and registers them with one `addMods` dispatch — seconds, no account) and
+fails when:
+
+- the Mods table renders more than 200 rows;
+- clearing its name filter blocks the renderer for over 2 s;
+- any scroll depth shows blank placeholder rows;
+- installing 10 mods in a row runs a single main-thread task over 1.5 s;
+- a deploy with the Mods page open takes over 1.6× one from Settings.
+
+Deploy times only count after it checks the purge emptied the fixture's files and the
+deploy linked all of them. Flags: `--mods <n>`, `--layout modern|classic`,
+`--installs <n>`, `--no-deploy`. It writes JSON evidence and a screenshot under
+`harness/.artifacts` and restores the layout. Stock 2.7.0 fails every budget (see
+KNOWLEDGE.md), so it is outside the stock-compatible `ai:test`. Run it against a
+source build with `up --dev-dir <checkout> --sandbox`, and against `--installed` for
+a baseline. Keep other CPU-heavy work (builds) off the machine while it measures.
+
 `pnpm run ai:test:zoom -- --signed-out` starts a separate anonymous profile on
 the next MCP/CDP ports, checks the same controls without an account, and stops it.
 Its cache lives under `zoom-signed-out`; it never logs out the active profile.

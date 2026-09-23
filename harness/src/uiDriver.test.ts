@@ -173,11 +173,14 @@ describe("dialogPolicies", () => {
  * spaces. Matching one against the other is what silently stalled three
  * separate runs.
  */
-function dialogMcp(): { mcp: VortexMcpClient; clicked: string[] } {
+function dialogMcp(body = "Mod files were changed outside Vortex."): {
+  mcp: VortexMcpClient;
+  clicked: string[];
+} {
   const clicked: string[] = [];
   const tree: SnapshotNode[] = [
     { ref: "r1", role: "heading", name: "External Changes" },
-    { ref: "r2", role: "text", text: "Mod files were changed outside Vortex." },
+    { ref: "r2", role: "text", text: body },
     { ref: "r3", role: "button", name: "Cancel deployment" },
     { ref: "r4", role: "button", name: "Confirm changes" },
   ];
@@ -192,7 +195,7 @@ function dialogMcp(): { mcp: VortexMcpClient; clicked: string[] } {
           nodeCount: tree.length,
           truncated: false,
           // No separator, exactly as Vortex reports it.
-          activeDialogs: scoped ? [] : ["External ChangesMod files were changed outside Vortex."],
+          activeDialogs: scoped ? [] : [`External Changes${body}`],
           tree,
         } satisfies Snapshot);
       }
@@ -217,5 +220,28 @@ describe("autoAnswerDialogs", () => {
 
     expect(clicked).toContain("r4");
     expect(answered[0]?.clicked).toBe("Confirm changes");
+  });
+
+  it("never confirms deleted links, whose default deletes the staging files", async () => {
+    // Vortex's own wording: every row defaults to "Save change (delete file)".
+    const { mcp, clicked } = dialogMcp(
+      'Mod files were changed outside Vortex. Links were deleted ("Save" will remove the ' +
+        'corresponding source files permanently, "Revert" will recreate the links)' +
+        "Revert all changes | Save all changes | example-mod 3 fileSave change (delete file)",
+    );
+    const refused: string[] = [];
+    const controller = new AbortController();
+    const answering = autoAnswerDialogs(mcp, {
+      signal: controller.signal,
+      pollMs: 1,
+      onUnanswerable: (_dialog, wanted) => refused.push(wanted),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    controller.abort();
+
+    expect(await answering).toEqual([]);
+    expect(clicked).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatch(/staging files/);
   });
 });

@@ -91,6 +91,7 @@ Run a sweep in each relevant state, using a distinct `--label` for artifacts:
 | --------------------------------- | ------------------------------------------------ |
 | Empty list / first run            | Setup guidance and primary action remain visible |
 | Populated or virtualized list     | Filtering, scrolling, selection, row actions     |
+| Thousands of mods                 | `ai:test:large-library`: rendered rows, freezes  |
 | Long names or localized text      | Wrapping, truncation, accessible names           |
 | Selection / expanded details      | Actions stay reachable; focus remains useful     |
 | Modal / stacked modal / installer | Dialog scope, scrollable body, footer actions    |

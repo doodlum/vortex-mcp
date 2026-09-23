@@ -371,10 +371,60 @@ Two things that look like details and are not:
   makes the rule fall through to _Back_ and walk the wizard backwards forever.
   Take the last button as it is, and if it is disabled, do nothing and re-poll.
 
+### The 2.7 Mods page renders every row, and that is the large-list slowdown
+
+On stock 2.7.0 (and 2.8-beta/master as of September 2026) the modern Mods page
+passes `stickyHeader` to SuperTable. That sets `.table-main-pane { overflow: visible }`
+so the page scrolls the table instead, but each row's `VisibilityProxy` still roots its
+IntersectionObserver at that pane. A root that doesn't clip counts its whole box as
+visible, so every row renders in full: 3,000 of 3,000 with 21 on screen. Nothing errors.
+It shows up only as slowness proportional to the mod count, which users reported as
+"deploy is 6× slower than 2.6", "clearing the filter takes 10–30 s" and "freezes during
+a collection install". Every dispatch (per-mod deploy progress, install steps) now
+re-runs thousands of rows' connected cells. The Mods page also stays mounted while
+hidden (`invisible`, not unmounted), so it slows other pages too, Plugins included.
+
+Measured with `ai:test:large-library`, 3,000 mods, unpatched vs patched master:
+
+- rows rendered: 3000 → 24;
+- filter clear: 11.0 s → 0.37 s;
+- deploy on the Mods page: 63 s → 31 s;
+- 20 sequential installs: 221 s → 33 s (longest freeze 2.4 s → 0.45 s).
+
+The stock 2.7.0 installer, same check: deploy on the Mods page took 403 s against 38 s
+from Settings (10.7×), in line with the reported 12 min against 2 min. At 10 installs the
+freeze budget did not trip on stock; use `--installs 20` or more to see that effect.
+
+The classic layout, whose pane scrolls itself, was never affected; use it as the
+in-build control. The fix roots the observer at the element that actually scrolls
+(`scrollContainerOf`). It lives on the Vortex branch `fix/sticky-table-virtualisation`.
+
+Traps found while measuring:
+
+- A deploy timing is worthless unless the purge before it removed the fixture's files.
+  Otherwise the next "deploy" is incremental and fast. Installing a mod triggers
+  Vortex's auto-deploy, which races a purge started right after and leaves files
+  behind, so the check turns auto-deploy off for its run.
+- Never delete fixture files a purge left behind while `vortex.deployment.json` still
+  lists them. (Copies no manifest lists, left by an interrupted run, are invisible to
+  Vortex and the check removes those.) Vortex still owns listed files, so the next
+  deploy stops on External Changes, "Links were deleted". Every row there defaults to
+  **Save change (delete file)**, which deletes the mods' _staging_ files. The
+  harness's Confirm policy would have accepted that for 3,000 mods; only the
+  snapshot's node limit hid the footer button. The policy now refuses whenever links
+  were deleted, and reports the dialog instead. Answer it in Vortex, with
+  **Revert all changes** to restore the links.
+- A long check piped through `Select-String` or `Select -Last` shows nothing until it
+  exits, so a hang looks like a slow run. Tee to a file, or watch progress through the
+  game directory and `list_notifications`.
+- tsx compiles named functions with an `__name` helper that the page does not have.
+  Pass `page.evaluate` source text, not a function, from harness scripts.
+
 ### Virtualised rows are not in the DOM
 
 Vortex's mod, plugin and game lists are windowed: a row simply does not exist
-until the list is narrowed or scrolled to it. Filter with the search box rather
+until the list is narrowed or scrolled to it (except the 2.7 Mods page — see above,
+where every row renders until the sticky-header fix lands). Filter with the search box rather
 than scrolling — far more reliable. And scrolling needs a real `scroll` **event**,
 not just a `scrollTop` assignment, or the new rows never mount.
 

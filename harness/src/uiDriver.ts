@@ -212,6 +212,12 @@ export interface DialogPolicy {
   button: string | RegExp;
   /** Why this answer is the right default — surfaced when it fires. */
   because: string;
+  /**
+   * A variant of the dialog that must be left for a person, even though `match`
+   * fits it: answering would destroy something no rerun can bring back. It is
+   * reported through `onUnanswerable` rather than clicked.
+   */
+  refuse?: { match: RegExp; because: string };
 }
 
 /**
@@ -305,6 +311,17 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
     because:
       "files changed outside Vortex; Confirm accepts the per-file defaults it has " +
       "already chosen, which during a purge means letting the removals stand",
+    // When deployed links were deleted, Vortex defaults every row to "Save change
+    // (delete file)", which removes the mods' STAGING files permanently. Found with a
+    // 3,000-mod fixture: only the snapshot's size limit stopped this policy from
+    // confirming it and wiping every staging folder. Revert would be safe for the
+    // staging files, but choosing between the two is the operator's call.
+    refuse: {
+      match: /links were deleted|delete file/i,
+      because:
+        "deployed links were deleted, and confirming the default would permanently delete " +
+        "the mods' staging files; choose Revert or Save in Vortex",
+    },
   },
 ];
 
@@ -370,6 +387,14 @@ export function autoAnswerDialogs(
           if (!warned.has(text)) {
             warned.add(text);
             options.onUnanswerable?.(text.slice(0, 160), "a documented dialog policy");
+          }
+          continue;
+        }
+
+        if (policy.refuse?.match.test(text) === true) {
+          if (!warned.has(text)) {
+            warned.add(text);
+            options.onUnanswerable?.(text.slice(0, 160), `nothing: ${policy.refuse.because}`);
           }
           continue;
         }

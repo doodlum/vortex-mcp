@@ -300,7 +300,8 @@ async function main(): Promise<number> {
         throw new ConfigError("call needs a tool name; run tools --json to inspect schemas.");
       const raw =
         typeof flags["args-file"] === "string"
-          ? fs.readFileSync(flags["args-file"], "utf8")
+          ? // Windows PowerShell 5.1 writes UTF-8 with a byte-order mark, which JSON.parse rejects
+            fs.readFileSync(flags["args-file"], "utf8").replace(/^﻿/, "")
           : typeof flags.args === "string"
             ? flags.args
             : "{}";
