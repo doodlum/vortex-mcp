@@ -173,6 +173,23 @@ the UI from `ui_snapshot` rather than failing:
    It means "hidden from assistive technology", not "not rendered" — it is
    reported per node as `ariaHidden` instead.
 
+### A button's accessible name is not its text
+
+`ui_snapshot` reports accessible names, and Vortex's buttons routinely carry an
+`aria-label` or `title` that differs from what they render. The External Changes
+dialog's confirm button reads **Confirm** in devtools and is named **Confirm
+changes**; its cancel button reads Cancel and is named "Cancel deployment".
+
+So a selector written by inspecting the DOM can match nothing while looking
+obviously correct — and a dialog policy that matches nothing is silent: the
+modal stays open, blocks whatever raised it, and reads as a hang. That cost
+three attempts on one dialog here.
+
+Write policies against the name `ui_snapshot` reports, not the text devtools
+shows, and prefer a prefix (`/^confirm/`) over an anchored exact match. Icon
+buttons are the same story from the other side: their text is empty and the name
+comes entirely from the attribute, so a text-based DOM query misses them.
+
 ### Several widgets listen on `mousedown`, not `click`
 
 `HTMLElement.click()` dispatches only a `click` event, so dropdown toggles and

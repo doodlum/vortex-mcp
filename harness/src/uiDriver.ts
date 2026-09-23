@@ -267,13 +267,17 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
     because: "the harness already registered the game's path explicitly",
   },
   {
-    // The footer is Cancel / Confirm; the rows are per-file dropdowns that
-    // Vortex has already defaulted. Confirm accepts those defaults. An earlier
-    // version matched /^(apply|continue|save changes)$/, which matches none of
-    // the real buttons — so the policy looked present, never fired, and a purge
-    // sat behind an unanswered modal until it timed out.
+    // The rows are per-file dropdowns Vortex has already defaulted; the footer
+    // button accepts those defaults.
+    //
+    // Matching it took three tries, and the reason is worth keeping: policies
+    // match on ACCESSIBLE NAME, not textContent. This button reads "Confirm" in
+    // the DOM and is named "Confirm changes", so a regex written from devtools
+    // matches nothing while looking obviously right. /^(apply|continue|save
+    // changes)$/ and then /^confirm$/ both failed that way, each time leaving a
+    // purge behind an unanswered modal until it timed out.
     match: /external changes/i,
-    button: /^confirm$/i,
+    button: /^confirm/i,
     because:
       "files changed outside Vortex; Confirm accepts the per-file defaults it has " +
       "already chosen, which during a purge means letting the removals stand",
