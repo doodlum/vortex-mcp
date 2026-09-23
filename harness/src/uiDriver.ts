@@ -371,12 +371,23 @@ export function autoAnswerDialogs(
  * subtree; the right container is identified by its text matching the dialog we
  * decided to answer, which matters when two modals are stacked.
  */
+/** Lowercase with all whitespace removed, so differently-joined text compares equal. */
+function squash(value: string): string {
+  return value.replace(/\s+/g, "").toLowerCase();
+}
+
 async function clickInsideDialog(
   mcp: VortexMcpClient,
   dialogText: string,
   button: string | RegExp,
 ): Promise<string | undefined> {
-  const marker = dialogText.slice(0, 20);
+  // Compared with whitespace removed, because the two sides are built
+  // differently: `activeDialogs` concatenates text nodes with no separator
+  // ("External ChangesMod files..."), while the snapshot joins names and text
+  // with spaces ("External Changes Mod files..."). A marker that straddles that
+  // boundary then never matches, the dialog is left unanswered, and it reads as
+  // a hang rather than as a lookup that failed.
+  const marker = squash(dialogText).slice(0, 20);
 
   for (const selector of DIALOG_SELECTORS) {
     // `index` picks the nth *match*, which is not what `:nth-of-type(n)` means.
@@ -392,7 +403,7 @@ async function clickInsideDialog(
 
       // Only answer the dialog we actually matched on.
       const flat = flatten(snap.tree);
-      const text = flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" ");
+      const text = squash(flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" "));
       if (!text.includes(marker)) continue;
 
       const target = findNodes(snap, { role: "button", name: button })[0];
