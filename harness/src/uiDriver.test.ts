@@ -149,48 +149,48 @@ describe("dialogPolicies", () => {
   });
 });
 
-describe("autoAnswerDialogs", () => {
-  /**
-   * A client whose snapshots mimic the real shape: `activeDialogs` concatenates
-   * text nodes with NO separator, while the tree joins names and text with
-   * spaces. Matching one against the other is what silently stalled three
-   * separate runs.
-   */
-  function fakeMcp(): { mcp: VortexMcpClient; clicked: string[] } {
-    const clicked: string[] = [];
-    const tree: SnapshotNode[] = [
-      { ref: "r1", role: "heading", name: "External Changes" },
-      { ref: "r2", role: "text", text: "Mod files were changed outside Vortex." },
-      { ref: "r3", role: "button", name: "Cancel deployment" },
-      { ref: "r4", role: "button", name: "Confirm changes" },
-    ];
-    const mcp = {
-      call: (name: string, args: Record<string, unknown> = {}) => {
-        if (name === "ui_snapshot") {
-          const scoped = args["selector"] !== undefined;
-          return Promise.resolve({
-            generation: 1,
-            title: "Vortex",
-            viewport: { width: 1280, height: 800 },
-            nodeCount: tree.length,
-            truncated: false,
-            // No separator, exactly as Vortex reports it.
-            activeDialogs: scoped ? [] : ["External ChangesMod files were changed outside Vortex."],
-            tree,
-          } satisfies Snapshot);
-        }
-        if (name === "ui_click") {
-          clicked.push(String(args["ref"]));
-          return Promise.resolve(undefined);
-        }
-        throw new Error(`unexpected tool call: ${name}`);
-      },
-    } as unknown as VortexMcpClient;
-    return { mcp, clicked };
-  }
+/**
+ * A client whose snapshots mimic the real shape: `activeDialogs` concatenates
+ * text nodes with NO separator, while the tree joins names and text with
+ * spaces. Matching one against the other is what silently stalled three
+ * separate runs.
+ */
+function dialogMcp(): { mcp: VortexMcpClient; clicked: string[] } {
+  const clicked: string[] = [];
+  const tree: SnapshotNode[] = [
+    { ref: "r1", role: "heading", name: "External Changes" },
+    { ref: "r2", role: "text", text: "Mod files were changed outside Vortex." },
+    { ref: "r3", role: "button", name: "Cancel deployment" },
+    { ref: "r4", role: "button", name: "Confirm changes" },
+  ];
+  const mcp = {
+    call: (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "ui_snapshot") {
+        const scoped = args["selector"] !== undefined;
+        return Promise.resolve({
+          generation: 1,
+          title: "Vortex",
+          viewport: { width: 1280, height: 800 },
+          nodeCount: tree.length,
+          truncated: false,
+          // No separator, exactly as Vortex reports it.
+          activeDialogs: scoped ? [] : ["External ChangesMod files were changed outside Vortex."],
+          tree,
+        } satisfies Snapshot);
+      }
+      if (name === "ui_click") {
+        clicked.push(String(args["ref"]));
+        return Promise.resolve(undefined);
+      }
+      throw new Error(`unexpected tool call: ${name}`);
+    },
+  } as unknown as VortexMcpClient;
+  return { mcp, clicked };
+}
 
+describe("autoAnswerDialogs", () => {
   it("answers a dialog whose text is joined differently from the snapshot's", async () => {
-    const { mcp, clicked } = fakeMcp();
+    const { mcp, clicked } = dialogMcp();
     const controller = new AbortController();
     const answering = autoAnswerDialogs(mcp, { signal: controller.signal, pollMs: 1 });
     await new Promise((resolve) => setTimeout(resolve, 60));
