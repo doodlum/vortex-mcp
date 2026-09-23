@@ -52,6 +52,7 @@ test.describe("snapshot", () => {
 
     const second = await snapshot(mcp);
     expect(second.generation).toBeGreaterThan(first.generation);
+    await expect(mcp.call("ui_click", { ref })).rejects.toThrow(/stale or unknown ref/i);
   });
 });
 
@@ -64,14 +65,25 @@ test.describe("acting on the UI", () => {
     await expect(vortexWindow.getByRole("heading", { name: /settings/i }).first()).toBeVisible();
   });
 
-  test("refuses to click a disabled control instead of silently no-opping", async ({ mcp }) => {
-    const snap = await snapshot(mcp);
-    const disabled = findNodes(snap, { role: "button", enabledOnly: false }).find(
-      (b) => b.disabled === true,
-    );
-    test.skip(disabled === undefined, "no disabled button on screen to test against");
-
-    await expect(mcp.call("ui_click", { ref: disabled?.ref })).rejects.toThrow(/disabled/i);
+  test("refuses to click a disabled control instead of silently no-opping", async ({
+    mcp,
+    vortexWindow,
+  }) => {
+    await vortexWindow.evaluate(() => {
+      const button = document.createElement("button");
+      button.id = "automation-disabled";
+      button.textContent = "Disabled fixture";
+      button.disabled = true;
+      button.style.cssText = "position:fixed;top:150px;left:400px;z-index:99999";
+      document.body.append(button);
+    });
+    try {
+      await expect(mcp.call("ui_click", { selector: "#automation-disabled" })).rejects.toThrow(
+        /disabled/i,
+      );
+    } finally {
+      await vortexWindow.locator("#automation-disabled").evaluate((el) => el.remove());
+    }
   });
 });
 

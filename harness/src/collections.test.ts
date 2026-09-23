@@ -2,6 +2,83 @@ import { describe, expect, it, vi } from "vitest";
 
 import { modsStillInstalling } from "./deployment";
 import type { VortexMcpClient } from "./mcpClient";
+import {
+  findCollectionMod,
+  parseCollectionRef,
+  resolveCollection,
+  throwOnCollectionErrors,
+} from "./collections";
+
+describe("collection identity", () => {
+  it("fails on new dependency errors while ignoring stale notifications", async () => {
+    const mcp = {
+      call: vi.fn(async () => [
+        { id: "old", type: "error", title: "Failed to look up dependency", message: "old failure" },
+      ]),
+    } as unknown as VortexMcpClient;
+    await expect(throwOnCollectionErrors(mcp, new Set(["old"]))).resolves.toBeUndefined();
+    await expect(throwOnCollectionErrors(mcp, new Set())).rejects.toThrow(
+      /profile and downloads are preserved/,
+    );
+  });
+  it("rejects lookalike domains and malformed slugs", () => {
+    expect(() =>
+      parseCollectionRef("https://evilnexusmods.com/fallout4/collections/test"),
+    ).toThrow();
+    expect(() => parseCollectionRef('nxm://fallout4/collections/x"}')).toThrow();
+    expect(
+      parseCollectionRef("https://www.nexusmods.com/games/fallout4/collections/pmmttm/revisions/2"),
+    ).toEqual({ gameId: "fallout4", slug: "pmmttm", revision: 2 });
+  });
+  it("does not resume a different collection or revision", async () => {
+    const mcp = {
+      call: vi.fn(async () => ({
+        wrong: {
+          id: "wrong",
+          type: "collection",
+          attributes: { collectionSlug: "other", revisionNumber: 2 },
+        },
+        old: {
+          id: "old",
+          type: "collection",
+          attributes: { collectionSlug: "wanted", revisionNumber: 1 },
+        },
+        correct: {
+          id: "correct",
+          type: "collection",
+          attributes: { collectionSlug: "wanted", revisionNumber: 2 },
+        },
+      })),
+    } as unknown as VortexMcpClient;
+    expect(
+      (await findCollectionMod(mcp, { gameId: "fallout4", slug: "wanted", revision: 2 }))?.id,
+    ).toBe("correct");
+  });
+  it("uses the requested revision's id as well as its revision number", async () => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: {
+            collection: {
+              id: 1,
+              name: "test",
+              currentRevision: { id: 99, revisionNumber: 9, modCount: 99 },
+            },
+            requested: { id: 22, revisionNumber: 2, modCount: 3 },
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    try {
+      expect(
+        await resolveCollection({ gameId: "fallout4", slug: "wanted", revision: 2 }),
+      ).toMatchObject({ revisionId: 22, revisionNumber: 2, modCount: 3 });
+    } finally {
+      fetcher.mockRestore();
+    }
+  });
+});
 
 function mcpWithMods(
   mods: Record<string, { id: string; name?: string; state?: string; type?: string }>,
@@ -40,14 +117,12 @@ describe("modsStillInstalling", () => {
     await expect(modsStillInstalling(mcp, "fallout4")).resolves.toEqual([]);
   });
 
-  it("treats an unreadable state as nothing pending rather than throwing", async () => {
-    // Blocking a deploy because a query failed would be worse than the problem;
-    // the guard is a safety net, not the source of truth.
+  it("refuses to certify installation when state cannot be read", async () => {
     const mcp = {
       call: vi.fn(async () => {
         throw new Error("nope");
       }),
     } as unknown as VortexMcpClient;
-    await expect(modsStillInstalling(mcp, "fallout4")).resolves.toEqual([]);
+    await expect(modsStillInstalling(mcp, "fallout4")).rejects.toThrow("nope");
   });
 });

@@ -15,6 +15,7 @@ import { bootstrap } from "./bootstrap";
 import type { HarnessConfig } from "./config";
 import { deployMods, modsStillInstalling, purgeGame } from "./deployment";
 import { VortexMcpClient } from "./mcpClient";
+import { KNOWN_GAMES } from "./gameSetup";
 
 export class E2eError extends Error {}
 
@@ -37,10 +38,13 @@ export interface E2eOptions {
   fresh?: boolean;
   /** Purge files another Vortex instance deployed. Required for a shared game dir. */
   purge?: boolean;
+  /** Installation/deployment validation on a fixture that is not a playable game. */
+  skipLaunch?: boolean;
   onProgress?: (message: string) => void;
 }
 
 interface CollectionCompleteness {
+  collectionModId: string;
   name: string;
   complete: boolean;
   required: number;
@@ -69,6 +73,7 @@ export async function runE2e(config: HarnessConfig, options: E2eOptions): Promis
   };
 
   let mcp: VortexMcpClient | undefined;
+  let collectionModId: string | undefined;
 
   try {
     await step("start Vortex", async () => {
@@ -108,6 +113,7 @@ export async function runE2e(config: HarnessConfig, options: E2eOptions): Promis
             `(${String(result.modCount)}/${String(result.expectedModCount)})`,
         );
       }
+      collectionModId = result.modId;
       return `${String(result.modCount)}/${String(result.expectedModCount)} required mods`;
     });
 
@@ -121,7 +127,10 @@ export async function runE2e(config: HarnessConfig, options: E2eOptions): Promis
           gameId: config.gameId,
         },
       );
-      const bad = all.filter((c) => !c.complete);
+      const selected = all.find((c) => c.collectionModId === collectionModId);
+      if (selected === undefined)
+        throw new Error("The installed collection is absent from Vortex's completion results.");
+      const bad = [selected].filter((c) => !c.complete);
       if (bad.length > 0) {
         const missing = bad
           .flatMap((c) => c.unsatisfied.map((u) => `${c.name}: ${u.reference}`))
@@ -143,17 +152,19 @@ export async function runE2e(config: HarnessConfig, options: E2eOptions): Promis
       return "deployed";
     });
 
-    await step("launch the game", async () => {
-      // launch_game does not reliably return before the client times out, and
-      // the process is the real evidence anyway — so fire it and watch for the
-      // game rather than trusting the call's result.
-      void (mcp as VortexMcpClient)
-        .call("launch_game", { gameId: config.gameId }, 180_000)
-        .catch(() => undefined);
-      const exe = await waitForGame(config.gameId, 120_000);
-      if (exe === undefined) throw new Error("no game process appeared within 2 minutes");
-      return `${exe} is running`;
-    });
+    if (options.skipLaunch !== true)
+      await step("launch the game", async () => {
+        const before = await gameProcesses(config.gameId);
+        // launch_game does not reliably return before the client times out, and
+        // the process is the real evidence anyway — so fire it and watch for the
+        // game rather than trusting the call's result.
+        void (mcp as VortexMcpClient)
+          .call("launch_game", { gameId: config.gameId }, 180_000)
+          .catch(() => undefined);
+        const exe = await waitForGame(config.gameId, 120_000, new Set(before.map((p) => p.pid)));
+        if (exe === undefined) throw new Error("no game process appeared within 2 minutes");
+        return `${exe} is running`;
+      });
   } finally {
     // The instance is deliberately left running: a failed run is far easier to
     // diagnose with the app still on screen.
@@ -167,24 +178,40 @@ const GAME_EXECUTABLES: Record<string, string[]> = {
   skyrimse: ["SkyrimSE.exe", "skse64_loader.exe"],
   fallout3: ["Fallout3.exe"],
   falloutnv: ["FalloutNV.exe"],
+  stardewvalley: ["Stardew Valley.exe", "StardewModdingAPI.exe"],
 };
 
-async function waitForGame(gameId: string, timeoutMs: number): Promise<string | undefined> {
+async function gameProcesses(gameId: string): Promise<{ name: string; pid: number }[]> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const run = promisify(execFile);
-  const names = GAME_EXECUTABLES[gameId] ?? [];
+  const names =
+    GAME_EXECUTABLES[gameId] ?? (KNOWN_GAMES[gameId] ? [KNOWN_GAMES[gameId]!.executable] : []);
+  if (names.length === 0)
+    throw new E2eError(
+      `No launch-process check is defined for ${gameId}. Add its executable or use --no-launch for installation/deployment only.`,
+    );
+  const { stdout } = await run("tasklist", ["/FO", "CSV", "/NH"], { windowsHide: true });
+  return stdout.split(/\r?\n/).flatMap((line) => {
+    const match = /^"([^"]+)","(\d+)"/.exec(line);
+    return match?.[1] &&
+      match[2] &&
+      names.some((name) => name.toLowerCase() === match[1]!.toLowerCase())
+      ? [{ name: match[1], pid: Number(match[2]) }]
+      : [];
+  });
+}
+
+async function waitForGame(
+  gameId: string,
+  timeoutMs: number,
+  previous: Set<number>,
+): Promise<string | undefined> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    for (const name of names) {
-      const found = await run("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH"], {
-        windowsHide: true,
-      })
-        .then(({ stdout }) => stdout.toLowerCase().includes(name.toLowerCase()))
-        .catch(() => false);
-      if (found) return name;
-    }
+    const found = (await gameProcesses(gameId)).find((p) => !previous.has(p.pid));
+    if (found) return found.name;
     await new Promise((resolve) => setTimeout(resolve, 2_000));
   }
   return undefined;

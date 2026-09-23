@@ -14,6 +14,8 @@
  * appears only below some width is the actual responsive regression. A raw
  * per-size issue list buries the second kind in the first.
  */
+import fs from "node:fs";
+import path from "node:path";
 import type { HarnessConfig } from "./config";
 import type { VortexMcpClient } from "./mcpClient";
 import { attachToRenderer, captureScreenshot, type RendererHandle } from "./cdp";
@@ -49,7 +51,9 @@ export interface ResponsiveFinding {
   name: string;
   /** Widths at which this issue was observed. */
   widths: number[];
-  /** True when it appears at some widths but not others — the interesting case. */
+  viewports: Viewport[];
+  viewportDependent: boolean;
+  /** Legacy alias for viewportDependent; prefer viewports for width/height data. */
   widthDependent: boolean;
   detail: string;
 }
@@ -57,11 +61,13 @@ export interface ResponsiveFinding {
 export interface ResponsiveReport {
   page: string;
   viewports: Viewport[];
-  /** Issues that appear only at some widths — the likely regressions. */
+  /** Issues that appear only at some requested sizes; inspect their evidence. */
   regressions: ResponsiveFinding[];
-  /** Issues present at every width — likely pre-existing, listed for completeness. */
+  /** Issues present at every size. They may still be real defects. */
   constant: ResponsiveFinding[];
   overflowWidths: number[];
+  overflowViewports: Viewport[];
+  reportFile?: string;
   screenshots: string[];
   results: SweepViewportResult[];
 }
@@ -70,6 +76,8 @@ export interface ResponsiveReport {
 export const DEFAULT_VIEWPORTS: Viewport[] = [
   { width: 1024, height: 720 },
   { width: 1280, height: 800 },
+  { width: 1280, height: 720 },
+  { width: 1280, height: 1080 },
   { width: 1600, height: 900 },
   { width: 1920, height: 1080 },
 ];
@@ -153,19 +161,31 @@ export async function runResponsiveSweep(
     await handle?.close();
   }
 
-  return { page, ...summarise(results), screenshots, results, viewports };
+  const report: ResponsiveReport = { page, ...summarise(results), screenshots, results, viewports };
+  fs.mkdirSync(config.artifactDir, { recursive: true });
+  const label = (options.label ?? "sweep").replace(/[^a-zA-Z0-9._-]/g, "_");
+  report.reportFile = path.join(
+    config.artifactDir,
+    `${label}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
+  );
+  fs.writeFileSync(report.reportFile, JSON.stringify(report, null, 2));
+  return report;
 }
 
-function summarise(results: SweepViewportResult[]): {
+export function summarise(results: SweepViewportResult[]): {
   regressions: ResponsiveFinding[];
   constant: ResponsiveFinding[];
   overflowWidths: number[];
+  overflowViewports: Viewport[];
 } {
   const byKey = new Map<string, ResponsiveFinding>();
 
   for (const result of results) {
+    const seen = new Set<string>();
     for (const issue of result.issues) {
       const key = issueKey(issue);
+      if (seen.has(key)) continue;
+      seen.add(key);
       const existing = byKey.get(key);
       if (existing === undefined) {
         byKey.set(key, {
@@ -174,11 +194,14 @@ function summarise(results: SweepViewportResult[]): {
           selector: issue.selector,
           name: issue.name,
           widths: [result.viewport.width],
+          viewports: [result.viewport],
+          viewportDependent: false,
           widthDependent: false,
           detail: issue.detail,
         });
       } else {
         existing.widths.push(result.viewport.width);
+        existing.viewports.push(result.viewport);
       }
     }
   }
@@ -186,12 +209,14 @@ function summarise(results: SweepViewportResult[]): {
   const findings = [...byKey.values()].map((f) => ({
     ...f,
     widthDependent: f.widths.length !== results.length,
+    viewportDependent: f.viewports.length !== results.length,
   }));
 
   return {
     regressions: findings.filter((f) => f.widthDependent),
     constant: findings.filter((f) => !f.widthDependent),
     overflowWidths: results.filter((r) => r.hasHorizontalOverflow).map((r) => r.viewport.width),
+    overflowViewports: results.filter((r) => r.hasHorizontalOverflow).map((r) => r.viewport),
   };
 }
 
@@ -217,24 +242,30 @@ export function formatReport(report: ResponsiveReport): string {
   );
 
   if (report.overflowWidths.length > 0) {
-    lines.push(`Horizontal overflow at: ${report.overflowWidths.join(", ")}px`);
+    lines.push(
+      `Horizontal overflow at: ${report.overflowViewports.map((v) => `${v.width}x${v.height}`).join(", ")}`,
+    );
   }
 
   lines.push("");
   if (report.regressions.length === 0) {
-    lines.push("No width-dependent layout issues.");
+    lines.push(
+      "No viewport-dependent layout issues detected. Review screenshots and constant findings too.",
+    );
   } else {
-    lines.push(`Width-dependent issues (${String(report.regressions.length)}) — look here first:`);
+    lines.push(`Viewport-dependent issues (${String(report.regressions.length)}):`);
     for (const f of report.regressions) {
       lines.push(`  [${f.kind}] ${f.selector}${f.name === "" ? "" : ` "${f.name}"`}`);
-      lines.push(`      only at ${f.widths.join(", ")}px — ${f.detail}`);
+      lines.push(
+        `      at ${f.viewports.map((v) => `${v.width}x${v.height}`).join(", ")} — ${f.detail}`,
+      );
     }
   }
 
   if (report.constant.length > 0) {
     lines.push("");
     lines.push(
-      `Present at every width (${String(report.constant.length)}) — likely pre-existing, not a regression:`,
+      `Present at every viewport (${String(report.constant.length)}) — review separately:`,
     );
     for (const f of report.constant.slice(0, 15)) {
       lines.push(`  [${f.kind}] ${f.selector}${f.name === "" ? "" : ` "${f.name}"`}`);
@@ -250,5 +281,6 @@ export function formatReport(report: ResponsiveReport): string {
     for (const file of report.screenshots) lines.push(`  ${file}`);
   }
 
+  if (report.reportFile) lines.push(`\nJSON report: ${report.reportFile}`);
   return lines.join("\n");
 }

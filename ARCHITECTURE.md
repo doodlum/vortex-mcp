@@ -96,12 +96,10 @@ A capability falls into one of three cases:
    changed outside Vortex" deploy-blocking dialog is the concrete case: it
    resolves a private in-memory Promise captured in a module-scope closure,
    so no amount of raw dispatching from outside that module can reach it.
-   The fix belongs in Vortex core, as a `context.registerAPI(...)`
-   addition — once exposed that way, it becomes a normal `api.ext` entry
-   and `vortex_dispatch` picks it up for free, no vortex-mcp code change
-   required. `mod_management/index.ts` gained
-   `confirmExternalChanges`/`setExternalChangeAction` `registerAPI` calls
-   for exactly this reason.
+   Drive the rendered dialog through `ui_snapshot` and `ui_click`; its own event
+   handler resolves that promise on a stock release. A core API addition may be
+   useful upstream, but must never become a prerequisite for this suite. Put
+   main-process-only operations such as screenshots in the harness over CDP.
 
 Nexus mod search falls into the same non-reachable category, for a
 different reason: it was evaluated across every layer that could
@@ -114,6 +112,22 @@ scraping the website or calling Nexus's API directly with the raw key,
 reopening the `state.confidential` exposure the Safety section closes. If
 Nexus ever ships a search endpoint, the fix is the same shape as
 `confirmExternalChanges`.
+
+## UI transactions, transport, and login persistence
+
+Each HTTP request has its own MCP server/transport; state listeners and UI refs
+remain shared within the renderer. Refs include a renderer-lifetime identifier
+and are invalidated by the next snapshot. Harness snapshot/action transactions
+are serialized with dialog watchers so they cannot invalidate each other's refs.
+Separate agent processes still need to coordinate access to the same instance.
+
+The harness uses isolated userData/appData and a dedicated sandbox game for
+account-free tests. In harness mode only, `authCache.ts` restores the current
+OAuth credentials from a private local file and persists changes when Vortex
+refreshes them. Logout leaves a tombstone that overrides stale snapshots. It
+uses Vortex's own actions and refresh logic; no OAuth secret is returned by MCP.
+Credentials are separate from profile snapshots so game changes and `--fresh`
+do not restore old refresh tokens or copy another game's mods into a blank profile.
 
 ## Keeping the tools table in sync
 

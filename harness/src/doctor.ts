@@ -11,11 +11,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { readMarker, snapshotDir, liveDir } from "./bootstrap";
+import { ANONYMOUS, loginDir, readMarker, snapshotDir, liveDir } from "./bootstrap";
 import { extensionRoot, findInstalledVortex, type HarnessConfig } from "./config";
 import { KNOWN_GAMES, findGamePath, steamLibraryRoots } from "./gameSetup";
 import { VortexMcpClient } from "./mcpClient";
-import { detectGitHubUser, hasVortexSource, vortexSourceDir } from "./source";
+import { hasVortexSource, vortexSourceDir } from "./source";
+import { authCacheFile } from "./instance";
 
 export interface Check {
   name: string;
@@ -32,14 +33,17 @@ export interface DoctorReport {
   checks: Check[];
 }
 
-export async function runDoctor(config: HarnessConfig): Promise<DoctorReport> {
+export async function runDoctor(
+  config: HarnessConfig,
+  options: { skipGame?: boolean } = {},
+): Promise<DoctorReport> {
   const checks: Check[] = [];
 
   checks.push(checkApiKey(config));
   checks.push(await checkSource());
   checks.push(checkVortex(config));
   checks.push(checkExtension());
-  checks.push(checkGame(config));
+  if (!options.skipGame) checks.push(checkGame(config));
   checks.push(checkCache(config));
   checks.push(checkCapturedLogin(config));
   checks.push(await checkRunning(config));
@@ -51,7 +55,9 @@ function checkCapturedLogin(config: HarnessConfig): Check {
   const key = config.apiKey?.trim();
   const captured =
     readMarker(snapshotDir(config, key === undefined || key === "" ? "anonymous" : key))
-      ?.loginCaptured === true;
+      ?.loginCaptured === true ||
+    readMarker(loginDir(config))?.loginCaptured === true ||
+    fs.existsSync(authCacheFile(config));
   return {
     name: "Nexus login captured",
     ok: captured,
@@ -59,12 +65,9 @@ function checkCapturedLogin(config: HarnessConfig): Check {
     // and everything else works without it.
     advisory: true,
     detail: captured
-      ? "captured — cold starts come up signed in"
+      ? "cache recorded — auth-status checks live credentials; this marker does not prove server validity"
       : "not captured — collections will fail; an API key alone does not cover them",
-    fix:
-      "Collections use OAuth, and its captcha cannot be automated, so log in once:\n" +
-      "      pnpm run ai:up        then click Log in in Vortex\n" +
-      "      pnpm run ai -- save-login",
+    fix: "pnpm run ai -- setup --oauth (complete browser login once; caches automatically)",
   };
 }
 
@@ -77,8 +80,8 @@ function checkApiKey(config: HarnessConfig): Check {
     // missing key must not read as "the harness is broken".
     advisory: true,
     detail: set
-      ? "set (automated login will work with no user input)"
-      : "not set — the harness runs signed out; needed only for Nexus downloads/collections",
+      ? "set (legacy API access; collections require OAuth)"
+      : "not set — optional; local automation needs no account and collections use OAuth",
     fix:
       "Get one at https://next.nexusmods.com/settings/api-keys, then:\n" +
       "      echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env",
@@ -104,15 +107,11 @@ async function checkSource(): Promise<Check> {
   if (hasVortexSource(dir)) {
     return { name: "Vortex source", ok: true, advisory: true, detail: dir };
   }
-  const user = await detectGitHubUser();
   return {
     name: "Vortex source",
     ok: false,
     advisory: true,
-    detail:
-      user === undefined
-        ? "not cloned; could not detect your GitHub user either"
-        : `not cloned (would use github.com/${user}/Vortex)`,
+    detail: "not cloned; optional unless developing Vortex itself",
     fix: "pnpm run ai:source",
   };
 }
@@ -162,11 +161,23 @@ function checkExtension(): Check {
 
 function checkGame(config: HarnessConfig): Check {
   const game = KNOWN_GAMES[config.gameId];
+  if (config.gamePath !== undefined) {
+    const ok =
+      fs.existsSync(config.gamePath) &&
+      (game === undefined || fs.existsSync(path.join(config.gamePath, game.executable)));
+    return {
+      name: `Game (${config.gameId})`,
+      ok,
+      detail: config.gamePath,
+      fix: "Correct --game-path, use --sandbox for disposable tests, or --no-game for global UI.",
+    };
+  }
   if (game === undefined) {
     return {
       name: `Game (${config.gameId})`,
-      ok: true,
+      ok: false,
       detail: "not a game the harness can locate itself — pass an explicit path when bootstrapping",
+      fix: "Provide --game-path, use --sandbox, or choose --no-game.",
     };
   }
   const found = findGamePath(game);
@@ -179,15 +190,7 @@ function checkGame(config: HarnessConfig): Check {
 }
 
 function checkCache(config: HarnessConfig): Check {
-  if (config.apiKey === undefined) {
-    return {
-      name: "Profile cache",
-      ok: true,
-      advisory: true,
-      detail: "cannot check without an API key",
-    };
-  }
-  const snapshot = snapshotDir(config, config.apiKey.trim());
+  const snapshot = snapshotDir(config, config.apiKey?.trim() || ANONYMOUS);
   const marker = readMarker(snapshot);
   const live = fs.existsSync(path.join(liveDir(config), "userData"));
 
@@ -220,7 +223,7 @@ async function checkRunning(config: HarnessConfig): Promise<Check> {
   const hasWrite = tools.some((t) => t.name === "ui_click");
   return {
     name: "Running instance",
-    ok: true,
+    ok: hasWrite,
     detail: hasWrite
       ? `answering on ${mcp.url} with ${String(tools.length)} tools (writes unlocked)`
       : `answering on ${mcp.url}, but UI write tools are missing — VORTEX_MCP_TOKEN was not set ` +

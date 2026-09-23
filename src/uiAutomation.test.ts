@@ -188,10 +188,7 @@ describe("ref lifecycle", () => {
     // different element. This is the virtualised-table hazard.
     setBody("<button>Second</button><button>Third</button>");
     snapshot();
-    // Same index string, but it must resolve to the NEW element or throw — never
-    // to the detached original.
-    const resolved = resolveTarget({ ref: staleRef });
-    expect(resolved.textContent).toBe("Second");
+    expect(() => resolveTarget({ ref: staleRef })).toThrow(/stale or unknown ref/i);
   });
 
   it("throws when a ref points at an element that has been removed", () => {

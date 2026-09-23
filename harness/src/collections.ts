@@ -3,7 +3,7 @@
  *
  * A collection is not a mod — it is a manifest of mods plus their rules, and
  * Vortex installs it through a driver that downloads each member in turn. The
- * whole flow is gated on being logged in, so this needs an API key; see
+ * whole flow needs Nexus OAuth from initial setup; see
  * AGENTS.md.
  *
  * The entry point is the same `start-download` event Vortex's own "Add to
@@ -13,7 +13,15 @@
  * download sits there looking like an ordinary archive.
  */
 import type { VortexMcpClient } from "./mcpClient";
-import { autoAdvanceFomods, autoAnswerDialogs, clickByName, type AnsweredDialog } from "./uiDriver";
+import { requireOAuth } from "./auth";
+import {
+  autoAdvanceFomods,
+  autoAnswerDialogs,
+  clickByName,
+  snapshot,
+  clickInsideDialog,
+  type AnsweredDialog,
+} from "./uiDriver";
 
 export class CollectionError extends Error {}
 
@@ -34,7 +42,10 @@ export interface CollectionRef {
 export function parseCollectionRef(input: string): CollectionRef {
   const trimmed = input.trim();
 
-  const nxm = /^nxm:\/\/([^/]+)\/collections\/([^/]+)(?:\/revisions\/(\d+))?/i.exec(trimmed);
+  const nxm =
+    /^nxm:\/\/([a-z0-9]+)\/collections\/([a-z0-9_-]+)(?:\/revisions\/(\d+))?\/?(?:[?#].*)?$/i.exec(
+      trimmed,
+    );
   if (nxm?.[1] !== undefined && nxm[2] !== undefined) {
     return {
       gameId: nxm[1],
@@ -44,7 +55,7 @@ export function parseCollectionRef(input: string): CollectionRef {
   }
 
   const web =
-    /nexusmods\.com\/(?:games\/)?([^/]+)\/collections\/([^/?#]+)(?:\/revisions\/(\d+))?/i.exec(
+    /^https:\/\/(?:next\.|www\.)?nexusmods\.com\/(?:games\/)?([a-z0-9]+)\/collections\/([a-z0-9_-]+)(?:\/revisions\/(\d+))?\/?(?:[?#].*)?$/i.exec(
       trimmed,
     );
   if (web?.[1] !== undefined && web[2] !== undefined) {
@@ -92,12 +103,24 @@ export interface ResolvedCollection extends CollectionRef {
  * so resolution works before the instance is even logged in.
  */
 export async function resolveCollection(ref: CollectionRef): Promise<ResolvedCollection> {
-  const query = `query { collection(slug: "${ref.slug}", domainName: "${ref.gameId}", viewAdultContent: true) { id slug name currentRevision { id revisionNumber modCount } } }`;
+  if (ref.revision !== undefined && (!Number.isInteger(ref.revision) || ref.revision < 1))
+    throw new CollectionError("Collection revision must be a positive integer.");
+  const query = `query($slug: String!, $game: String!${ref.revision === undefined ? "" : ", $revision: Int!"}) {
+    collection(slug: $slug, domainName: $game, viewAdultContent: true) { id name currentRevision { id revisionNumber modCount } }
+    ${ref.revision === undefined ? "" : "requested: collectionRevision(slug: $slug, revision: $revision, viewAdultContent: true) { id revisionNumber modCount }"}
+  }`;
 
   const response = await fetch("https://api.nexusmods.com/v2/graphql", {
     method: "POST",
     headers: { "content-type": "application/json", "user-agent": "vortex-mcp-harness/1.0" },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({
+      query,
+      variables: {
+        slug: ref.slug,
+        game: ref.gameId,
+        ...(ref.revision === undefined ? {} : { revision: ref.revision }),
+      },
+    }),
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) {
@@ -108,6 +131,7 @@ export async function resolveCollection(ref: CollectionRef): Promise<ResolvedCol
 
   const body = (await response.json()) as {
     data?: {
+      requested?: { id: number; revisionNumber: number; modCount: number } | null;
       collection?: {
         id: number;
         name: string;
@@ -121,7 +145,8 @@ export async function resolveCollection(ref: CollectionRef): Promise<ResolvedCol
     throw new CollectionError(`Nexus rejected the lookup: ${body.errors[0]?.message ?? "unknown"}`);
   }
   const collection = body.data?.collection;
-  if (collection == null || collection.currentRevision == null) {
+  const revision = ref.revision === undefined ? collection?.currentRevision : body.data?.requested;
+  if (collection == null || revision == null) {
     throw new CollectionError(
       `No collection "${ref.slug}" for ${ref.gameId} on Nexus. Check the URL — the slug is the ` +
         `short code at the end, e.g. .../collections/pmmttm.`,
@@ -131,10 +156,10 @@ export async function resolveCollection(ref: CollectionRef): Promise<ResolvedCol
   return {
     ...ref,
     collectionId: collection.id,
-    revisionId: collection.currentRevision.id,
-    revisionNumber: ref.revision ?? collection.currentRevision.revisionNumber,
+    revisionId: revision.id,
+    revisionNumber: revision.revisionNumber,
     name: collection.name,
-    modCount: collection.currentRevision.modCount,
+    modCount: revision.modCount,
   };
 }
 
@@ -222,38 +247,41 @@ export async function installCollection(
   // it — but this build authenticates collection downloads with OAuth, and an
   // API key gets a 401 surfaced as "You are not logged in to Nexus Mods!" well
   // after the download has been dispatched. Ask for what is actually needed.
-  const oauth = await mcp
-    .call<unknown>("vortex_query", {
-      path: ["confidential", "account", "nexus", "OAuthCredentials"],
-    })
-    .catch(() => undefined);
-  if (oauth === undefined || oauth === null) {
+  await requireOAuth(mcp);
+  const activeGame = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });
+  if (activeGame !== ref.gameId)
     throw new CollectionError(
-      "Not signed in to Nexus with OAuth, and collection downloads require it on this\n" +
-        "Vortex build. An API key is NOT enough: it satisfies Vortex's isLoggedIn check,\n" +
-        "so the download starts and then fails with a 401.\n\n" +
-        "  Sign in through Vortex's own Log in button — the OAuth flow has a captcha,\n" +
-        "  so it cannot be automated and the user has to do it once.\n\n" +
-        "  Then run `vortex-ai save-login` once: it folds the signed-in instance\n" +
-        "  into the snapshot, so cold starts restore the login instead of losing it.\n",
+      `Collection is for ${ref.gameId}, but the active game is ${activeGame ?? "none"}. Start the matching game before installation.`,
     );
-  }
 
   const controller = new AbortController();
-  const answering = autoAnswerDialogs(mcp, {
-    signal: controller.signal,
-    pollMs: 1_500,
-    onAnswer: (a) => report(`answered [${a.clicked}] ${a.dialog.slice(0, 55)}`),
-    onUnanswerable: (d, wanted) =>
-      report(`STUCK: no button matching ${wanted} in "${d.slice(0, 60)}"`),
-  });
+  const previousErrors = new Set(
+    (await mcp.call<{ id: string }[]>("list_notifications")).map((notice) => notice.id),
+  );
+  const answeredDialogs: AnsweredDialog[] = [];
+  const answering =
+    options.autoAnswer === false
+      ? Promise.resolve([])
+      : autoAnswerDialogs(mcp, {
+          signal: controller.signal,
+          pollMs: 1_500,
+          onAnswer: (a) => {
+            answeredDialogs.push(a);
+            report(`answered [${a.clicked}] ${a.dialog.slice(0, 55)}`);
+          },
+          onUnanswerable: (d, wanted) =>
+            report(`STUCK: no button matching ${wanted} in "${d.slice(0, 60)}"`),
+        });
   // Member mods ship FOMOD installers that block the driver until someone picks
   // options. Unattended is the whole point of this function, so accept their
   // defaults; the collection manifest already encodes the curator's choices.
-  const advancing = autoAdvanceFomods(mcp, {
-    signal: controller.signal,
-    onAdvance: (label) => report(`fomod step [${label}]`),
-  });
+  const advancing =
+    options.autoAnswer === false
+      ? Promise.resolve()
+      : autoAdvanceFomods(mcp, {
+          signal: controller.signal,
+          onAdvance: (label) => report(`fomod step [${label}]`),
+        });
 
   try {
     const resolved = await resolveCollection(ref);
@@ -261,24 +289,38 @@ export async function installCollection(
       `${resolved.name} — revision ${String(resolved.revisionNumber)}, ${String(resolved.modCount)} mods`,
     );
 
-    const existing = await findCollectionMod(mcp, ref);
+    const exactRef = { ...ref, revision: resolved.revisionNumber };
+    const existing = await findCollectionMod(mcp, exactRef);
     if (existing === undefined) {
       const url = toNxmUrl({ ...ref, revision: resolved.revisionNumber });
       report(`downloading ${url}`);
       await startCollectionDownload(mcp, ref, resolved, url);
-      await waitForCollectionMod(mcp, ref, 15 * 60 * 1000, report);
+      await waitForCollectionMod(mcp, exactRef, 15 * 60 * 1000, report);
     } else {
       report("collection already added; resuming its install");
     }
 
-    const collectionMod = await waitForCollectionMod(mcp, ref, 60_000, report);
+    const collectionMod = await waitForCollectionMod(mcp, exactRef, 60_000, report);
     await startInstallDriver(mcp, ref, collectionMod.id, report);
 
     const expected = requiredMemberCount(collectionMod, resolved.modCount);
     if (expected !== resolved.modCount) {
       report(`${String(expected)} of the ${String(resolved.modCount)} listed mods are required`);
     }
-    const status = await waitForCompletion(mcp, ref, timeoutMs, report);
+    const status = await waitForCompletion(
+      mcp,
+      ref,
+      collectionMod.id,
+      timeoutMs,
+      report,
+      previousErrors,
+    );
+    if (options.autoAnswer !== false) {
+      for (const dialog of (await snapshot(mcp)).activeDialogs) {
+        if (/collection installation complete/i.test(dialog))
+          await clickInsideDialog(mcp, dialog, /^no thanks$/i);
+      }
+    }
 
     return {
       ref,
@@ -286,7 +328,7 @@ export async function installCollection(
       modCount: status.satisfied,
       expectedModCount: status.required,
       complete: status.complete,
-      answeredDialogs: [],
+      answeredDialogs,
     };
   } finally {
     controller.abort();
@@ -362,16 +404,19 @@ async function startInstallDriver(
   report(clicked ? "clicked Install Now" : "driver already running (no Install Now button)");
 }
 
-async function findCollectionMod(
+export async function findCollectionMod(
   mcp: VortexMcpClient,
   ref: CollectionRef,
 ): Promise<CollectionMod | undefined> {
-  const mods = await mcp
-    .call<Record<string, CollectionMod> | null>("vortex_query", {
-      path: ["persistent", "mods", ref.gameId],
-    })
-    .catch(() => null);
-  return Object.values(mods ?? {}).find((m) => m.type === "collection");
+  const mods = await mcp.call<Record<string, CollectionMod> | null>("vortex_query", {
+    path: ["persistent", "mods", ref.gameId],
+  });
+  return Object.values(mods ?? {}).find(
+    (m) =>
+      m.type === "collection" &&
+      m.attributes?.collectionSlug === ref.slug &&
+      (ref.revision === undefined || Number(m.attributes.revisionNumber) === ref.revision),
+  );
 }
 
 async function waitForCollectionMod(
@@ -427,18 +472,20 @@ export interface CollectionCompleteness {
 async function waitForCompletion(
   mcp: VortexMcpClient,
   ref: CollectionRef,
+  collectionModId: string,
   timeoutMs: number,
   report: (message: string) => void,
+  previousErrors: Set<string>,
 ): Promise<CollectionCompleteness> {
   const started = Date.now();
   let last = "";
   let lastChange = Date.now();
 
   for (;;) {
-    const all = await mcp
-      .call<CollectionCompleteness[]>("collection_status", { gameId: ref.gameId })
-      .catch(() => [] as CollectionCompleteness[]);
-    const status = all[0];
+    const all = await mcp.call<CollectionCompleteness[]>("collection_status", {
+      gameId: ref.gameId,
+    });
+    const status = all.find((entry) => entry.collectionModId === collectionModId);
 
     if (status !== undefined) {
       if (status.complete) {
@@ -453,6 +500,7 @@ async function waitForCompletion(
       }
     }
 
+    if (Date.now() - lastChange > 30_000) await throwOnCollectionErrors(mcp, previousErrors);
     if (Date.now() - started > timeoutMs) {
       const missing = (status?.unsatisfied ?? [])
         .map(
@@ -476,4 +524,27 @@ async function waitForCompletion(
     }
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }
+}
+
+/** Fail stalled installs with the app's actual errors, not an hour-long timeout. */
+export async function throwOnCollectionErrors(
+  mcp: VortexMcpClient,
+  previous: Set<string>,
+): Promise<void> {
+  const notices =
+    await mcp.call<{ id: string; type: string; title?: string; message?: string }[]>(
+      "list_notifications",
+    );
+  const failures = notices.filter(
+    (notice) =>
+      !previous.has(notice.id) &&
+      notice.type === "error" &&
+      /dependency|download|collection|login|logged in|authentication/i.test(notice.title ?? ""),
+  );
+  if (failures.length)
+    throw new CollectionError(
+      "Vortex cannot continue this collection: " +
+        failures.map((notice) => `${notice.title}: ${notice.message ?? ""}`).join("; ") +
+        ". The profile and downloads are preserved. Inspect notifications/logs for the service error, then rerun collection with the same URL and configuration after it is resolved.",
+    );
 }

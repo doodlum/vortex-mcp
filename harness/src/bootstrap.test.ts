@@ -4,8 +4,14 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { captureLogin, liveDir, readMarker, snapshotDir } from "./bootstrap";
+import { captureLogin, liveDir, loginDir, readMarker, snapshotDir } from "./bootstrap";
 import type { HarnessConfig } from "./config";
+import { requireOAuth } from "./auth";
+import { stopStaleInstance } from "./instance";
+
+vi.mock("./auth", () => ({
+  requireOAuth: vi.fn(async () => ({ oauthPresent: true, oauthRefreshable: true })),
+}));
 
 // captureLogin stops the running instance before copying, because Vortex only
 // flushes state on a clean close. Nothing is running in a unit test, so the
@@ -20,16 +26,23 @@ const roots: string[] = [];
 function fakeConfig(): HarnessConfig {
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-ai-bootstrap-"));
   roots.push(cacheDir);
-  return {
+  const config = {
     cacheDir,
     gameId: "fallout4",
     gamePath: "C:/Games/Fallout 4",
     apiKey: "test-key",
     target: { kind: "installed", appName: "Vortex", executable: "C:/Vortex/Vortex.exe" },
   } as unknown as HarnessConfig;
+  fs.mkdirSync(liveDir(config), { recursive: true });
+  fs.writeFileSync(
+    path.join(liveDir(config), ".vortex-ai-snapshot.json"),
+    JSON.stringify({ snapshotKey: path.basename(snapshotDir(config, "test-key")) }),
+  );
+  return config;
 }
 
 afterEach(() => {
+  vi.clearAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -49,6 +62,7 @@ describe("captureLogin", () => {
       "opaque-bytes",
     );
     expect(readMarker(snapshot)?.loginCaptured).toBe(true);
+    expect(readMarker(loginDir(config))?.loginCaptured).toBe(true);
   });
 
   it("replaces an earlier snapshot rather than merging into it", async () => {
@@ -71,5 +85,24 @@ describe("captureLogin", () => {
 
   it("refuses when there is no working directory to capture", async () => {
     await expect(captureLogin(fakeConfig())).rejects.toThrow(/no working directory/i);
+  });
+
+  it("does not stop or copy an unsigned profile", async () => {
+    const config = fakeConfig();
+    fs.mkdirSync(path.join(liveDir(config), "userData"));
+    vi.mocked(requireOAuth).mockRejectedValueOnce(new Error("OAuth setup incomplete"));
+    await expect(captureLogin(config)).rejects.toThrow("OAuth setup incomplete");
+    expect(stopStaleInstance).not.toHaveBeenCalled();
+    expect(fs.existsSync(loginDir(config))).toBe(false);
+  });
+
+  it("preserves the previous login when clean shutdown fails", async () => {
+    const config = fakeConfig();
+    fs.mkdirSync(path.join(liveDir(config), "userData"));
+    fs.mkdirSync(loginDir(config));
+    fs.writeFileSync(path.join(loginDir(config), "sentinel"), "previous login");
+    vi.mocked(stopStaleInstance).mockRejectedValueOnce(new Error("did not exit cleanly"));
+    await expect(captureLogin(config)).rejects.toThrow("did not exit cleanly");
+    expect(fs.readFileSync(path.join(loginDir(config), "sentinel"), "utf8")).toBe("previous login");
   });
 });

@@ -14,6 +14,7 @@
  */
 import fs from "node:fs";
 import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 
 import {
@@ -25,6 +26,7 @@ import {
 } from "@playwright/test";
 
 import { loadConfig, type HarnessConfig } from "../config";
+import { sandboxConfig, installSandboxExtension } from "../sandbox";
 import { ensureGameManaged } from "../gameSetup";
 import {
   buildInstanceEnv,
@@ -32,7 +34,6 @@ import {
   installMcpExtension,
   prepareUserDataDir,
   removeInstanceDir,
-  stopStaleInstance,
 } from "../instance";
 import { VortexMcpClient } from "../mcpClient";
 
@@ -59,11 +60,32 @@ export interface AiFixtures {
  */
 type NoTestFixtures = Record<never, never>;
 
+export async function freePort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = (server.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve, reject) =>
+    server.close((err) => (err ? reject(err) : resolve())),
+  );
+  return port;
+}
+
 export const test = base.extend<NoTestFixtures, AiFixtures>({
   config: [
     // eslint-disable-next-line no-empty-pattern
     async ({}, use) => {
-      await use(loadConfig());
+      const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-ai-test-"));
+      const mcpPort = await freePort();
+      let cdpPort = await freePort();
+      while (cdpPort === mcpPort) cdpPort = await freePort();
+      try {
+        await use(sandboxConfig(loadConfig({ cacheDir, mcpPort, cdpPort, apiKey: undefined })));
+      } finally {
+        removeInstanceDir(cacheDir);
+      }
     },
     { scope: "worker" },
   ],
@@ -73,10 +95,11 @@ export const test = base.extend<NoTestFixtures, AiFixtures>({
       // A dedicated temp directory rather than the shared .cache/live one: these
       // tests install mods and resize windows, and must not disturb a working
       // instance the operator has up.
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-ai-test-"));
+      const dir = path.join(config.cacheDir, "instance");
       prepareUserDataDir(dir, config.target.appName);
       await ensureExtensionBuilt();
       installMcpExtension(dir);
+      installSandboxExtension(dir, config);
       await use(dir);
       removeInstanceDir(dir);
     },
@@ -85,9 +108,6 @@ export const test = base.extend<NoTestFixtures, AiFixtures>({
 
   vortexApp: [
     async ({ config, userDataDir }, use) => {
-      // A leftover instance would hold the MCP port this test needs.
-      await stopStaleInstance(config);
-
       // Whatever the config resolved — a released Vortex.exe by default, or an
       // Electron pointed at a source checkout. CDP is opened so the screenshot
       // helpers can attach alongside Playwright's own connection.

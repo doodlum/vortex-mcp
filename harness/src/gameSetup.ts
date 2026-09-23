@@ -14,6 +14,7 @@ import path from "node:path";
 import type { HarnessConfig } from "./config";
 import type { VortexMcpClient } from "./mcpClient";
 import { realHover } from "./cdp";
+import { withUiLock } from "./uiSession";
 import {
   autoAnswerDialogs,
   clickByName,
@@ -44,6 +45,11 @@ export interface GameDefinition {
  * explicit path to `ensureGameManaged`.
  */
 export const KNOWN_GAMES: Record<string, GameDefinition> = {
+  vortexaisandbox: {
+    id: "vortexaisandbox",
+    name: "Vortex Automation Sandbox",
+    executable: "game.exe",
+  },
   fallout4: {
     id: "fallout4",
     name: "Fallout 4",
@@ -153,6 +159,15 @@ export async function ensureGameManaged(
   options: EnsureGameOptions,
 ): Promise<EnsureGameResult> {
   const game = KNOWN_GAMES[gameId];
+  if (
+    options.gamePath !== undefined &&
+    (!fs.existsSync(options.gamePath) ||
+      (game !== undefined && !fs.existsSync(path.join(options.gamePath, game.executable))))
+  ) {
+    throw new GameNotFoundError(
+      `Invalid explicit game path: ${options.gamePath}. Correct it or use --sandbox; an explicit path never falls back to your installed game.`,
+    );
+  }
 
   const existing = await mcp.call<{ path?: string } | null>("vortex_query", {
     path: ["settings", "gameMode", "discovered", gameId],
@@ -258,7 +273,7 @@ async function activateGame(
     if (hasProfile) {
       await mcp.call("vortex_dispatch", { action: "activate-game", args: [gameId] });
     } else {
-      await manageGameViaUi(mcp, config, gameName);
+      await withUiLock(mcp, () => manageGameViaUi(mcp, config, gameName));
     }
     return await waitForActiveGame(mcp, gameId);
   } finally {
@@ -279,10 +294,11 @@ async function manageGameViaUi(
   config: HarnessConfig,
   gameName: string,
 ): Promise<void> {
-  await clickByName(mcp, { role: "button", name: "Games" }).catch(async () => {
-    // The nav entry is a link in some layouts and a button in others.
-    await clickByName(mcp, { name: "Games" });
-  });
+  if (!(await tryClick(mcp, ['button[aria-label="Games"]']))) {
+    await clickByName(mcp, { role: "button", name: "Games" }).catch(async () => {
+      await clickByName(mcp, { role: "link", name: "Games" });
+    });
+  }
 
   // The unmanaged list is windowed and 600+ games long, so a game's tile is
   // simply not in the DOM until the list has been narrowed to it.

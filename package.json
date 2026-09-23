@@ -30,6 +30,7 @@
     "ai:down": "tsx harness/src/cli.ts down",
     "ai:watch": "tsx harness/src/cli.ts watch",
     "ai:test": "playwright test --config harness/playwright.config.ts",
+    "ai:test:nexus": "tsx harness/src/tests/nexus-collection.e2e.ts",
     "install-plugin": "node scripts/install-local.mjs",
     "docs:tools": "node scripts/generate-readme-tools-table.mjs",
     "docs:tools:check": "node scripts/generate-readme-tools-table.mjs --check"
@@ -44,6 +45,7 @@
     "@playwright/test": "1.61.1",
     "@types/jsdom": "^30.0.0",
     "@types/node": "^22.10.2",
+    "fflate": "0.8.2",
     "jsdom": "^30.1.1",
     "oxfmt": "0.65.0",
     "oxlint": "1.80.0",
@@ -55,7 +57,7 @@
     "vitest": "^3.2.6"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19"
   },
   "packageManager": "pnpm@9.15.0"
 }

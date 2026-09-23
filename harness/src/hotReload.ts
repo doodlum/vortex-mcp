@@ -192,10 +192,20 @@ export async function watchAndReload(
         installMcpExtension(options.liveDir);
       }
 
+      const before = await mcp.call<{ runtimeId: string }>("automation_status");
       await mcp.call("ui_reload_renderer");
       // The renderer tears down and comes back; wait for MCP to answer again
       // before reporting success, or the next command races the reload.
-      await mcp.waitUntilReady(60_000);
+      const deadline = Date.now() + 60_000;
+      for (;;) {
+        const after = await mcp
+          .call<{ runtimeId: string }>("automation_status", {}, 3_000)
+          .catch(() => undefined);
+        if (after !== undefined && after.runtimeId !== before.runtimeId) break;
+        if (Date.now() >= deadline)
+          throw new Error("The renderer did not reload within 60 seconds.");
+        await sleep(300, options.signal);
+      }
       emit({ type: "reloaded", elapsedMs: Date.now() - started });
     } catch (err) {
       emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
@@ -205,10 +215,13 @@ export async function watchAndReload(
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const finish = (): void => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
       resolve();
-    });
+    };
+    const timer = setTimeout(finish, ms);
+    if (signal?.aborted) finish();
+    else signal?.addEventListener("abort", finish, { once: true });
   });
 }

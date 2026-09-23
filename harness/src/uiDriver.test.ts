@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { VortexMcpClient } from "./mcpClient";
 import {
   advanceFomod,
+  findNodes,
+  findOne,
   autoAnswerDialogs,
   DEFAULT_DIALOG_POLICIES,
   dialogPolicies,
@@ -56,6 +58,22 @@ function fakeMcp(bySelector: Record<string, SnapshotNode[]>): {
 }
 
 const NAV = "#fomod-installer-dialog .fomod-nav-buttons";
+
+describe("target matching", () => {
+  it("does not select Save games when asked for Games", () => {
+    expect(findNodes(snapshotOf([node("Save games")]), { name: "Games" })).toEqual([]);
+  });
+  it("applies anchored patterns to labels without duplicating name and text", () => {
+    expect(
+      findNodes(snapshotOf([node("Manage", { text: "Manage" })]), { name: /^manage$/i }),
+    ).toHaveLength(1);
+  });
+  it("requires disambiguation instead of clicking the first duplicate", () => {
+    expect(() => findOne(snapshotOf([node("Close"), node("Close")]), { name: "Close" })).toThrow(
+      /ambiguous/i,
+    );
+  });
+});
 
 describe("advanceFomod", () => {
   it("clicks the last nav button, whatever the step happens to call it", async () => {

@@ -21,6 +21,24 @@ const TOKEN = process.env.VORTEX_MCP_TOKEN;
 const URL = `http://127.0.0.1:${PORT}/mcp`;
 
 const ACCESS_TIER = {
+  automation_status: "read",
+  nexus_auth_status: "read",
+  collection_status: "read",
+  ui_snapshot: "read",
+  ui_wait_for: "read",
+  ui_get_viewport: "read",
+  ui_detect_layout_issues: "read",
+  ui_read_console: "read",
+  ui_click: "write",
+  ui_fill: "write",
+  ui_press_key: "write",
+  ui_hover: "write",
+  ui_select_option: "write",
+  ui_scroll: "write",
+  ui_set_viewport: "write",
+  ui_responsive_sweep: "write",
+  ui_reload_renderer: "write",
+  vortex_quit: "write",
   vortex_describe: "read",
   scan_extension_actions: "read",
   vortex_query: "read",
@@ -46,7 +64,7 @@ const ACCESS_TIER = {
   list_unsolved_conflicts: "read",
   find_missing_deployed_files: "read",
   find_orphaned_files: "read",
-  check_nexus_mod_updates: "read",
+  check_nexus_mod_updates: "write",
   switch_profile: "write",
   clone_profile: "write",
   vortex_dispatch: "write",
@@ -65,15 +83,20 @@ async function callMcp(body) {
   if (TOKEN !== undefined) {
     headers.authorization = `Bearer ${TOKEN}`;
   }
-  const res = await fetch(URL, { method: "POST", headers, body: JSON.stringify(body) });
+  const res = await fetch(URL, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  });
   const text = await res.text();
   const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
-  if (dataLine === undefined) {
+  if (!res.ok || (dataLine === undefined && !text.trim().startsWith("{"))) {
     throw new Error(
       `Unexpected response from ${URL} (status ${res.status}): ${text.slice(0, 300)}`,
     );
   }
-  const parsed = JSON.parse(dataLine.slice("data: ".length));
+  const parsed = JSON.parse(dataLine === undefined ? text : dataLine.slice("data: ".length));
   if (parsed.error !== undefined) {
     throw new Error(`MCP error: ${JSON.stringify(parsed.error)}`);
   }

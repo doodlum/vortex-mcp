@@ -12,6 +12,13 @@ actually happened.
 
 ## One-time: get the source
 
+First read [the workflow guide](../../../harness/WORKFLOWS.md). After locating the
+checkout, read and follow **Vortex's own `AGENTS.md`, `CLAUDE.md` when present,
+and `docs/README.md`**, plus the task-specific documents they reference. These
+are authoritative for Vortex development; this skill is an automation aid.
+For UI features, load `docs/frontend.md`, `docs/testing.md`, and the applicable
+design-system and supplied design documents before implementing.
+
 ```bash
 pnpm run ai:source
 ```
@@ -45,6 +52,15 @@ Nothing in the renderer can reload main — `watch` says so explicitly rather th
 reloading and appearing to do nothing.
 
 ## Verifying a change
+
+For bugs, reproduce first and add a regression assertion. For features and design
+implementation, state the acceptance criteria and test both behavior and visual
+fidelity. Exercise relevant empty, populated, loading, error, and modal states
+at different widths **and heights**, including equal-width/different-height
+cases. See the state matrix in `harness/WORKFLOWS.md`.
+
+If the kit lacks a capability needed for the request, implement it in this repo,
+test it, and update the relevant instructions so later agents can reuse it.
 
 Drive the real app rather than reasoning about the diff. See the
 `drive-vortex` skill for the snapshot → act → wait loop, and:

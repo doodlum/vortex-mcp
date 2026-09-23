@@ -12,12 +12,18 @@ impossible — most Vortex surprises are catalogued there.
 ## Get an instance up
 
 ```bash
-pnpm run ai:doctor    # says exactly what is missing
-pnpm run ai:up        # logged in, game active; prints the `claude mcp add` line
+pnpm run ai -- doctor --installed --sandbox
+pnpm run ai -- setup --installed --sandbox  # no game or account needed
+pnpm run ai -- tools --json                # all live input schemas
 ```
 
-`ai:up` is idempotent and warm-starts in ~10-20s. It drives the **installed**
-Vortex; no source checkout needed.
+Use `setup --installed --oauth` for initial Nexus login; it waits and caches
+automatically. `up` reuses a matching working profile; `up --fresh` resets it.
+Without `--installed`, the managed `.vortex-src` clone takes precedence.
+Read [harness/AGENTS.md](../../../harness/AGENTS.md) and
+[WORKFLOWS.md](../../../harness/WORKFLOWS.md) before starting. If a requested
+workflow cannot be completed with existing tools, implement the reusable missing
+capability, test it, update the instructions, and resume the original request.
 
 ## The loop
 
@@ -61,10 +67,14 @@ deployed files, and purging unattended removes them. To test deployment, use a
 disposable game directory:
 
 ```bash
-pnpm run ai -- up --game-path "C:/dev/vortex-ai-sandbox/Fallout 4"
+pnpm run ai -- up --installed --sandbox
 ```
 
 ## When it goes wrong
+
+For real Nexus collections use their real game ID and a disposable game copy;
+the sandbox game is for local archive and deployment tests. A copied executable
+does not isolate game-specific writes to Documents or LocalAppData.
 
 Read the error — they are written to be actionable. Then:
 

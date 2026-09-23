@@ -1,398 +1,271 @@
-# AI testing & automation harness
-
-Drive Vortex's UI from an AI agent: read what is on screen, click and type,
-resize the window, test responsive layout, hot-reload changes, and get from a
-cold machine to a logged-in, game-managed instance with no human in the loop.
-
-**It drives the Vortex you already have installed.** No patched build, no source
-checkout, no fork of Vortex. Verified against the released 2.6.3.
-
-If you read one section, read [What you have to provide](#what-you-have-to-provide)
-and [Quick start](#quick-start).
-
-## How it fits together
-
-```
-  agent (Claude, etc.)
-        │  MCP over HTTP — 127.0.0.1:3701
-        ▼
-  ┌────────────────────────────────────────────┐
-  │ Vortex (the installed one)                 │
-  │   renderer ── vortex-mcp extension         │  ← state AND the DOM
-  └────────────────────────────────────────────┘
-        ▲                        ▲
-        │ spawn / cache / reload │ CDP :9222 — screenshots, real hover
-        └──────── harness/ ──────┘   `vortex-ai`
-```
-
-**The extension** (`../src`) runs inside Vortex's renderer, alongside its React
-tree, so it can read the Redux store and touch the DOM directly. That is why an
-agent can drive a user's real, already-running Vortex.
-
-**The harness** (this directory) does what an extension cannot: start a process,
-build a bundle, cache a profile, take screenshots, and move a real mouse.
-
-Two capabilities genuinely need the harness, and both go through CDP rather than
-a change to Vortex:
-
-- **Screenshots.** `webContents.capturePage` is main-process only, and Vortex
-  extensions are renderer-only (`onceMain` is deprecated). Electron parses
-  `--remote-debugging-port` from argv even in a released build, so the harness
-  launches Vortex with it and Playwright attaches.
-- **Real hover.** See [the hover trap](#the-hover-trap).
-
-## What you have to provide
-
-**One of these**, depending on what you are doing:
-
-- **Driving Vortex** (the common case) — an installed Vortex:
-  <https://www.nexusmods.com/about/vortex/>
-- **Working on Vortex** — a GitHub fork of `Nexus-Mods/Vortex`. Run
-  `pnpm run ai:source` and it finds your fork, clones it to `.vortex-src/`
-  inside this repo, and builds it. No fork yet? It stops and tells you how to
-  make one; the suite builds _your_ fork because you cannot push to upstream.
-
-Plus, for anything that talks to Nexus: **a Nexus Mods personal API key.**
-
-Everything else works signed out: driving the UI, managing a game, installing a
-mod from a local archive, deploying, purging, responsive testing, hot reload.
-
-```bash
-echo 'VORTEX_AI_NEXUS_API_KEY=<your key>' >> harness/.env   # gitignored
-```
-
-### The rule for credentials
-
-**Check for a key before starting anything that needs one, and if it is absent,
-ask the user for it.** A key is the user's credential: it cannot be guessed,
-derived, or read out of an existing Vortex install, so there is nothing to fall
-back on and nothing to infer. `requireApiKey()` is that check, and Nexus-facing
-commands call it before they launch or connect to anything — a run that is going
-to fail on authentication should say so up front, not after a cold start and a
-rejected download.
-
-Store it once in `harness/.env`. It is gitignored, it survives `up --fresh`, and
-every later run reuses it. Never commit it, and never print it.
-
-### An API key is not enough for collections
-
-Vortex's `isLoggedIn` is
-`truthy(state.confidential.account.nexus.APIKey) || truthy(...OAuthCredentials)`,
-so an API key satisfies it — no browser, no redirect, **no captcha** — and that
-is enough for the API calls the harness makes directly.
-
-It is **not** enough to download a collection. This Vortex build authenticates
-that path with OAuth, so with only an API key the download is dispatched and
-then fails with a 401, surfaced as _"You are not logged in to Nexus Mods!"_ —
-long after `isLoggedIn` said yes. `installCollection` therefore checks for
-`OAuthCredentials` specifically and refuses up front.
-
-### Setup requires logging in once, by hand
-
-**This is a required setup step, not an optional extra.** Collections are
-authenticated with OAuth, OAuth means a captcha, and a captcha cannot be
-automated by anyone — so one interactive login has to happen before the suite
-can install a collection:
-
-```bash
-pnpm run ai:up                 # start an instance
-#  ... click Log in in Vortex, complete the Nexus flow in the browser ...
-pnpm run ai -- save-login      # fold that login into the snapshot
-```
-
-`save-login` copies the working directory over the snapshot, so every later
-cold start — `up --fresh` included — comes up already signed in. Do it once per
-machine. Until it is done, `up` says so on every start, because otherwise the
-omission surfaces much later as a download that 401s minutes into a run.
-
-It copies the directory wholesale rather than reading the token out of Vortex's
-state: the credential stays opaque bytes that the harness never inspects, which
-is both safer and less brittle than reproducing whatever shape Vortex stores
-tokens in.
-
-If the login is ever revoked or expires, log in again and re-run `save-login`.
-
-### What an agent can and cannot drive here
-
-| In the browser Vortex opens      | Automatable?                        |
-| -------------------------------- | ----------------------------------- |
-| Already signed in to Nexus       | **Yes** — it is one Authorise click |
-| Signed out (email/password form) | **No** — credential entry           |
-| Captcha shown                    | **No** — never solve one            |
-
-Two things that make this awkward in practice:
-
-- **An API key hides the Log in button.** It satisfies `isLoggedIn`, so Vortex
-  shows an account as signed in and offers only **Logout**. Reaching the OAuth
-  flow means logging out first — which is the user's session to end, so ask.
-- **Reading the OAuth URL out of `vortex.log` is not a shortcut.** Scraping logs
-  for authorisation URLs or tokens is credential handling, and is refused. The
-  dialog's own "Website didn't open?" field holds the same URL, which is the
-  affordance the app offers the user.
-
-### Everything else is checked for you
-
-```bash
-pnpm run ai:doctor
-```
-
-Reports every prerequisite — which Vortex it found, the extension build, the
-game install, the profile cache, whether an instance is already running — and
-prints the exact command that fixes each missing one.
-
-## Quick start
-
-```bash
-pnpm install
-pnpm run build        # build the extension
-pnpm run ai:doctor    # check the setup
-pnpm run ai:up        # start a ready-to-drive Vortex
-
-# point your agent at it — `ai:up` prints this line with your token
-claude mcp add --transport http vortex http://127.0.0.1:3701/mcp \
-  -H "Authorization: Bearer <token>"
-```
-
-The agent now has ~45 tools: the state tools (mods, profiles, load order,
-conflicts, diagnostics) plus the UI tools below.
-
-## Cold vs warm start
-
-Paid once per machine per (API key, game); everything after is warm.
-
-| Tier      | What happens                                                                      | When                               |
-| --------- | --------------------------------------------------------------------------------- | ---------------------------------- |
-| **cold**  | Launch a blank Vortex, seed the API key and game over MCP, quit cleanly, snapshot | first run, or `--rebuild-snapshot` |
-| **reset** | Copy the snapshot over the working directory, launch                              | `--fresh`                          |
-| **warm**  | Launch the existing working directory as-is                                       | every other run                    |
-
-Measured against Vortex 2.6.3: **cold ~90-140s, warm ~10-20s.** A warm start is
-just Electron booting — nothing is copied, so a previous session's mods are
-still there. `--fresh` gets back to a clean logged-in state (the snapshot is a
-few hundred KB, so the copy is effectively instant).
-
-### Why not seed Vortex's database directly?
-
-Faster still, and rejected. Vortex persists state in DuckDB through a
-`level_pivot` extension, keyed `hive###path###parts` — version-coupled to
-Vortex, and a desync would surface as mysterious data loss rather than an error.
-Letting Vortex write its own state once and copying the result cannot drift.
-
-Instances are fully isolated: `ELECTRON_USERDATA`/`ELECTRON_APPDATA` point at
-`harness/.cache/`, so **your real Vortex install is never touched**, and both can
-run at once. (Those variables are honoured by the released build, not just a
-source checkout — which is what makes isolated automation possible at all.)
-
-## Driving the UI
-
-### The loop
-
-1. `ui_snapshot` — see what is on screen, and get a `ref` per element
-2. `ui_click` / `ui_fill` / `ui_press_key` — act on a `ref`
-3. `ui_wait_for` — wait for the result
-4. back to 1
-
-Refs are **generation-scoped**: every `ui_snapshot` invalidates the previous set.
-Deliberate — Vortex's mod and plugin tables are virtualised, so the element
-behind a given row index is genuinely recycled as the list scrolls. A
-silently-reused ref would click the wrong mod. A stale ref throws instead.
-
-### Tools
-
-Read tier — always available:
-
-| Tool                      | What it gives you                                                                                                                  |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `ui_snapshot`             | Accessibility tree of what is rendered, with a `ref` per node. Layout wrappers collapsed. Open modals surfaced as `activeDialogs`. |
-| `ui_wait_for`             | Poll a selector or text to `visible`/`hidden`/`attached`/`detached`. Returns `matched: false` on timeout rather than throwing.     |
-| `ui_get_viewport`         | Window outer size, renderer inner size, device pixel ratio.                                                                        |
-| `ui_detect_layout_issues` | Overflow, clipped text, offscreen elements, sub-24px tap targets.                                                                  |
-| `ui_read_console`         | Renderer console and uncaught errors, ring-buffered. The only way to see a React error over MCP.                                   |
-
-Write tier — needs `VORTEX_MCP_TOKEN`, which `ai:up` sets for you:
-
-| Tool                  | Notes                                                                                                                                       |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ui_click`            | Full pointer/mouse sequence, not `el.click()` — several Vortex widgets listen on `mousedown` only. `modifiers` for ctrl-click multi-select. |
-| `ui_fill`             | Goes through React's native value setter, so `onChange` actually fires.                                                                     |
-| `ui_press_key`        | DOM key events. Does **not** reach native menus or OS file dialogs.                                                                         |
-| `ui_hover`            | JS hover handlers only — see [the hover trap](#the-hover-trap).                                                                             |
-| `ui_select_option`    | Native `<select>` only. Vortex's custom dropdowns need click-then-click.                                                                    |
-| `ui_scroll`           | Also fires a `scroll` event, which is what makes virtualised tables mount newly-revealed rows.                                              |
-| `ui_set_viewport`     | Resizes the real window. Unmaximises first.                                                                                                 |
-| `ui_responsive_sweep` | Resize through sizes, scanning each, then restore. Structure only.                                                                          |
-| `ui_reload_renderer`  | Hot-reload the renderer (and with it, extensions).                                                                                          |
-| `vortex_quit`         | Clean shutdown that flushes state.                                                                                                          |
-
-Screenshots are a harness command (`vortex-ai screenshot`), not a tool — they
-need CDP.
-
-### From a shell, without an agent
-
-Every UI tool has a CLI equivalent. Fastest way to tell a broken harness from a
-broken MCP client config:
-
-```bash
-pnpm run ai -- snapshot            # what is on screen
-pnpm run ai -- click --ref e42
-pnpm run ai -- fill --ref e17 --value "vintage"
-pnpm run ai -- press --key Escape
-pnpm run ai -- screenshot --label before
-pnpm run ai -- tools               # everything the instance exposes
-```
-
-## The hover trap
-
-`ui_hover` dispatches `pointerover`/`mouseover`/`mouseenter`. Those run React's
-handlers, but they **do not change the browser's own hover state** — so anything
-revealed purely by a CSS `:hover` rule stays hidden.
-
-Vortex's game tiles are exactly this: the "Manage" button lives in a
-`.hover-content` wrapper at `opacity: 0`. After `ui_hover` the button is in the
-DOM but correctly reported as hidden, which reads like a bug in the snapshot and
-is not.
-
-Two ways through:
-
-- `ui_click` with `requireActionable: false` — the click handler fires
-  regardless of opacity, because the event is dispatched on the element rather
-  than at a screen coordinate.
-- The harness's `realHover()`, which drives a real mouse over CDP. This is what
-  the first-time game-manage flow uses.
-
-## Testing a change
-
-```bash
-pnpm run ai:watch          # reload the instance whenever the extension rebuilds
-pnpm run dev               # in another shell: tsup --watch
-```
-
-`watch` polls build _output_ and calls `ui_reload_renderer` when it changes.
-Reloading the renderer re-runs extension initialisation, so your new tool code is
-live without restarting Vortex. It deliberately does not own the build, so it
-composes with whatever produced the output.
-
-Working on **Vortex itself** rather than the extension? Once `ai:source` has
-cloned it, `ai:up` drives that clone automatically and `watch` also watches
-Vortex's own renderer bundle:
-
-```bash
-pnpm run ai:source        # once
-pnpm run ai:up            # now targets .vortex-src
-pnpm run ai:watch
-```
-
-`--installed` forces the released build back to the front when you want it.
-
-A change to Vortex's **main** process can never be hot-reloaded — nothing in the
-renderer can reload main — so `watch` says so explicitly instead of reloading and
-appearing to do nothing.
-
-## Running the test suite
-
-```bash
+# Vortex automation operating manual
+
+Read this first, then the relevant skill under `.claude/skills/`. Read
+[KNOWLEDGE.md](../KNOWLEDGE.md) before debugging, and
+[WORKFLOWS.md](WORKFLOWS.md) for bug fixes, feature development, design references,
+and testing across application states and window sizes. When developing Vortex,
+**read and follow its own `AGENTS.md`, `CLAUDE.md` when present, and documentation
+index and task-specific AI guidance before editing its source**.
+
+The extension drives an unmodified released Vortex through MCP. The harness
+launches isolated profiles, manages caches, drives CSS hover, captures screenshots,
+and runs Playwright assertions. A Vortex source checkout is optional.
+
+## Initial setup
+
+Use Windows, a Node version compatible with package.json, the pinned pnpm version
+(`pnpm@9.15.0`), and an installed Vortex. No purchased game or Nexus account is
+needed for the sandbox tests. Git is needed to clone repositories.
+
+From this repository:
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm run ai -- setup --installed --sandbox
+pnpm run ai -- doctor --installed --sandbox
+pnpm run ai -- snapshot
 pnpm run ai:test
 ```
 
-Playwright specs that drive Vortex through the MCP `ui_*` tools and verify the
-result through Playwright's own view of the DOM. The two halves are separate on
-purpose: asserting an MCP tool's effect with the same MCP tools would pass even
-if both sides were wrong together.
+`setup` builds the extension when missing and starts an isolated Vortex. `--sandbox`
+creates a disposable game directory and installs a tiny game-support extension.
+It supports real local archive installation, enabling/disabling, deployment, and
+purge. It cannot launch a playable game. Tests allocate their own profile and ports;
+they do not stop a working automation instance. To run tests against the installed
+build when a source checkout exists, set `VORTEX_AI_INSTALLED=1` in the environment.
 
-Not part of `pnpm run ci` — it needs a real Vortex and minutes of startup. Point
-it at a disposable game directory first (see below).
+For global UI work without a game, use `setup --installed --no-game`.
+For a real game, replace `--sandbox` with `--game <id> --game-path <directory>`.
+An invalid explicit path fails; it never silently falls back to a real install.
+Without an explicit path, the harness can locate common games through Steam.
 
-## Responsive testing
+Use the same target/game/cache flags when starting, checking, and saving a profile.
+Persist regular choices in the gitignored `harness/.env` to avoid retyping them.
+Normal UI commands only need the running instance's MCP port and token.
 
-```bash
-pnpm run ai -- responsive --screenshots
-pnpm run ai -- responsive --viewports 1024x720,1920x1080 --strict
+If pnpm reports a dependency-layout mismatch or asks to remove node_modules,
+check `pnpm --version` against package.json before changing the lockfile. Use the
+repository's pinned package manager. A sandboxed agent may need approval to
+launch subprocesses or GUI applications; that is a host permission, not an OAuth
+or Vortex setup step.
+
+## Optional Nexus setup: interact once, cache automatically
+
+Local automation needs no account. Collections require OAuth on the tested
+Vortex build. A personal API key alone can make `isLoggedIn` true while collection
+downloads still fail authentication. Do not ask for an API key to run local tests,
+build the extension, or install a collection when OAuth is already configured.
+
+Before installing any mods, run:
+
+```powershell
+pnpm run ai -- setup --oauth --installed
 ```
 
-Defaults to 1024x720, 1280x800, 1600x900, 1920x1080, and restores the original
-size afterwards — even if the sweep fails partway.
+The harness starts its isolated global UI. If an API key was seeded, setup clears
+it in this isolated profile so Vortex exposes the Log in button. Click Log in and
+complete Nexus's browser authentication, including any password, MFA, or captcha.
+The command waits up to ten minutes, detects OAuth access and refresh credentials,
+caches credentials locally, and checks that a fresh restore still contains them. Agents
+can do the surrounding setup; the account owner completes the interactive login.
+Do not put passwords, API keys, or OAuth tokens in chat or committed files.
 
-The output separates **width-dependent** issues from ones present at **every**
-width, and that distinction is the whole value. An issue at every size is almost
-always a pre-existing quirk (a deliberately-scrollable pane, an icon button that
-is simply small). One that appears only below some width is the actual
-responsive regression. Findings are heuristic and advisory; `--strict` exits
-non-zero on width-dependent ones.
+If setup times out, the window and profile remain available. Finish login, then:
 
-## Deploying into a game your own Vortex manages
-
-Vortex refuses to deploy over files another instance deployed, and prompts:
-_"Purge files from different instance?"_. The harness answers **Cancel**
-automatically and says so. Not a formality — on the machine this was built on,
-the operator's real Fallout 4 had **31,102 files** deployed by their own Vortex,
-and answering "Purge" unattended would have removed them.
-
-So **installs and enables work against your real game; deploys do not.** To
-exercise deploy and purge for real, point at a disposable copy:
-
-```bash
-mkdir -p "C:/dev/vortex-ai-sandbox/Fallout 4/Data"   # a stub exe is enough
-pnpm run ai -- up --game-path "C:/dev/vortex-ai-sandbox/Fallout 4"
+```powershell
+pnpm run ai -- save-login --installed
+pnpm run ai -- up --installed --no-game
+pnpm run ai -- auth-status
 ```
 
-Everything else is identical; only deployment cares which directory it writes to.
-If you genuinely want the harness to take over your real install, purge from your
-own Vortex first (the reliable direction Vortex recommends), then start it.
+`setup --oauth --no-wait` returns immediately for clients that handle the setup
+conversation separately. `save-login` refuses an unsigned/API-key-only profile
+and refuses to copy a profile that cannot shut down cleanly. It does not infer
+successful login from a cached marker alone.
 
-## Safety
+The reusable login cache is independent of the selected game and API key, and
+separate for installed and source-build targets. Fresh/rebuilt game profiles
+can reuse it. Vortex manages OAuth refresh; credential presence does not prove
+that Nexus still accepts an account. A revoked login requires repeating this
+setup phase. The extension writes `oauth-<target>.json` only in harness mode;
+it updates the cache on token rotation and records logout so old snapshots
+cannot silently sign back in. Blank profiles inherit credentials, not old mod
+lists or game paths. Cache directories contain credentials and must remain private and
+uncommitted. The default cache is gitignored.
 
-The MCP server binds `127.0.0.1` only and rejects any request whose `Host` or
-`Origin` is not localhost — that, not the loopback bind, is what stops a
-DNS-rebinding page reaching it.
+A legacy personal API key may be stored locally as `VORTEX_AI_NEXUS_API_KEY` in
+`harness/.env` if a separate workflow needs it. It is optional for this setup.
 
-**Write tools do not exist without `VORTEX_MCP_TOKEN`.** With no token they are
-never registered; `tools/list` will not even show them. Any client holding the
-token has the same power a human at Vortex's UI has.
+## Run and reset
 
-**The stored Nexus credential is redacted from every read**, token or not.
+```powershell
+pnpm run ai -- up --installed --sandbox
+pnpm run ai -- down
+pnpm run ai -- up --installed --sandbox --fresh
+pnpm run ai -- up --installed --sandbox --rebuild-snapshot
+```
 
-Your API key lives in `harness/.env`; the cached profile is under `.cache/`. Both
-gitignored. The snapshot marker stores only a hash of the key.
+| Start   | Behavior                                                                            |
+| ------- | ----------------------------------------------------------------------------------- |
+| Cold    | Start a blank/cached-login profile, manage the game, quit cleanly, snapshot, launch |
+| Warm    | Reopen the working profile with its existing mods and settings                      |
+| Fresh   | Replace the working profile with its matching baseline snapshot                     |
+| Rebuild | Recreate that baseline while retaining the independent login cache                  |
 
-## Environment variables
+`--no-game` has its own baseline. Changing target/game/path selects a matching
+snapshot; an unrelated working profile is never silently reused. Vortex writes
+its own state database; the harness does not edit its storage format.
 
-| Variable                  | Default               | Purpose                                                   |
-| ------------------------- | --------------------- | --------------------------------------------------------- |
-| `VORTEX_AI_NEXUS_API_KEY` | —                     | Nexus personal API key. The only secret.                  |
-| `VORTEX_MCP_TOKEN`        | derived from hostname | Bearer token gating write tools.                          |
-| `VORTEX_MCP_PORT`         | `3701`                | MCP port.                                                 |
-| `VORTEX_AI_CDP_PORT`      | `9222`                | CDP port for screenshots and Playwright.                  |
-| `VORTEX_AI_EXE`           | auto-detected         | A specific Vortex.exe.                                    |
-| `VORTEX_AI_DEV_DIR`       | —                     | A Vortex source checkout, instead of the installed build. |
-| `VORTEX_AI_GAME_ID`       | `fallout4`            | Game to manage.                                           |
-| `VORTEX_AI_GAME_PATH`     | located via Steam     | Explicit game directory.                                  |
-| `VORTEX_AI_CACHE_DIR`     | `harness/.cache`      | Snapshot + working directory.                             |
-| `VORTEX_AI_ARTIFACT_DIR`  | `harness/.artifacts`  | Screenshots, sweep reports.                               |
-| `VORTEX_AI_HEADLESS`      | off                   | Hide the window. Screenshots may come back blank.         |
+`down` waits for clean shutdown. An unresponsive instance is reported and left
+intact; the harness does not blindly kill a recorded PID and then certify a
+possibly unflushed profile. Close the identified harness window before retrying.
+A server from another cache is not stopped just because it occupies the same port.
 
-## Troubleshooting
+Use `--cache-dir <dir> --port <n> --cdp-port <n>` for another independent instance.
+Keep those flags consistent across commands. Both ports must be free.
 
-**"Could not find an installed Vortex"** — install it, or set `VORTEX_AI_EXE`.
+## Drive from any agent or shell
 
-**"No Vortex instance is answering"** — nothing running, or a different port.
-`pnpm run ai -- status`.
+`up` prints the HTTP MCP endpoint and a client-connection example. Any MCP client
+supporting Streamable HTTP can use it with the printed bearer token. Connecting
+an agent is optional: every exposed tool can also be called through the CLI.
 
-**MCP answers but there are no `ui_*` write tools** — Vortex was launched without
-`VORTEX_MCP_TOKEN`, so the server is read-only. Start it through `ai:up`.
+```powershell
+pnpm run ai -- tools --json
+pnpm run ai -- snapshot
+pnpm run ai -- click --ref <ref-from-snapshot>
+pnpm run ai -- fill --ref <ref-from-snapshot> --value example
+pnpm run ai -- press --key Escape
+pnpm run ai -- call ui_get_viewport
+pnpm run ai -- call vortex_query --args-file query.json
+pnpm run ai -- screenshot --label before
+```
 
-**"vortex-mcp did not become ready"** — Vortex started but its renderer never got
-far enough to load extensions. Read `.cache/live/userData/vortex.log`.
+`tools --json` includes live input schemas. `call <tool> --args-file <file>` accepts
+a JSON object and avoids shell-quoting problems. `--args <json>` works when the
+shell preserves JSON quoting. Keep credential-bearing argument files private.
 
-**403 from the MCP server** — the client's token does not match the one Vortex was
-launched with. Re-run `ai:up` and use the `claude mcp add` line it prints.
+The UI loop is snapshot, act, wait, inspect. Refs are opaque and expire on the
+next snapshot, renderer reload, or element removal. Never reuse a stale ref.
+Virtualized rows must first be filtered or scrolled into the DOM. Check
+`activeDialogs` when an action seems blocked. The harness serializes its own
+snapshot/action sequences against its background dialog watchers; independent
+clients still need to coordinate UI actions.
 
-**"Vortex did not make \<game\> the active game"** — activation is blocked on a
-modal. The error prints the open dialogs and notifications.
+| Tool/path                                        | Use                                                                         |
+| ------------------------------------------------ | --------------------------------------------------------------------------- |
+| `ui_snapshot`                                    | Rendered tree, accessible names, refs, active dialogs; selector/index scope |
+| `ui_click`, `ui_fill`                            | Mouse sequence and React-compatible input changes                           |
+| `ui_press_key`                                   | DOM keyboard handlers; not native OS dialogs or browser text insertion      |
+| `ui_select_option`                               | Native select; custom dropdowns need click-then-click                       |
+| `ui_scroll`                                      | Scroll plus events for virtualized lists                                    |
+| `ui_wait_for`                                    | Poll selector/text; inspect `matched` because timeout returns false         |
+| `ui_hover`                                       | JavaScript hover handlers only                                              |
+| harness `realHover()`                            | Real mouse over CDP, including CSS `:hover`                                 |
+| `ui_get_viewport`, `ui_set_viewport`             | Read/resize actual window and renderer dimensions                           |
+| `ui_detect_layout_issues`, `ui_responsive_sweep` | Advisory layout findings                                                    |
+| `ui_read_console`                                | Renderer console/errors since a sequence number                             |
+| `nexus_auth_status`                              | Credential-presence booleans, never credentials                             |
+| `automation_status`                              | Isolated profile path and renderer lifetime ID                              |
+| `vortex_query`, `vortex_dispatch`                | Inspect state, invoke documented actions/events                             |
 
-**A previous run left Vortex running** — `up` detects and stops it, over MCP when
-it answers and by recorded PID when it does not. The PID path matters: an
-instance whose extension failed to load holds the user-data directory while
-answering nothing.
+Harness `clickByName`/`fillByName` use exact case-insensitive strings, or explicit
+regular expressions for partial matches, and reject ambiguous targets. Use
+accessible names, not guessed visible text. Scope modal actions to their dialog.
+Native file pickers are avoided through `install <archive>` or a documented event.
 
-See [KNOWLEDGE.md](../KNOWLEDGE.md) for the non-obvious Vortex behaviours behind
-several of these.
+## Install and deploy
+
+```powershell
+pnpm run ai -- install C:/fixtures/example.zip
+pnpm run ai -- collection <collection-url>
+pnpm run ai -- deploy --game <active-game-id>
+pnpm run ai -- purge
+```
+
+Local archive installation waits for the installer to finish. Collection installs
+check OAuth before downloading and wait for required members to finish. FOMOD
+navigation accepts defaults; unexpected dialogs remain visible for diagnosis.
+This cannot guarantee that every third-party installer or website download works
+unattended. Add a scoped policy/helper and regression coverage when a supported
+workflow needs one, rather than guessing an answer globally.
+
+Deployment refuses while mods are installing or when installation state cannot
+be read. Foreign-instance purge prompts are cancelled by default. `deploy --purge`
+explicitly allows removing another instance's deployed files. Use disposable
+paths for destructive test cases; changing Vortex's profile location alone does
+not isolate writes to a real game's directory or game-specific configuration.
+
+`e2e <collection-url>` additionally verifies collection completion, deployment,
+and game launch. This needs the actual game and authenticated network access;
+it is distinct from the account-free local sandbox suite. Do not use the sandbox
+executable as evidence of a successful game launch.
+
+## Tests, responsiveness, and development
+
+`ai:test:nexus` is the opt-in authenticated integration test. Use the same target,
+cache and ports as account setup (environment variables below apply). It stops
+that harness instance, creates a separate `nexus-smoke` profile and disposable
+Stardew Valley directory, installs the five required members of revision 1 of
+`stardewvalley/nudx7b`, verifies deployed SHA-256 hashes, purges, and saves JSON
+and screenshot evidence. It copies refreshed credentials back on clean exit.
+It does not launch a game. Nexus Premium is required for unattended member
+downloads; an account without it may require browser clicks for each file.
+Check that prerequisite during initial account setup. Service outages are
+reported as failures; they are not a reason to repeat OAuth login.
+
+For a different collection use `e2e <url> --no-launch` with the real game ID and
+an explicitly disposable game path. Omit `--no-launch` only with a playable
+game. A launch check requires a newly observed game process, not one already
+running before the command.
+
+```powershell
+pnpm run ci
+pnpm run ai:test
+pnpm run ai -- responsive --screenshots --viewports 1024x720,1280x720,1280x1000,1920x1080
+```
+
+CI runs typechecking, lint, formatting checks, unit tests, and a build. The separate
+Playwright suite drives real Vortex through MCP and asserts through Playwright or
+the filesystem. Say which suite ran and disclose skips. The app may make its own
+background network requests even when no Nexus account is needed for the test.
+
+Run responsive checks in each relevant state, with distinct artifact labels.
+Test both width and height, inspect actual sizes after OS clamping, and visually
+review screenshots against any supplied design. Structural warnings are not a
+substitute for design review. See the state matrix in [WORKFLOWS.md](WORKFLOWS.md).
+
+For Vortex development, `pnpm run ai:source` prepares `.vortex-src`; `up` prefers
+that managed checkout when present. `--installed` explicitly selects the released
+build; `--exe <path>` and `--dev-dir <path>` select specific targets.
+
+Use `pnpm run dev` with `pnpm run ai:watch` for extension development. The watcher
+copies rebuilt output, reloads, and waits for a changed renderer lifetime before
+reporting readiness. Rebuild Vortex's own renderer using its current documented
+commands when editing it. Main-process changes require a full restart. Verify
+live schemas with `tools --json` after changing tool registration.
+
+## Configuration and recovery
+
+| Variable                                   | Purpose/default                                      |
+| ------------------------------------------ | ---------------------------------------------------- |
+| `VORTEX_AI_EXE`                            | Installed Vortex executable, otherwise auto-detected |
+| `VORTEX_AI_DEV_DIR`                        | Explicit Vortex source directory                     |
+| `VORTEX_AI_INSTALLED`                      | `1` forces installed Vortex, including tests         |
+| `VORTEX_AI_GAME_ID`, `VORTEX_AI_GAME_PATH` | Game and install path                                |
+| `VORTEX_AI_CACHE_DIR`                      | Profiles/login cache; default `harness/.cache`       |
+| `VORTEX_AI_ARTIFACT_DIR`                   | Screenshots/reports; default `harness/.artifacts`    |
+| `VORTEX_MCP_PORT`, `VORTEX_AI_CDP_PORT`    | MCP/CDP; default 3701/9222                           |
+| `VORTEX_MCP_TOKEN`                         | Bearer token shared by harness and MCP client        |
+| `VORTEX_AI_NEXUS_API_KEY`                  | Optional legacy Nexus API key                        |
+| `VORTEX_AI_HEADLESS`                       | Hide window; screenshots may be blank                |
+
+Run `doctor` with the same setup flags when prerequisites are unclear. No UI write
+tools means Vortex started without a token. HTTP 403 means a token/host/origin
+mismatch. Startup errors identify the isolated `userData/vortex.log`; avoid
+printing whole logs because authentication flows may log sensitive URLs.
+
+If a running instance predates `automation_status`, update its installed extension
+and restart it through its existing MCP `vortex_quit` tool before using the new
+lifecycle commands. Never treat a port collision as permission to stop an unrelated
+Vortex. Do not commit profiles, screenshots with private data, or credentials.

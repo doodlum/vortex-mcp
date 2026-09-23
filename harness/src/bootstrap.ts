@@ -1,5 +1,5 @@
 /**
- * Getting from nothing to a logged-in, game-managed Vortex as fast as possible.
+ * Getting from nothing to an isolated, driveable Vortex with reusable setup.
  *
  * Three tiers, in descending cost:
  *
@@ -32,8 +32,10 @@ import {
   removeInstanceDir,
   stopStaleInstance,
   type VortexInstance,
+  authCacheFile,
 } from "./instance";
-import type { VortexMcpClient } from "./mcpClient";
+import { VortexMcpClient } from "./mcpClient";
+import { requireOAuth } from "./auth";
 
 /**
  * Bumped when a change here makes previously-cached snapshots wrong (a different
@@ -60,6 +62,9 @@ export interface SnapshotMarker {
    * reason.
    */
   loginCaptured?: boolean;
+  /** Identifies the configuration this working directory was copied from. */
+  snapshotKey?: string;
+  gameSkipped?: boolean;
 }
 
 function fingerprint(value: string): string {
@@ -76,20 +81,28 @@ function fingerprint(value: string): string {
  */
 export const ANONYMOUS = "anonymous";
 
-export function snapshotDir(config: HarnessConfig, apiKey: string): string {
+export function snapshotDir(config: HarnessConfig, apiKey: string, skipGame = false): string {
   // The target is part of the key because the two builds are not
   // interchangeable: a released Vortex keeps startup.json under appData/Vortex
   // and a source checkout under appData/@vortex/main, so reusing one build's
   // snapshot for the other makes Vortex quit on a missing startup.json.
   const key = fingerprint(
     `${String(SNAPSHOT_SCHEMA_VERSION)}:${apiKey}:${config.gameId}:${config.gamePath ?? "auto"}:` +
-      `${config.target.kind}:${config.target.appName}`,
+      `${config.target.kind}:${config.target.appName}${skipGame ? ":no-game" : ""}`,
   );
   return path.join(config.cacheDir, `snapshot-${key}`);
 }
 
 export function liveDir(config: HarnessConfig): string {
   return path.join(config.cacheDir, "live");
+}
+
+/** Independent of game/API-key settings, so initial OAuth setup survives reseeding. */
+export function loginDir(config: HarnessConfig): string {
+  return path.join(
+    config.cacheDir,
+    `login-${fingerprint(`${config.target.kind}:${config.target.appName}`)}`,
+  );
 }
 
 export function readMarker(dir: string): SnapshotMarker | undefined {
@@ -102,6 +115,13 @@ export function readMarker(dir: string): SnapshotMarker | undefined {
   }
 }
 
+function copyProfile(source: string, destination: string): void {
+  fs.cpSync(source, destination, {
+    recursive: true,
+    filter: (file) => path.basename(file) !== MARKER_FILE,
+  });
+}
+
 function isUsableSnapshot(dir: string, apiKey: string, gameId: string): boolean {
   const marker = readMarker(dir);
   return (
@@ -111,18 +131,13 @@ function isUsableSnapshot(dir: string, apiKey: string, gameId: string): boolean 
     marker.apiKeyFingerprint === fingerprint(apiKey) &&
     // A game that has since been uninstalled would make every later step fail
     // in a confusing place; catch it while there is still a clear thing to say.
-    fs.existsSync(marker.gamePath)
+    (marker.gameSkipped === true || fs.existsSync(marker.gamePath))
   );
 }
 
 /**
- * Log in without any user interaction.
- *
- * Vortex's `isLoggedIn` selector is `truthy(APIKey) || truthy(OAuthCredentials)`,
- * so setting the API key is a complete login as far as the app is concerned —
- * no browser, no OAuth redirect, and no captcha. The captcha is precisely what
- * forces the E2E suite's `auth:capture` to be a manual one-off, and why that
- * approach could never satisfy "from scratch with no user input".
+ * Seed optional legacy API access. isLoggedIn only proves presence, not token
+ * validity or collection authentication; collections require OAuth separately.
  *
  * Dispatched raw because SET_USER_API_KEY is defined inside the
  * nexus_integration extension and is not re-exported through vortex-api.
@@ -166,8 +181,8 @@ export interface BootstrapResult {
 /**
  * Bring up a ready-to-drive Vortex, building whatever tier of cache is missing.
  *
- * Always returns a *running* instance whose MCP server has answered, is logged
- * in, and has the target game active.
+ * Returns a running MCP instance, with the game active unless skipGame is set.
+ * Login is optional and restored from the private OAuth cache when available.
  */
 export async function bootstrap(
   config: HarnessConfig,
@@ -177,12 +192,8 @@ export async function bootstrap(
   const report = options.onProgress ?? ((): void => undefined);
   const configuredKey = config.apiKey?.trim();
   const apiKey = configuredKey !== undefined && configuredKey !== "" ? configuredKey : ANONYMOUS;
-  if (apiKey === ANONYMOUS) {
-    report(
-      "no API key set — starting signed out. Everything except Nexus downloads works; " +
-        "see AGENTS.md to enable them.",
-    );
-  }
+  if (apiKey === ANONYMOUS)
+    report("no API key configured; cached OAuth is restored automatically when available");
 
   fs.mkdirSync(config.cacheDir, { recursive: true });
 
@@ -197,26 +208,36 @@ export async function bootstrap(
   report(`extension ready (${builtAt})`);
   report(`target: ${config.target.kind} — ${config.target.executable}`);
 
-  const snapshot = snapshotDir(config, apiKey);
+  const snapshot = snapshotDir(config, apiKey, options.skipGame);
   const live = liveDir(config);
 
   if (options.rebuildSnapshot === true && fs.existsSync(snapshot)) {
     removeInstanceDir(snapshot);
   }
 
-  if (!isUsableSnapshot(snapshot, apiKey, config.gameId)) {
+  const cold = !isUsableSnapshot(snapshot, apiKey, config.gameId);
+  if (cold) {
     report("no usable snapshot — running a cold bootstrap (this happens once)");
     await buildSnapshot(config, apiKey, snapshot, options);
     // The live dir was produced from an older snapshot; it must not survive.
     removeInstanceDir(live);
   }
 
-  const liveUsable = fs.existsSync(path.join(live, "userData")) && options.fresh !== true;
-  const tier: BootstrapResult["tier"] = liveUsable
-    ? "warm"
-    : isUsableSnapshot(snapshot, apiKey, config.gameId) && fs.existsSync(live)
-      ? "reset"
-      : "reset";
+  const liveMarker = readMarker(live);
+  // Preserve matching legacy working profiles during the first upgrade.
+  const legacyMatch =
+    liveMarker?.snapshotKey === undefined &&
+    liveMarker?.schemaVersion === SNAPSHOT_SCHEMA_VERSION &&
+    liveMarker?.apiKeyFingerprint === fingerprint(apiKey) &&
+    liveMarker?.gameId === config.gameId &&
+    (options.skipGame === true
+      ? liveMarker.gameSkipped === true
+      : liveMarker?.gamePath === readMarker(snapshot)?.gamePath);
+  const liveUsable =
+    fs.existsSync(path.join(live, "userData")) &&
+    options.fresh !== true &&
+    (liveMarker?.snapshotKey === path.basename(snapshot) || legacyMatch);
+  const tier: BootstrapResult["tier"] = cold ? "cold" : liveUsable ? "warm" : "reset";
 
   if (!liveUsable) {
     report("seeding the working directory from the snapshot");
@@ -233,10 +254,17 @@ export async function bootstrap(
 
   report(`launching Vortex (${tier})`);
   const instance = await launchVortex({ userDataDir: live, config });
+  if (liveUsable && legacyMatch && liveMarker) {
+    fs.writeFileSync(
+      path.join(live, MARKER_FILE),
+      JSON.stringify({ ...liveMarker, snapshotKey: path.basename(snapshot) }, null, 2),
+    );
+  }
 
   // Re-assert both on every start. Cheap, and it turns "the snapshot was subtly
   // wrong" into a self-healing case rather than a mysterious failure later.
-  if (apiKey !== ANONYMOUS) await seedLogin(instance.mcp, apiKey);
+  const auth = await instance.mcp.call<{ oauthPresent: boolean }>("nexus_auth_status");
+  if (apiKey !== ANONYMOUS && !auth.oauthPresent) await seedLogin(instance.mcp, apiKey);
 
   const game =
     options.skipGame === true
@@ -251,14 +279,14 @@ export async function bootstrap(
   // Said on every start until it is done, because the cost of not knowing is
   // paid much later: collections are the one thing an API key cannot buy, and
   // the failure otherwise shows up as a download that 401s minutes into a run.
-  if (readMarker(snapshot)?.loginCaptured !== true) {
+  if (!auth.oauthPresent) {
     report(
       "no Nexus login captured yet — collections will not install. Log in through " +
-        "Vortex's Log in button, then run `vortex-ai save-login` once.",
+        "`pnpm run ai -- setup --oauth` during initial setup if you need collections.",
     );
   }
 
-  return { instance, tier: liveUsable ? "warm" : tier, game, elapsedMs: Date.now() - started };
+  return { instance, tier, game, elapsedMs: Date.now() - started };
 }
 
 /**
@@ -299,15 +327,25 @@ export async function captureLogin(
 
   const apiKey =
     config.apiKey?.trim() === "" || config.apiKey === undefined ? ANONYMOUS : config.apiKey.trim();
-  const snapshot = snapshotDir(config, apiKey);
-  const existing = readMarker(snapshot);
+  const existing = readMarker(live);
+  const snapshot = snapshotDir(config, apiKey, existing?.gameSkipped);
+  if (existing?.snapshotKey !== path.basename(snapshot)) {
+    throw new ConfigError(
+      "The running profile uses different settings. Repeat the same --installed, --game, --game-path and --cache-dir flags used for setup.",
+    );
+  }
+  const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
+  await requireOAuth(mcp);
 
   report("stopping Vortex so its state is flushed to disk");
   await stopStaleInstance(config);
 
-  report("copying the working directory over the snapshot");
+  report("capturing the verified profile; refreshed OAuth credentials are cached separately");
+  const login = loginDir(config);
+  removeInstanceDir(login);
+  fs.mkdirSync(login, { recursive: true });
   removeInstanceDir(snapshot);
-  fs.cpSync(live, snapshot, { recursive: true });
+  copyProfile(live, snapshot);
 
   const marker: SnapshotMarker = {
     schemaVersion: SNAPSHOT_SCHEMA_VERSION,
@@ -316,8 +354,12 @@ export async function captureLogin(
     createdAt: new Date().toISOString(),
     apiKeyFingerprint: fingerprint(apiKey),
     loginCaptured: true,
+    snapshotKey: path.basename(snapshot),
+    gameSkipped: existing?.gameSkipped === true,
   };
   fs.writeFileSync(path.join(snapshot, MARKER_FILE), JSON.stringify(marker, null, 2));
+  fs.writeFileSync(path.join(login, MARKER_FILE), JSON.stringify(marker, null, 2));
+  fs.writeFileSync(path.join(live, MARKER_FILE), JSON.stringify(marker, null, 2));
   report(`snapshot updated at ${snapshot}`);
   return snapshot;
 }
@@ -338,6 +380,8 @@ async function buildSnapshot(
   // isUsableSnapshot requires it, so an interrupted run leaves a markerless
   // directory that is simply treated as absent and rebuilt.
   removeInstanceDir(snapshot);
+  const hasLogin = fs.existsSync(authCacheFile(config));
+  if (hasLogin) report("cold: reusing the local OAuth cache with a clean profile");
   prepareUserDataDir(snapshot, config.target.appName);
   installMcpExtension(snapshot);
 
@@ -346,7 +390,10 @@ async function buildSnapshot(
 
   let game: EnsureGameResult;
   try {
-    if (apiKey === ANONYMOUS) {
+    const auth = await instance.mcp.call<{ oauthPresent: boolean }>("nexus_auth_status");
+    if (auth.oauthPresent) {
+      report("cold: cached OAuth credentials present; Vortex manages refresh");
+    } else if (apiKey === ANONYMOUS) {
       report("cold: no API key — skipping login");
     } else {
       report("cold: seeding login from the API key");
@@ -381,7 +428,9 @@ async function buildSnapshot(
     gamePath: game.gamePath,
     createdAt: new Date().toISOString(),
     apiKeyFingerprint: fingerprint(apiKey),
-    loginCaptured: false,
+    loginCaptured: hasLogin,
+    snapshotKey: path.basename(snapshot),
+    gameSkipped: options.skipGame === true,
   };
   fs.writeFileSync(path.join(snapshot, MARKER_FILE), JSON.stringify(marker, null, 2));
   report(`cold: snapshot cached at ${snapshot}`);

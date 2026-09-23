@@ -70,10 +70,10 @@ let server: http.Server;
 const fakeState: { confidential: Record<string, unknown> } = { confidential: {} };
 
 function request(
-  options: Partial<http.RequestOptions> & { body?: unknown } = {},
+  options: Partial<http.RequestOptions> & { body?: unknown; bodyReady?: Promise<void> } = {},
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const { body, ...rest } = options;
+    const { body, bodyReady, ...rest } = options;
     const req = http.request(
       { host: "127.0.0.1", port, path: "/mcp", method: "POST", ...rest },
       (res) => {
@@ -85,10 +85,14 @@ function request(
       },
     );
     req.on("error", reject);
-    if (body !== undefined) {
-      req.write(JSON.stringify(body));
+    req.setTimeout(3_000, () => req.destroy(new Error("HTTP response timed out")));
+    if (bodyReady) {
+      req.flushHeaders();
+      void bodyReady.then(() => req.end(JSON.stringify(body)));
+    } else {
+      if (body !== undefined) req.write(JSON.stringify(body));
+      req.end();
     }
-    req.end();
   });
 }
 
@@ -154,6 +158,67 @@ describe("mcpServer HTTP gating", () => {
     const res = await request({ headers: jsonHeaders, body: initializeBody });
     expect(res.status).toBe(200);
     expect(res.body).toContain('"protocolVersion"');
+  });
+
+  it("keeps simultaneous clients with the same request id independent", async () => {
+    let finish!: () => void;
+    let began!: () => void;
+    const started = new Promise<void>((resolve) => {
+      began = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    vi.mocked(control.scanExtensionActions).mockImplementationOnce(async () => {
+      began();
+      await gate;
+      return [];
+    });
+    const slow = request({
+      headers: jsonHeaders,
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "scan_extension_actions", arguments: {} },
+      },
+    });
+    await started;
+    const quick = await request({
+      headers: jsonHeaders,
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {},
+      },
+    });
+    finish();
+    expect(quick.status).toBe(200);
+    expect((await slow).status).toBe(200);
+  });
+
+  it("routes a delayed request body to its own response after another client finishes", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const arrived = new Promise<void>((resolve) => server.once("request", () => resolve()));
+    const delayed = request({
+      headers: jsonHeaders,
+      bodyReady: gate,
+      body: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+    });
+    await arrived;
+    try {
+      const quick = await request({ headers: jsonHeaders, body: initializeBody });
+      expect(quick.status).toBe(200);
+    } finally {
+      release();
+    }
+    const response = await delayed;
+    expect(response.status).toBe(200);
+    expect(parseToolNames(response.body)).toContain("vortex_query");
   });
 
   it("only registers read tools when VORTEX_MCP_TOKEN is unset (fail closed)", async () => {

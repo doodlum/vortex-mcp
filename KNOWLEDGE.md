@@ -6,6 +6,46 @@ If you are debugging something baffling, start here.
 
 ## Extensions
 
+### Setup and automation regressions found in September 2026
+
+- A snapshot ref counter that resets to `e1` can make an old ref target a new
+  element. Refs now include a renderer lifetime and never reuse a counter within
+  it. Test rejection of old refs; testing only increasing snapshot generations
+  misses this bug.
+- A dialog watcher can invalidate a foreground snapshot before its click.
+  `withUiLock` serializes snapshot/action transactions within a harness client.
+  Separate clients still need their own coordination.
+- An MCP Protocol object owns one transport. Overlapping HTTP bodies must not
+  share that object. The delayed-body regression test verifies each response
+  still reaches its original client.
+- Plain-string UI name matching is exact and case-insensitive. Substring
+  matching `Games` also matched `Save games`; matching name plus text duplicated
+  labels and broke anchored regexes. Ambiguity must be an error.
+- `isLoggedIn` can be true with only an API key. OAuth presence is a separate
+  check; a snapshot marker alone never proves a usable login. The harness-only
+  credential file tracks refreshes and logout separately from game snapshots.
+  Existing credentials may omit the optional fingerprint field.
+- A no-game snapshot must have its own key and explicit marker. Treating
+  `(skipped)` as a filesystem path makes every no-game start cold.
+- Worker fixtures share an app. A lifecycle test using their ports can stop
+  the app underneath later tests. Give every additional app its own cache and
+  both its own MCP and CDP ports.
+- A fake Fallout executable does not isolate game-specific Documents or
+  LocalAppData writes. The normal suite registers `vortexaisandbox`; the opt-in
+  Nexus smoke test uses Stardew support, which installs this fixture into its
+  disposable game directory. Neither fixture proves a real game will launch.
+- Collection lookup must match both slug and revision; completion must match
+  the returned collection mod ID. Selecting the first collection can report
+  unrelated work as complete. Resolve historical revision IDs independently
+  from the latest revision number.
+- Nexus can return HTTP 504 for dependency lookup after successful earlier
+  runs. Vortex then shows dependency-error notifications with no active
+  downloads. Report those errors promptly and preserve the profile for retry;
+  repeating OAuth login does not fix a service outage.
+- Width-only report labels hide height-dependent failures. Record requested,
+  actual and inner dimensions, deduplicate issues within each viewport, and
+  keep constant findings visible: a defect at every size is still a defect.
+
 ### An extension under an ESM package root never runs
 
 Node decides a `.js` file's module type from the **nearest `package.json` up the
@@ -278,11 +318,10 @@ until the list is narrowed or scrolled to it. Filter with the search box rather
 than scrolling — far more reliable. And scrolling needs a real `scroll` **event**,
 not just a `scrollTop` assignment, or the new rows never mount.
 
-### Tool schemas change only on a restart, not a renderer reload
+### Verify tool schemas after reload; a responding port can still be the old server
 
-`ui_reload_renderer` re-runs extension code, so a fix inside a tool's _handler_
-takes effect immediately. Tool **registration** does not: the MCP server is
-already listening, so re-registration is skipped and the previous schemas stay.
+Older reload paths could leave the previous MCP server listening. A handler
+appeared updated while its tool registration still had the old input schema.
 
 The result is a half-updated extension that is easy to misread. A new parameter
 is rejected by the old schema and silently stripped before the handler sees it,
@@ -291,8 +330,11 @@ perfectly normal result. Nothing errors. It looks exactly like the new code not
 being loaded — and led to a "verified against the live app" claim here that was
 really the old schema discarding the argument.
 
-Restart the instance (`vortex-ai down && vortex-ai up`) after changing anything
-in a tool's `inputSchema`. Hot reload is fine for handler-only edits.
+The current harness waits for `automation_status.runtimeId` to change, and real
+tests verify the new renderer rejects old refs. After a schema change, also
+inspect `tools --json`. If the new schema is missing, perform a full
+`vortex-ai down` / `vortex-ai up` cycle; a successful request alone is not proof
+that the rebuilt extension loaded.
 
 ### Installing the extension: `installMcpExtension` appends `userData` itself
 

@@ -12,21 +12,18 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { bootstrap, liveDir, readMarker, snapshotDir } from "./bootstrap";
-import {
-  ConfigError,
-  loadConfig,
-  requireApiKey,
-  resolveTarget,
-  type HarnessConfig,
-} from "./config";
+import { ANONYMOUS, bootstrap, liveDir, readMarker, snapshotDir } from "./bootstrap";
+import { ConfigError, loadConfig, resolveTargetSafely, type HarnessConfig } from "./config";
 import { runDoctor, formatDoctorReport } from "./doctor";
 import { watchAndReload } from "./hotReload";
-import { ensureExtensionBuilt } from "./instance";
+import { ensureExtensionBuilt, stopStaleInstance } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep } from "./responsive";
 import { captureScreenshot } from "./cdp";
 import { captureLogin } from "./bootstrap";
+import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
+import { sandboxConfig } from "./sandbox";
+import { installLocalMod } from "./localMod";
 import { installCollection } from "./collections";
 import { deployMods, needsDeployment, purgeGame } from "./deployment";
 import { runE2e } from "./e2e";
@@ -53,6 +50,30 @@ function parseArgs(argv: string[]): ParsedArgs {
   const [command = "help", ...rest] = args;
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  const booleanFlags = new Set([
+    "help",
+    "installed",
+    "sandbox",
+    "headless",
+    "oauth",
+    "no-wait",
+    "no-launch",
+    "fresh",
+    "no-game",
+    "rebuild-snapshot",
+    "rebuild-extension",
+    "json",
+    "screenshots",
+    "strict",
+    "build",
+    "update",
+    "no-build",
+    "where",
+    "purge",
+    "keep",
+    "full-page",
+    "allow-incomplete",
+  ]);
 
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -66,11 +87,13 @@ function parseArgs(argv: string[]): ParsedArgs {
     const next = rest[i + 1];
     if (eq !== -1) {
       flags[body.slice(0, eq)] = body.slice(eq + 1);
+    } else if (booleanFlags.has(body)) {
+      flags[body] = true;
     } else if (next !== undefined && !next.startsWith("--")) {
       flags[body] = next;
       i++;
     } else {
-      flags[body] = true;
+      throw new ConfigError(`--${body} needs a value. Run help for supported flags.`);
     }
   }
   return { command, positional, flags };
@@ -85,15 +108,18 @@ function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
     typeof flags.exe === "string" ||
     flags.installed === true
   ) {
-    overrides.target = resolveTarget({
+    overrides.target = resolveTargetSafely({
       devDir: typeof flags["dev-dir"] === "string" ? flags["dev-dir"] : undefined,
       exe: typeof flags.exe === "string" ? flags.exe : undefined,
       preferInstalled: flags.installed === true,
     });
   }
   if (typeof flags.port === "string") overrides.mcpPort = Number(flags.port);
+  if (typeof flags["cdp-port"] === "string") overrides.cdpPort = Number(flags["cdp-port"]);
+  if (typeof flags["cache-dir"] === "string") overrides.cacheDir = path.resolve(flags["cache-dir"]);
   if (flags.headless === true) overrides.headless = true;
-  return loadConfig(overrides);
+  const config = loadConfig(overrides);
+  return flags.sandbox === true ? sandboxConfig(config) : config;
 }
 
 function log(message: string): void {
@@ -117,103 +143,77 @@ async function requireRunning(config: HarnessConfig): Promise<VortexMcpClient> {
   return mcp;
 }
 
-const HELP = `vortex-ai — AI/UI automation for Vortex
+const HELP = `vortex-ai — automation for stock Vortex and Vortex development
 
-Drives a stock, officially released Vortex. No patched build required.
+First run (no account or installed game required)
+  pnpm install
+  pnpm run build
+  pnpm run ai -- doctor --installed --sandbox
+  pnpm run ai -- setup --installed --sandbox
+  pnpm run ai:test
 
-Setup
-  doctor                 Check everything needed, and say what is missing
-  source                 Find your Vortex fork on GitHub, clone it into
-                         .vortex-src here, and build it. Everything needed to go
-                         from a fresh checkout to building Vortex.
-    --update             Fetch origin + upstream on an existing clone
-    --no-build           Clone only; skip install and build
-    --where              Print the clone path and exit
-  bootstrap              Build the cached, logged-in profile (cold; run once)
-    --rebuild-snapshot   Discard the cache and rebuild it from cold
-    --rebuild-extension  Rebuild the extension from source first
+Initial account setup (only for Nexus collections)
+  setup --oauth          Open isolated Vortex, wait for browser login, cache OAuth
+                         automatically, verify credentials survive a fresh start
+    --no-wait            Return with login pending; finish with save-login
+  auth-status            Print presence booleans only; never print credentials
+  save-login             Verify OAuth, stop cleanly, capture the current baseline
 
-Running an instance
-  up                     Start a ready-to-drive Vortex (logged in, game active)
-    --fresh              Reset the working directory from the cached snapshot
-    --no-game            Skip managing a game (drive the global UI only)
-    --verbose            Pipe Vortex's stdout/stderr through
-  down                   Quit the running instance cleanly
-  status                 Show cache state and whether an instance is answering
+Instance lifecycle
+  doctor                 Report prerequisites and actionable fixes
+  up                     Start/restart the matching working profile
+    --fresh              Reset working state from its baseline; reuse current OAuth
+    --no-game            Global UI without managing a game
+    --rebuild-snapshot   Rebuild baseline with current OAuth cache
+    --rebuild-extension  Force extension build
+  bootstrap              Build/reset baseline and launch (--no-game supported)
+  down                   Quit this cache's Vortex and wait for clean exit
+  status                 Show endpoint and profile cache status
+  source                 Find your fork, clone to .vortex-src and build Vortex
+    --update             Fetch origin and upstream in an existing clone
+    --no-build           Clone only
+    --where              Print managed source path
 
-Driving the UI (one-shot; needs a running instance)
-  snapshot               Print the accessibility tree of what is on screen
-    --selector <css>     Limit to a subtree
-  click --ref <e12>      Click an element (or --selector <css>)
-  fill --ref <e12> --value <text>
-  press --key <Enter>
-  screenshot             Save a PNG of the window (captured over CDP)
-    --full-page          Capture the whole scrollable page
-  tools                  List every MCP tool the instance exposes
+Driving a running instance
+  tools --json           Discover every live tool and its full input schema
+  call <tool> --args-file <json-file>   Invoke any tool with structured arguments
+    --args <json>        Inline alternative (mind shell quoting)
+  snapshot               Accessibility tree; optional --selector <css>
+  click --ref <ref>       Or use --selector <css>
+  fill --ref <ref> --value <text>
+  press --key <Enter>     DOM key events; native typing/defaults require CDP
+  screenshot             Save PNG; --label <name>, --full-page
+  install <archive>      Install local ZIP/7z through Vortex; no account needed
+  collection <url>       Install exact Nexus collection/revision using OAuth
+  deploy                 Deploy enabled mods for the active game
+    --purge              Permit purging a foreign deployment in a disposable game
+  purge                  Remove files recorded in this game's deployment manifest
+  e2e <collection>       Fresh start, install, verify, deploy, launch real game
+    --runs <n> --keep --purge; --no-launch for installation/deployment only
 
-Login
-  save-login             Capture the running instance's Nexus login into the
-                         snapshot, so cold starts restore it. Run this once,
-                         after logging in through Vortex's Log in button.
-                         Collections need OAuth, and OAuth needs a captcha that
-                         cannot be automated — so the login is done by hand once
-                         and reused from then on.
+Testing and iteration
+  responsive             Scan width AND height changes; persist JSON evidence
+    --viewports 1024x720,1280x720,1280x1080,1920x1080
+    --screenshots        Save PNG per viewport
+    --strict             Nonzero exit for viewport-dependent findings or overflow
+  watch                  Reload after extension/renderer rebuilds
+    --build              Build extension when source changes
+  build-extension        Force extension build
 
-Collections (needs a Nexus API key — they cannot be downloaded anonymously)
-  collection <url>       Download and install a Nexus collection, then wait for
-                         every required member mod to finish. Accepts a website
-                         URL, an nxm:// link, or <game>/<slug>.
-                         Runs unattended: member mods' FOMOD installers are
-                         advanced on their defaults, which are the choices the
-                         collection already records.
+Target and isolation (repeat the same flags for all commands)
+  --installed            Use released Vortex even when .vortex-src exists
+  --exe <path>           Explicit Vortex.exe
+  --dev-dir <path>       Explicit source checkout
+  --sandbox              Disposable test game for local install/deploy tests
+  --game <id> --game-path <dir>   Real game integration; use a disposable copy
+  --cache-dir <dir>      Profiles and private OAuth cache
+  --port <n> --cdp-port <n>      MCP/CDP endpoints (3701/9222 by default)
+  --headless             Hide the window; screenshots/layout may differ
 
-Deployment
-  deploy                 Link every enabled mod into the game directory
-    --purge              First remove files another Vortex instance deployed.
-                         DELETES those files; without it, deployment of a game
-                         another instance has touched is blocked outright.
-  purge                  Reset the game directory to unmodded, for a repeatable
-                         run. Implies --purge's consent.
-
-End to end
-  e2e <collection>       Run the whole chain from scratch and check every step
-                         against what Vortex itself reports: start, manage the
-                         game, install the collection, confirm Vortex calls it
-                         complete, deploy, launch.
-    --runs <n>           Repeat it n times (default 1). Each run starts from a
-                         wiped working directory.
-    --purge              Let it reset a game directory another Vortex instance
-                         deployed to. DELETES those files.
-    --keep               Do not wipe the working directory between runs.
-
-Testing
-  responsive             Sweep window sizes, report width-dependent issues
-    --screenshots        Also save a PNG per size
-    --viewports 1024x720,1600x900
-    --strict             Exit non-zero when there are width-dependent findings
-  watch                  Reload the instance when the extension (or, with
-                         --dev-dir, Vortex's renderer) is rebuilt
-    --build              Rebuild the extension yourself on each change
-
-Which Vortex
-  (default)              The .vortex-src clone if present, else the installed
-                         released Vortex
-  --installed            Force the installed build even when a clone exists
-  --exe <path>           A specific Vortex.exe
-  --dev-dir <path>       A Vortex source checkout — only needed to hot-reload
-                         changes to Vortex's OWN renderer code
-
-Common flags
-  --game <id>            Game to manage (default: fallout4)
-  --game-path <dir>      Use this install directory instead of locating it via
-                         Steam. Use a disposable copy to exercise deploy/purge
-                         without touching a real, already-managed game install.
-  --port <n>             MCP port (default: 3701)
-  --headless             Hide the window (screenshots may be blank)
-
-A Nexus API key is needed only for Nexus downloads. See AGENTS.md.
+Without a target flag: .vortex-src if present, otherwise installed Vortex.
+Read harness/AGENTS.md, the relevant skills and KNOWLEDGE.md first.
+For Vortex changes also follow its AGENTS.md and linked task-specific docs.
 `;
-
 async function main(): Promise<number> {
   const { command, flags, positional } = parseArgs(process.argv.slice(2));
 
@@ -225,14 +225,81 @@ async function main(): Promise<number> {
   const config = configFrom(flags);
 
   switch (command) {
+    case "install": {
+      const file = positional[0];
+      if (!file) throw new ConfigError("install needs the path to a local mod archive.");
+      log(JSON.stringify(await installLocalMod(await requireRunning(config), file), null, 2));
+      return 0;
+    }
+    case "setup": {
+      const result = await bootstrap(config, {
+        skipGame: flags.oauth === true || flags["no-game"] === true,
+        onProgress: log,
+      });
+      if (flags.oauth !== true) {
+        log(`Ready: ${result.instance.mcp.url}. Use snapshot or call to drive it.`);
+        return 0;
+      }
+      const auth = await result.instance.mcp.call<AuthStatus>("nexus_auth_status");
+      if (auth.oauthPresent && auth.oauthRefreshable) {
+        await captureLogin(config, { onProgress: log });
+        const restored = await bootstrap(config, { skipGame: true, fresh: true, onProgress: log });
+        await requireOAuth(restored.instance.mcp);
+        log("Existing OAuth login cached and present after a fresh restore. Setup complete.");
+        return 0;
+      }
+      // Only this harness-owned profile is changed; a seeded API key hides the
+      // login button, preventing the initial OAuth flow.
+      if (auth.apiKeyPresent) {
+        await result.instance.mcp.call("vortex_dispatch", {
+          action: "type:SET_USER_API_KEY",
+          args: [null],
+        });
+      }
+      log("Initial setup: click Log in in the isolated Vortex and complete the browser flow.");
+      if (flags["no-wait"] === true) {
+        log("Then run `pnpm run ai -- save-login` with these same configuration flags.");
+        return 0;
+      }
+      log("Waiting up to 10 minutes; OAuth login will be cached automatically.");
+      await waitForOAuth(result.instance.mcp);
+      await captureLogin(config, { onProgress: log });
+      const restored = await bootstrap(config, { skipGame: true, fresh: true, onProgress: log });
+      await requireOAuth(restored.instance.mcp);
+      log("OAuth credentials cached and verified after a fresh restore. Setup complete.");
+      return 0;
+    }
+    case "auth-status": {
+      const mcp = await requireRunning(config);
+      log(JSON.stringify(await mcp.call<AuthStatus>("nexus_auth_status"), null, 2));
+      return 0;
+    }
+    case "call": {
+      const name = positional[0];
+      if (!name)
+        throw new ConfigError("call needs a tool name; run tools --json to inspect schemas.");
+      const raw =
+        typeof flags["args-file"] === "string"
+          ? fs.readFileSync(flags["args-file"], "utf8")
+          : typeof flags.args === "string"
+            ? flags.args
+            : "{}";
+      const args: unknown = JSON.parse(raw);
+      if (args === null || typeof args !== "object" || Array.isArray(args))
+        throw new ConfigError("Tool arguments must be a JSON object.");
+      const mcp = await requireRunning(config);
+      log(JSON.stringify(await mcp.call(name, args as Record<string, unknown>), null, 2));
+      return 0;
+    }
     case "doctor": {
-      const report = await runDoctor(config);
+      const report = await runDoctor(config, { skipGame: flags["no-game"] === true });
       log(formatDoctorReport(report));
       return report.ok ? 0 : 1;
     }
 
     case "bootstrap": {
       const result = await bootstrap(config, {
+        skipGame: flags["no-game"] === true,
         rebuildSnapshot: flags["rebuild-snapshot"] === true,
         rebuildExtension: flags["rebuild-extension"] === true,
         fresh: true,
@@ -249,6 +316,7 @@ async function main(): Promise<number> {
     case "up": {
       const result = await bootstrap(config, {
         fresh: flags.fresh === true,
+        rebuildSnapshot: flags["rebuild-snapshot"] === true,
         skipGame: flags["no-game"] === true,
         rebuildExtension: flags["rebuild-extension"] === true,
         onProgress: (m) => log(`  ${m}`),
@@ -268,19 +336,13 @@ async function main(): Promise<number> {
     }
 
     case "down": {
-      const mcp = clientFor(config);
-      if (!(await mcp.ping())) {
-        log("Nothing is running.");
-        return 0;
-      }
-      await mcp.call("vortex_quit").catch(() => undefined);
-      log("Asked Vortex to quit cleanly.");
+      log((await stopStaleInstance(config)) ? "Vortex exited cleanly." : "Nothing is running.");
       return 0;
     }
 
     case "status": {
       const apiKey = config.apiKey;
-      const snapshot = apiKey === undefined ? undefined : snapshotDir(config, apiKey);
+      const snapshot = snapshotDir(config, apiKey?.trim() || ANONYMOUS, flags["no-game"] === true);
       const live = liveDir(config);
       const running = await clientFor(config).ping();
 
@@ -302,6 +364,10 @@ async function main(): Promise<number> {
     case "tools": {
       const mcp = await requireRunning(config);
       const tools = await mcp.listTools();
+      if (flags.json === true) {
+        log(JSON.stringify(tools, null, 2));
+        return 0;
+      }
       log(`${String(tools.length)} tools:\n`);
       for (const tool of tools) {
         log(`  ${tool.name.padEnd(28)} ${tool.description.slice(0, 90)}`);
@@ -350,7 +416,10 @@ async function main(): Promise<number> {
         label: typeof flags.label === "string" ? flags.label : undefined,
       });
       log(formatReport(report));
-      return report.regressions.length > 0 && flags.strict === true ? 1 : 0;
+      return (report.regressions.length > 0 || report.overflowViewports.length > 0) &&
+        flags.strict === true
+        ? 1
+        : 0;
     }
 
     case "watch": {
@@ -441,11 +510,6 @@ async function main(): Promise<number> {
     }
 
     case "collection": {
-      // Checked before anything is started or connected to. A collection cannot
-      // be fetched anonymously, so without a key this run is going to fail —
-      // and it should fail here, saying what to do, rather than after a cold
-      // start and a download that gets rejected.
-      requireApiKey(config);
       const mcp = await requireRunning(config);
       const target = typeof flags.url === "string" ? flags.url : positional[0];
       if (target === undefined) {
@@ -467,7 +531,7 @@ async function main(): Promise<number> {
         log("  collection page says which, and its archive is usually already");
         log("  downloaded, so a retry from there does not re-fetch it.");
       }
-      return 0;
+      return result.complete ? 0 : 1;
     }
 
     case "deploy": {
@@ -510,7 +574,6 @@ async function main(): Promise<number> {
       if (target === undefined) {
         throw new ConfigError("e2e needs a collection, e.g.\n  vortex-ai e2e <collection url>");
       }
-      requireApiKey(config);
       const runs = typeof flags.runs === "string" ? Number.parseInt(flags.runs, 10) : 1;
       if (!Number.isInteger(runs) || runs < 1)
         throw new ConfigError("--runs must be a positive integer");
@@ -524,6 +587,7 @@ async function main(): Promise<number> {
             collection: target,
             fresh: flags.keep !== true,
             purge: flags.purge === true,
+            skipLaunch: flags["no-launch"] === true,
             onProgress: (m) => log(m),
           });
           outcomes.push(result.ok);
@@ -541,7 +605,6 @@ async function main(): Promise<number> {
     }
 
     case "build-extension": {
-      requireApiKey(config);
       const root = await ensureExtensionBuilt({ rebuild: true });
       log(`Built vortex-mcp at ${root}`);
       return 0;
@@ -568,7 +631,7 @@ function parseViewports(
     const [w, h] = pair.trim().split("x");
     const width = Number(w);
     const height = Number(h);
-    if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
       throw new ConfigError(`Bad viewport "${pair}" — expected WIDTHxHEIGHT, e.g. 1280x800.`);
     }
     return { width, height };

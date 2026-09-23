@@ -5,7 +5,11 @@ description: Write or debug a Playwright test for Vortex's UI in this repo, driv
 
 # Writing a Vortex UI test
 
-Specs live in `harness/src/tests/`. Run them with `pnpm run ai:test`.
+Specs live in `harness/src/tests/`. Run them with `pnpm run ai:test`. Read
+`harness/AGENTS.md`, `KNOWLEDGE.md` and `harness/WORKFLOWS.md` first. Before
+changing Vortex, follow its own `AGENTS.md`, docs index, and relevant frontend,
+testing and design-system documentation. Extend the harness when a requested
+test needs a capability that is missing; verify the workflow after adding it.
 
 ## The shape of a test
 
@@ -41,8 +45,13 @@ app per assertion.
 - **Never assert on a `ref` across snapshots.** They are generation-scoped.
 - **Prefer `findNodes` over hardcoded selectors.** Vortex's class names are
   largely generated; labels move between versions (`Manage` → `Add game`).
-- **Skip, don't fail, when the precondition is absent.** `test.skip(cond, "why")`
-  — e.g. no disabled button on screen to test the disabled-click guard against.
+- **Create deterministic preconditions.** A disabled-click test supplies a
+  disabled fixture; a game test uses the sandbox game. Do not silently skip
+  acceptance criteria. Report unavoidable external blockers separately.
+- **Test width and height independently**, then exercise relevant loading,
+  empty, populated, error, modal, filter and selection states. Structural layout
+  scans are advisory; independently inspect screenshots and asserted behavior.
+- **Use distinct ports and cache roots** when a test starts another instance.
 - **Assert a direction, not an exact number,** for anything the OS clamps. A
   window resize below the minimum is clamped, so assert "moved towards" rather
   than equality.

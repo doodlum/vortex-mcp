@@ -23,6 +23,8 @@
  * Vortex. That constraint is deliberate and worth preserving.
  */
 
+import { randomUUID } from "node:crypto";
+
 // Vortex's own Electron preload bridge. Not part of @nexusmods/vortex-api and not
 // a contract Nexus Mods commits to — same caveat as vortexControl.ts's use of
 // window.api.app.relaunch. Only the members this module actually calls are declared.
@@ -85,16 +87,18 @@ function win(): Window {
 const refTable = new Map<string, Element>();
 let refGeneration = 0;
 let refCounter = 0;
+const refSession = randomUUID().slice(0, 8);
 
 function beginRefGeneration(): void {
   refGeneration += 1;
-  refCounter = 0;
+  // Never reuse a ref string. Resetting this counter lets an earlier snapshot's
+  // e1 resolve to an unrelated element in the new generation.
   refTable.clear();
 }
 
 function assignRef(el: Element): string {
   refCounter += 1;
-  const ref = `e${String(refCounter)}`;
+  const ref = `e${String(refCounter)}-${refSession}`;
   refTable.set(ref, el);
   return ref;
 }

@@ -84,11 +84,11 @@ export class VortexMcpClient {
   }
 
   /** List the tools the server currently exposes — write tools only appear with a token. */
-  async listTools(): Promise<{ name: string; description: string }[]> {
+  async listTools(): Promise<{ name: string; description: string; inputSchema?: unknown }[]> {
     const result = (await this.#rpc("tools/list", {})) as {
-      tools?: { name: string; description?: string }[];
+      tools?: { name: string; description?: string; inputSchema?: unknown }[];
     };
-    return (result.tools ?? []).map((t) => ({ name: t.name, description: t.description ?? "" }));
+    return (result.tools ?? []).map((t) => ({ ...t, description: t.description ?? "" }));
   }
 
   /** Call a tool and return its raw content blocks. */
@@ -164,10 +164,11 @@ export class VortexMcpClient {
    * extensions and the Redux store is live. Polling a port would be satisfied
    * far too early, while the app is still on the splash screen.
    */
-  async waitUntilReady(timeoutMs = 180_000, pollMs = 500): Promise<void> {
+  async waitUntilReady(timeoutMs = 180_000, pollMs = 500, signal?: AbortSignal): Promise<void> {
     const started = Date.now();
     let lastError = "never answered";
     for (;;) {
+      signal?.throwIfAborted();
       if (await this.ping()) return;
       if (Date.now() - started > timeoutMs) {
         throw new Error(
@@ -177,7 +178,7 @@ export class VortexMcpClient {
         );
       }
       lastError = "not answering yet";
-      await delay(pollMs);
+      await delay(pollMs, undefined, { signal });
     }
   }
 }

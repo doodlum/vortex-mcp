@@ -14,13 +14,24 @@
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 
 import { extensionRoot, MCP_EXTENSION_ID, type HarnessConfig } from "./config";
 import { VortexMcpClient } from "./mcpClient";
+import { installSandboxExtension } from "./sandbox";
 
 const execFileAsync = promisify(execFile);
+
+export function authCacheFile(config: HarnessConfig): string {
+  const key = createHash("sha256")
+    .update(`${config.target.kind}:${config.target.appName}`)
+    .digest("hex")
+    .slice(0, 16);
+  return path.join(config.cacheDir, `oauth-${key}.json`);
+}
 
 export interface VortexInstance {
   process: ChildProcess;
@@ -61,6 +72,7 @@ export function buildInstanceEnv(
   env.VORTEX_E2E = "1";
   env.VORTEX_MCP_TOKEN = config.mcpToken;
   env.VORTEX_MCP_PORT = String(config.mcpPort);
+  env.VORTEX_AI_AUTH_CACHE = authCacheFile(config);
   if (config.headless) env.VORTEX_E2E_HEADLESS = "1";
   // A source checkout only loads its extensions and devtools wiring under
   // development; a released build ignores this.
@@ -112,17 +124,44 @@ export function installMcpExtension(userDataDir: string, source = extensionRoot(
 
 export class ExtensionMissingError extends Error {}
 
+async function assertPortAvailable(port: number): Promise<void> {
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", () =>
+      reject(
+        new Error(
+          `Port ${port} is occupied. Choose unused --port and --cdp-port values; no new Vortex was launched.`,
+        ),
+      ),
+    );
+    server.listen(port, "127.0.0.1", () =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+}
+
 /** Ensure the extension is built, building it when needed. Returns this repo's root. */
 export async function ensureExtensionBuilt(options: { rebuild?: boolean } = {}): Promise<string> {
   const source = extensionRoot();
   const dist = path.join(source, "dist", "index.js");
 
-  if (options.rebuild === true || !fs.existsSync(dist)) {
-    await execFileAsync("pnpm", ["run", "build"], {
-      cwd: source,
-      shell: true,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+  const buildTime = fs.existsSync(dist) ? fs.statSync(dist).mtimeMs : 0;
+  const inputs = fs
+    .readdirSync(path.join(source, "src"), { recursive: true, encoding: "utf8" })
+    .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
+    .map((file) => path.join(source, "src", file));
+  inputs.push(path.join(source, "tsup.config.ts"), path.join(source, "package.json"));
+  if (options.rebuild === true || inputs.some((file) => fs.statSync(file).mtimeMs > buildTime)) {
+    const pnpmScript = process.env.npm_execpath;
+    await execFileAsync(
+      pnpmScript ? process.execPath : "pnpm",
+      pnpmScript ? [pnpmScript, "run", "build"] : ["run", "build"],
+      {
+        cwd: source,
+        shell: pnpmScript === undefined,
+        maxBuffer: 10 * 1024 * 1024,
+      },
+    );
   }
   if (!fs.existsSync(dist)) {
     throw new ExtensionMissingError(`The extension build produced no ${dist}.`);
@@ -194,38 +233,35 @@ function isAlive(pid: number): boolean {
  */
 export async function stopStaleInstance(config: HarnessConfig): Promise<boolean> {
   let stopped = false;
-
+  const file = pidFile(config);
+  const pid = fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8").trim()) : undefined;
   const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
   if (await mcp.ping()) {
-    await mcp.call("vortex_quit").catch(() => undefined);
-    for (let i = 0; i < 40; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      if (!(await mcp.ping())) break;
+    const status = await mcp.call<{ userDataDir: string | null }>("automation_status");
+    const relative =
+      status.userDataDir === null
+        ? ".."
+        : path.relative(path.resolve(config.cacheDir), path.resolve(status.userDataDir));
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(
+        `Port ${config.mcpPort} belongs to a different Vortex profile. Choose another --port and --cdp-port.`,
+      );
     }
+    await mcp.call("vortex_quit");
     stopped = true;
   }
-
-  const file = pidFile(config);
-  if (fs.existsSync(file)) {
-    const pid = Number(fs.readFileSync(file, "utf8").trim());
-    if (Number.isFinite(pid) && pid > 0 && isAlive(pid)) {
-      try {
-        process.kill(pid, "SIGKILL");
-        stopped = true;
-        // Windows releases the database handles a moment after the process
-        // goes; removeInstanceDir's retries absorb the rest.
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      } catch {
-        // Already gone, or not ours to kill.
-      }
+  const deadline = Date.now() + 30_000;
+  const recordedProcessAlive = (): boolean =>
+    pid !== undefined && Number.isInteger(pid) && pid > 0 && isAlive(pid);
+  while (recordedProcessAlive() || (await mcp.ping())) {
+    if (Date.now() >= deadline) {
+      throw new Error(
+        "Vortex did not exit cleanly. The profile has been preserved; close the harness window before retrying. No snapshot was copied and no PID was killed.",
+      );
     }
-    try {
-      fs.rmSync(file, { force: true });
-    } catch {
-      // ignored
-    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
   }
-
+  fs.rmSync(file, { force: true });
   return stopped;
 }
 
@@ -253,6 +289,9 @@ export interface LaunchOptions {
 export async function launchVortex(options: LaunchOptions): Promise<VortexInstance> {
   const { userDataDir, config } = options;
   const { target } = config;
+  installSandboxExtension(userDataDir, config);
+  await assertPortAvailable(config.mcpPort);
+  await assertPortAvailable(config.cdpPort);
 
   if (target.executable === "") {
     throw new Error(
@@ -281,11 +320,20 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
   // Fail fast on an early crash rather than waiting out the readiness timeout.
   let exited: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   child.once("exit", (code, signal) => (exited = { code, signal }));
+  let spawnError: Error | undefined;
+  child.once("error", (err) => {
+    spawnError = err;
+  });
 
-  const readiness = mcp.waitUntilReady();
+  const readyController = new AbortController();
+  const readiness = mcp.waitUntilReady(180_000, 500, readyController.signal);
+  let timer: ReturnType<typeof setInterval>;
   const crashWatch = new Promise<never>((_resolve, reject) => {
-    const timer = setInterval(() => {
-      if (exited !== undefined) {
+    timer = setInterval(() => {
+      if (spawnError !== undefined) {
+        clearInterval(timer);
+        reject(spawnError);
+      } else if (exited !== undefined) {
         clearInterval(timer);
         reject(
           new Error(
@@ -299,7 +347,12 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
     timer.unref();
   });
 
-  await Promise.race([readiness, crashWatch]);
+  try {
+    await Promise.race([readiness, crashWatch]);
+  } finally {
+    clearInterval(timer!);
+    readyController.abort();
+  }
 
   return {
     process: child,
@@ -332,8 +385,13 @@ export async function stopInstance(
 
   const exited = await waitForExit(child, timeoutMs);
   if (!exited) {
+    if (options.force !== true)
+      throw new Error(
+        "Vortex did not exit cleanly; refusing to snapshot potentially unflushed state.",
+      );
     child.kill("SIGKILL");
-    await waitForExit(child, 5_000);
+    if (!(await waitForExit(child, 5_000)))
+      throw new Error("Vortex did not exit after forced shutdown.");
   }
 }
 

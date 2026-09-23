@@ -12,15 +12,12 @@ https://www.nexusmods.com/games/site/mods/2263
 
 ## Status
 
-Unit- and integration-tested — see `pnpm run test`. Every read tool and
-every `vortex_dispatch` fallback tier has been verified against a real
-Vortex install on a disposable test profile, with a `backup_state` snapshot
-taken first. `launch_game` was verified end to end (deploy, launch, real
-game process came up) since unlike everything else here it has a visible
-real-world side effect. The `start-download` event (installing a mod from a
-URL) is never exercised outside unit tests — it can trigger a blocking
-"choose install type" modal for ambiguous archives, unsafe to risk
-unsupervised.
+`pnpm run ci` checks types, lint, formatting, unit tests and the build without
+requiring Vortex. `pnpm run ai:test` exercises a real Vortex in disposable
+profiles: UI actions, screenshots, renderer reload, cold/warm/fresh starts, and
+ZIP installation through enable, deploy, disable, redeploy and purge, with
+actual file-content checks. The suite supplies a test game and needs no Nexus
+account. Collections and real game launch require separate integration checks.
 
 ## Driving the UI
 
@@ -34,18 +31,38 @@ patched Vortex.
 instance, take screenshots, move a real mouse, and hot-reload changes.
 
 ```sh
-pnpm run ai:doctor   # check the setup, print fixes
-pnpm run ai:up       # start a ready-to-drive Vortex, logged in, game active
+pnpm install
+pnpm run build
+pnpm run ai -- doctor --installed --sandbox
+pnpm run ai -- setup --installed --sandbox
+pnpm run ai -- tools --json   # full live schemas for any agent
+pnpm run ai -- snapshot
+pnpm run ai:test
 ```
 
 Working on **Vortex itself** rather than this extension? `pnpm run ai:source`
 finds your Vortex fork on GitHub, clones it into `.vortex-src/` here, and builds
 it; `ai:up` then drives that clone instead of the installed app.
 
-Verified against the released Vortex 2.6.3 — cold start ~90-140s, warm ~10-20s.
+For collections, run `pnpm run ai -- setup --installed --oauth` once and finish
+the browser login. Setup waits and caches automatically; refreshed credentials
+stay private on this machine and are reused across fresh profiles. An API key
+alone does not authenticate collections on the tested build.
+
+Then `pnpm run ai:test:nexus` validates a small live collection in a disposable
+game directory, including deployed file hashes and purge. It uses the same
+target/cache settings as setup and needs Nexus Premium for unattended downloads.
+It does not test gameplay. See [validation coverage](harness/VALIDATION.md).
+
+Verified against released Vortex 2.6.3. Use Node 20.19+ and this repo's pinned
+pnpm 9.15.0; enable `packageManager` version selection with Corepack or install
+that pnpm version. An incompatible global pnpm can fail before the harness runs.
 See [harness/AGENTS.md](harness/AGENTS.md) for the operating manual and
 [KNOWLEDGE.md](KNOWLEDGE.md) for the Vortex behaviours that will otherwise cost
-you an afternoon.
+you an afternoon. [harness/WORKFLOWS.md](harness/WORKFLOWS.md) covers regression
+tests, bug fixes, implementing designs, and viewport/state matrices. Agents must
+read applicable skills and knowledge first, add missing reusable capabilities,
+and follow Vortex's own AI documentation when changing Vortex.
 
 ## Stack
 
@@ -105,10 +122,13 @@ Generated from the live server's actual `tools/list` response — see
 
 | Tool                          | Access | What it does                                                                                                                                 |
 | ----------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `automation_status`           | read   | Identify this renderer lifetime and isolated harness profile.                                                                                |
+| `nexus_auth_status`           | read   | Report whether a Nexus API key, OAuth access token, and OAuth refresh token are present, without returning credentials.                      |
 | `vortex_describe`             | read   | Discover the live Vortex API surface: callable selector names (for vortex_query, with known caveats in `selectorHints`, e.g. selectorHints.… |
 | `scan_extension_actions`      | read   | Discover real dispatchable Redux action type strings — and, where recoverable, their payload shape — by scanning every installed extension'… |
 | `vortex_query`                | read   | Read Vortex state. Two modes: `selector` calls that named vortex-api selector as `(state, ...args)` (e.g. selector='activeProfileId', or se… |
 | `list_profiles`               | read   | List Vortex profiles (defaults to every game; pass gameId to filter to one), with name, active status, and mod counts — a formatted join vo… |
+| `collection_status`           | read   | Whether each installed collection is COMPLETE, by Vortex's own definition — the same check behind the Collections page's "Incomplete" badge. |
 | `list_mods`                   | read   | List mods for a game (defaults to the active game), with friendly names and enabled state for the active profile — a formatted join vortex_… |
 | `list_load_order`             | read   | List the current Gamebryo/LOOT plugin load order (.esp/.esm/.esl), sorted by index.                                                          |
 | `get_plugin_details`          | read   | Get the same rich per-plugin info Vortex's own Plugins tab shows — master list, LOOT messages/warnings, dirty-edit status (ITM/UDR), group,… |
@@ -128,9 +148,14 @@ Generated from the live server's actual `tools/list` response — see
 | `list_unsolved_conflicts`     | read   | List file conflicts between enabled mods that have NO rule resolving them yet — the read side of Vortex's own conflict-resolution ('Set Rul… |
 | `find_missing_deployed_files` | read   | Find plugins where Vortex's load-order state, what's actually deployed to the game's Data folder, and what the game's own plugins.txt says…  |
 | `find_orphaned_files`         | read   | Find files Vortex's own deployment manifest (<Data>/vortex.deployment.json — the same bookkeeping Vortex reads for its own Purge) still att… |
-| `check_nexus_mod_updates`     | read   | Check installed Nexus-sourced mods for available updates via Vortex's own built-in integration and the user's existing Vortex login — no se… |
 | `list_dialogs`                | read   | List Vortex's currently-open GENERIC modal dialogs (showDialog-based — most confirmation/question/error prompts) — distinct from list_notif… |
 | `list_external_changes`       | read   | List pending 'external changes' Vortex detected (a deployed file differs from what Vortex itself put there) that are BLOCKING an in-progres… |
+| `ui_snapshot`                 | read   | Read what is actually ON SCREEN in Vortex right now, as a compact accessibility tree with a stable `ref` per node — the primary 'look at th… |
+| `ui_wait_for`                 | read   | Poll until a CSS selector or a piece of visible text reaches the given state, then return how long it took.                                  |
+| `ui_get_viewport`             | read   | Report the Electron window's outer size, the renderer's inner (CSS px) size, and the device pixel ratio.                                     |
+| `ui_detect_layout_issues`     | read   | Scan the rendered UI at its CURRENT size for responsive-layout breakage: content overflowing the right edge, elements pushed fully offscree… |
+| `ui_read_console`             | read   | Read the renderer's console output and uncaught errors/rejections from an in-process ring buffer (500 entries, oldest dropped), captured si… |
+| `check_nexus_mod_updates`     | write  | Check installed Nexus-sourced mods for available updates via Vortex's own built-in integration and the user's existing Vortex login — no se… |
 | `switch_profile`              | write  | Switch Vortex to a different profile by id (query list_profiles to find one).                                                                |
 | `clone_profile`               | write  | Clone an existing profile into a new one (copies its on-disk profile directory — load order, ini tweaks — plus its mod enabled-state), the…  |
 | `vortex_dispatch`             | write  | Dispatch a named Vortex action creator, api.ext function, event, or direct api method — tried in that order.                                 |
@@ -139,6 +164,16 @@ Generated from the live server's actual `tools/list` response — see
 | `set_mods_enabled`            | write  | Enable or disable a set of mods for a profile (defaults to the active profile).                                                              |
 | `launch_game`                 | write  | Launch a game's configured primary tool (e.g. SKSE, or the vanilla exe if none is set) — the same operation as Vortex's own 'Play' button,…  |
 | `vortex_restart`              | write  | Restart Vortex via its own graceful relaunch (same path as Vortex's 'Restart now' button): closes windows and lets Vortex's normal shutdown… |
+| `vortex_quit`                 | write  | Quit Vortex cleanly — the same path as clicking the window's close button, NOT a process kill.                                               |
+| `ui_click`                    | write  | Click an element, addressed by `ref` from ui_snapshot or by CSS `selector`.                                                                  |
+| `ui_fill`                     | write  | Set the value of an <input>, <textarea> or contenteditable, then fire input+change so React's onChange actually runs.                        |
+| `ui_press_key`                | write  | Dispatch a keydown/keypress/keyup on a target element, or on whatever currently has focus when no target is given.                           |
+| `ui_hover`                    | write  | Move the pointer over an element, firing the pointerover/mouseover/mouseenter sequence.                                                      |
+| `ui_select_option`            | write  | Choose an option in a native <select>, by `value` or by visible `label`, firing input+change.                                                |
+| `ui_scroll`                   | write  | Scroll the window, or a specific scrollable element when given a ref/selector.                                                               |
+| `ui_set_viewport`             | write  | Resize the real Electron window to test responsive layout.                                                                                   |
+| `ui_responsive_sweep`         | write  | Resize through a list of viewports, running the ui_detect_layout_issues scan at each, then restore the original size — the restore runs eve… |
+| `ui_reload_renderer`          | write  | Reload the renderer window, picking up a rebuilt renderer bundle WITHOUT restarting Electron — the hot-reload path after editing renderer c… |
 
 <!-- TOOLS_TABLE_END -->
 

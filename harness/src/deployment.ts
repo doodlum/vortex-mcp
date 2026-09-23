@@ -58,9 +58,9 @@ export async function modsStillInstalling(
   mcp: VortexMcpClient,
   gameId: string,
 ): Promise<ModState[]> {
-  const mods = await mcp
-    .call<Record<string, ModState> | null>("vortex_query", { path: ["persistent", "mods", gameId] })
-    .catch(() => null);
+  const mods = await mcp.call<Record<string, ModState> | null>("vortex_query", {
+    path: ["persistent", "mods", gameId],
+  });
   return Object.values(mods ?? {}).filter((m) => m.state === "installing");
 }
 
@@ -159,10 +159,8 @@ async function runAnswering(
 
 /** Whether Vortex still considers this game to have undeployed changes. */
 export async function needsDeployment(mcp: VortexMcpClient, gameId: string): Promise<boolean> {
-  const pending = await mcp
-    .call<Record<string, boolean> | null>("vortex_query", {
-      path: ["persistent", "deployment", "needToDeploy"],
-    })
-    .catch(() => null);
+  const pending = await mcp.call<Record<string, boolean> | null>("vortex_query", {
+    path: ["persistent", "deployment", "needToDeploy"],
+  });
   return pending?.[gameId] === true;
 }

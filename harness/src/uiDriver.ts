@@ -14,6 +14,7 @@
  * seen and adjusted.
  */
 import type { VortexMcpClient } from "./mcpClient";
+import { withUiLock } from "./uiSession";
 
 export interface SnapshotNode {
   ref: string;
@@ -40,7 +41,7 @@ export interface Snapshot {
 export interface NodeQuery {
   /** Exact role, e.g. "button", "textbox", "link". */
   role?: string;
-  /** Case-insensitive substring of the accessible name or visible text. */
+  /** Case-insensitive exact name/text, or an explicit regex for partial matching. */
   name?: string | RegExp;
   /** Exact data-testid. */
   testId?: string;
@@ -66,10 +67,19 @@ function matches(node: SnapshotNode, query: NodeQuery): boolean {
   if (query.enabledOnly !== false && node.disabled === true) return false;
 
   if (query.name !== undefined) {
-    const haystack = `${node.name ?? ""} ${node.text ?? ""}`.trim();
+    const labels = [node.name, node.text].filter((value): value is string => value !== undefined);
     if (query.name instanceof RegExp) {
-      if (!query.name.test(haystack)) return false;
-    } else if (!haystack.toLowerCase().includes(query.name.toLowerCase())) {
+      const pattern = query.name;
+      if (
+        !labels.some((label) => {
+          pattern.lastIndex = 0;
+          return pattern.test(label);
+        })
+      )
+        return false;
+    } else if (
+      !labels.some((label) => label.trim().toLowerCase() === (query.name as string).toLowerCase())
+    ) {
       return false;
     }
   }
@@ -91,7 +101,11 @@ export class ElementNotFoundError extends Error {}
  */
 export function findOne(snap: Snapshot, query: NodeQuery): SnapshotNode {
   const found = findNodes(snap, query);
-  if (found.length > 0) return found[0] as SnapshotNode;
+  if (found.length > 1)
+    throw new ElementNotFoundError(
+      `Ambiguous UI target: ${found.length} matches (${found.map((n) => `${n.ref} ${n.role} ${JSON.stringify(n.name ?? n.text)}`).join(", ")}). Scope the snapshot or specify a role/testId.`,
+    );
+  if (found.length === 1) return found[0] as SnapshotNode;
 
   const sameRole =
     query.role === undefined
@@ -114,10 +128,9 @@ export async function snapshot(
   selector?: string,
   index?: number,
 ): Promise<Snapshot> {
-  if (selector === undefined) return mcp.call<Snapshot>("ui_snapshot", {});
-  return mcp.call<Snapshot>(
-    "ui_snapshot",
-    index === undefined ? { selector } : { selector, index },
+  if (selector === undefined) return withUiLock(mcp, () => mcp.call<Snapshot>("ui_snapshot", {}));
+  return withUiLock(mcp, () =>
+    mcp.call<Snapshot>("ui_snapshot", index === undefined ? { selector } : { selector, index }),
   );
 }
 
@@ -129,15 +142,19 @@ export async function snapshot(
  * the stale-ref hazard the extension guards against.
  */
 export async function clickByName(mcp: VortexMcpClient, query: NodeQuery): Promise<SnapshotNode> {
-  const node = findOne(await snapshot(mcp), query);
-  await mcp.call("ui_click", { ref: node.ref });
-  return node;
+  return withUiLock(mcp, async () => {
+    const node = findOne(await snapshot(mcp), query);
+    await mcp.call("ui_click", { ref: node.ref });
+    return node;
+  });
 }
 
 export async function hoverByName(mcp: VortexMcpClient, query: NodeQuery): Promise<SnapshotNode> {
-  const node = findOne(await snapshot(mcp), query);
-  await mcp.call("ui_hover", { ref: node.ref });
-  return node;
+  return withUiLock(mcp, async () => {
+    const node = findOne(await snapshot(mcp), query);
+    await mcp.call("ui_hover", { ref: node.ref });
+    return node;
+  });
 }
 
 export async function fillByName(
@@ -145,9 +162,11 @@ export async function fillByName(
   query: NodeQuery,
   value: string,
 ): Promise<SnapshotNode> {
-  const node = findOne(await snapshot(mcp), query);
-  await mcp.call("ui_fill", { ref: node.ref, value });
-  return node;
+  return withUiLock(mcp, async () => {
+    const node = findOne(await snapshot(mcp), query);
+    await mcp.call("ui_fill", { ref: node.ref, value });
+    return node;
+  });
 }
 
 /**
@@ -246,6 +265,11 @@ export function dialogPolicies(options: { allowForeignPurge?: boolean } = {}): D
 
 export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
   {
+    match: /collection installation complete/i,
+    button: /^no thanks$/i,
+    because: "required members are complete; optional members are outside this run",
+  },
+  {
     // Must come first: clicking the wrong button here throws away an install
     // that is halfway done, and Vortex raises it whenever anything looks like a
     // cancellation — including a stray Escape.
@@ -340,7 +364,15 @@ export function autoAnswerDialogs(
 
       for (const text of snap.activeDialogs) {
         const policy = policies.find((p) => p.match.test(text));
-        if (policy === undefined) continue;
+        if (policy === undefined) {
+          // The collection coordinator owns this confirmation separately.
+          if (/collection added/i.test(text)) continue;
+          if (!warned.has(text)) {
+            warned.add(text);
+            options.onUnanswerable?.(text.slice(0, 160), "a documented dialog policy");
+          }
+          continue;
+        }
 
         const clicked = await clickInsideDialog(mcp, text, policy.button);
         if (clicked === undefined) {
@@ -376,44 +408,46 @@ function squash(value: string): string {
   return value.replace(/\s+/g, "").toLowerCase();
 }
 
-async function clickInsideDialog(
+export async function clickInsideDialog(
   mcp: VortexMcpClient,
   dialogText: string,
   button: string | RegExp,
 ): Promise<string | undefined> {
-  // Compared with whitespace removed, because the two sides are built
-  // differently: `activeDialogs` concatenates text nodes with no separator
-  // ("External ChangesMod files..."), while the snapshot joins names and text
-  // with spaces ("External Changes Mod files..."). A marker that straddles that
-  // boundary then never matches, the dialog is left unanswered, and it reads as
-  // a hang rather than as a lookup that failed.
-  const marker = squash(dialogText).slice(0, 20);
+  return withUiLock(mcp, async () => {
+    // Compared with whitespace removed, because the two sides are built
+    // differently: `activeDialogs` concatenates text nodes with no separator
+    // ("External ChangesMod files..."), while the snapshot joins names and text
+    // with spaces ("External Changes Mod files..."). A marker that straddles that
+    // boundary then never matches, the dialog is left unanswered, and it reads as
+    // a hang rather than as a lookup that failed.
+    const marker = squash(dialogText).slice(0, 20);
 
-  for (const selector of DIALOG_SELECTORS) {
-    // `index` picks the nth *match*, which is not what `:nth-of-type(n)` means.
-    // That counts position among same-tag siblings, so with two modals mounted
-    // under different parents every `div:nth-of-type(n)` matched both and
-    // querySelector kept returning the first. The second of two stacked dialogs
-    // was therefore unreachable: a purge prompt sat unanswered behind a
-    // collection report and blocked an install, looking like a policy that
-    // failed to match.
-    for (let index = 0; index < 4; index++) {
-      const snap = await snapshot(mcp, selector, index).catch(() => undefined);
-      if (snap === undefined || snap.nodeCount === 0) break;
+    for (const selector of DIALOG_SELECTORS) {
+      // `index` picks the nth *match*, which is not what `:nth-of-type(n)` means.
+      // That counts position among same-tag siblings, so with two modals mounted
+      // under different parents every `div:nth-of-type(n)` matched both and
+      // querySelector kept returning the first. The second of two stacked dialogs
+      // was therefore unreachable: a purge prompt sat unanswered behind a
+      // collection report and blocked an install, looking like a policy that
+      // failed to match.
+      for (let index = 0; index < 4; index++) {
+        const snap = await snapshot(mcp, selector, index).catch(() => undefined);
+        if (snap === undefined || snap.nodeCount === 0) break;
 
-      // Only answer the dialog we actually matched on.
-      const flat = flatten(snap.tree);
-      const text = squash(flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" "));
-      if (!text.includes(marker)) continue;
+        // Only answer the dialog we actually matched on.
+        const flat = flatten(snap.tree);
+        const text = squash(flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" "));
+        if (!text.includes(marker)) continue;
 
-      const target = findNodes(snap, { role: "button", name: button })[0];
-      if (target === undefined) continue;
+        const target = findNodes(snap, { role: "button", name: button })[0];
+        if (target === undefined) continue;
 
-      await mcp.call("ui_click", { ref: target.ref }).catch(() => undefined);
-      return target.name ?? String(button);
+        await mcp.call("ui_click", { ref: target.ref });
+        return target.name ?? String(button);
+      }
     }
-  }
-  return undefined;
+    return undefined;
+  });
 }
 
 /**
@@ -448,18 +482,20 @@ const FOMOD_NAV = `${FOMOD_DIALOG} .fomod-nav-buttons`;
  * Returns the label clicked, or undefined when no FOMOD dialog is open.
  */
 export async function advanceFomod(mcp: VortexMcpClient): Promise<string | undefined> {
-  const snap = await snapshot(mcp, FOMOD_NAV).catch(() => undefined);
-  if (snap === undefined || snap.nodeCount === 0) return undefined;
+  return withUiLock(mcp, async () => {
+    const snap = await snapshot(mcp, FOMOD_NAV).catch(() => undefined);
+    if (snap === undefined || snap.nodeCount === 0) return undefined;
 
-  // Deliberately includes disabled buttons, because position is what identifies
-  // the forward action. Filtering them out first would make a step with a
-  // greyed-out Next fall through to Back and walk the wizard backwards forever.
-  const buttons = findNodes(snap, { role: "button", enabledOnly: false });
-  const forward = buttons[buttons.length - 1];
-  if (forward === undefined || forward.disabled === true) return undefined;
+    // Deliberately includes disabled buttons, because position is what identifies
+    // the forward action. Filtering them out first would make a step with a
+    // greyed-out Next fall through to Back and walk the wizard backwards forever.
+    const buttons = findNodes(snap, { role: "button", enabledOnly: false });
+    const forward = buttons[buttons.length - 1];
+    if (forward === undefined || forward.disabled === true) return undefined;
 
-  await mcp.call("ui_click", { ref: forward.ref });
-  return forward.name ?? "(unnamed)";
+    await mcp.call("ui_click", { ref: forward.ref });
+    return forward.name ?? "(unnamed)";
+  });
 }
 
 /**

@@ -55,13 +55,8 @@ export interface VortexTarget {
 
 export interface HarnessConfig {
   /**
-   * Nexus Mods personal API key. The ONLY thing a human has to provide, and
-   * only for Nexus downloads.
-   *
-   * This is what makes "no user input" login possible: Vortex's `isLoggedIn` is
-   * true whenever `confidential.account.nexus.APIKey` is set, so the harness
-   * dispatches SET_USER_API_KEY and the app is logged in — no browser, no OAuth
-   * redirect, and crucially no captcha.
+   * Optional Nexus personal API key for legacy API access. Collections require
+   * OAuth; local UI/install/deployment tests need neither credential.
    */
   apiKey: string | undefined;
   /** Bearer token unlocking vortex-mcp's write tools. Generated if unset. */
@@ -147,8 +142,13 @@ export function resolveTarget(
   // installed Vortex. The clone wins because if you have gone to the trouble of
   // cloning Vortex here, working on it is the whole point — but --installed
   // puts the released build back in front.
-  const managed = overrides.preferInstalled === true ? undefined : managedSourceDir();
-  const devDir = overrides.devDir ?? process.env.VORTEX_AI_DEV_DIR ?? managed;
+  const installed = overrides.preferInstalled === true || envFlag("VORTEX_AI_INSTALLED");
+  const managed = installed || overrides.exe !== undefined ? undefined : managedSourceDir();
+  const devDir =
+    overrides.devDir ??
+    (installed || overrides.exe !== undefined
+      ? undefined
+      : (process.env.VORTEX_AI_DEV_DIR ?? managed));
   if (devDir !== undefined && devDir !== "") {
     const mainDir = path.join(devDir, "src", "main");
     const resolved = fs.existsSync(mainDir) ? mainDir : devDir;
@@ -186,16 +186,18 @@ function resolveDevElectron(mainDir: string): string {
  * precisely to report that, and it can report nothing if building the config
  * blew up first.
  */
-function resolveTargetSafely(): VortexTarget {
+export function resolveTargetSafely(
+  overrides: Parameters<typeof resolveTarget>[0] = {},
+): VortexTarget {
   try {
-    return resolveTarget();
+    return resolveTarget(overrides);
   } catch {
     return { kind: "installed", executable: "", args: [], appName: "Vortex" };
   }
 }
 
 export function loadConfig(overrides: Partial<HarnessConfig> = {}): HarnessConfig {
-  return {
+  const config = {
     apiKey: process.env.VORTEX_AI_NEXUS_API_KEY ?? process.env.NEXUS_API_KEY,
     mcpToken: process.env.VORTEX_MCP_TOKEN ?? defaultToken(),
     mcpPort: Number(process.env.VORTEX_MCP_PORT ?? 3701),
@@ -208,6 +210,15 @@ export function loadConfig(overrides: Partial<HarnessConfig> = {}): HarnessConfi
     headless: envFlag("VORTEX_AI_HEADLESS"),
     ...overrides,
   };
+  for (const port of [config.mcpPort, config.cdpPort]) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+      throw new ConfigError("MCP and CDP ports must be integers from 1 to 65535.");
+  }
+  if (config.mcpPort === config.cdpPort) throw new ConfigError("MCP and CDP need different ports.");
+  config.cacheDir = path.resolve(config.cacheDir);
+  config.artifactDir = path.resolve(config.artifactDir);
+  if (config.gamePath) config.gamePath = path.resolve(config.gamePath);
+  return config;
 }
 
 /** This repo — holds the built extension that gets copied into an instance. */
@@ -218,25 +229,15 @@ export function extensionRoot(): string {
 export const MCP_EXTENSION_ID = "vortex-mcp";
 
 /**
- * The Nexus API key, or a directly actionable error saying how to supply one.
- *
- * Call this **before** starting or connecting to anything, in any operation that
- * touches Nexus. Everything else in this harness works signed out, so the key is
- * checked at the point of need rather than at startup — but at that point it is
- * a hard requirement, and the run should stop here saying what is missing rather
- * than cold-start an instance and fail on a rejected download minutes later.
- *
- * A key cannot be guessed, derived, or read out of an existing Vortex install —
- * it is the user's credential. An agent that hits this asks the user for one and
- * writes it to `harness/.env` once; it is gitignored and reused from then on.
+ * Optional helper for integrations that specifically need the legacy API key.
+ * Collections use requireOAuth instead. Credentials belong in local setup,
+ * never in chat or committed files.
  */
 export function requireApiKey(config: HarnessConfig): string {
   if (config.apiKey === undefined || config.apiKey.trim() === "") {
     throw new ConfigError(
-      "No Nexus API key configured, and this operation needs one — Nexus downloads " +
-        "cannot be made anonymously.\n\n" +
-        "  Ask the user for a personal API key; it is theirs to give and cannot be " +
-        "obtained any other way.\n\n" +
+      "This legacy integration requires a Nexus API key. Collections instead use setup --oauth.\n\n" +
+        "  During initial setup, store the key locally rather than sending it in chat.\n\n" +
         "  1. Open https://next.nexusmods.com/settings/api-keys\n" +
         "  2. Copy the personal API key\n" +
         "  3. echo 'VORTEX_AI_NEXUS_API_KEY=<key>' >> harness/.env   # gitignored\n\n" +

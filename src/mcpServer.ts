@@ -1,4 +1,5 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 
 import { McpServer } from "@modelcontextprotocol/server";
 import {
@@ -12,6 +13,7 @@ import type { types } from "@nexusmods/vortex-api";
 import { log } from "@nexusmods/vortex-api";
 import * as control from "./vortexControl";
 import * as ui from "./uiAutomation";
+import { authStatus } from "./authStatus";
 
 type IExtensionApi = types.IExtensionApi;
 
@@ -45,6 +47,7 @@ const HOST = "127.0.0.1";
 // registered. Host/Origin checks below are what actually stop DNS-rebinding (a page whose
 // hostname resolves to 127.0.0.1); the token is a second, independent gate for writes.
 const TOKEN = process.env.VORTEX_MCP_TOKEN;
+const RUNTIME_ID = randomUUID();
 
 // Vortex's `confidential` state hive (Nexus API key, OAuth credentials, and anything
 // else Vortex core itself treats as a credential — see Application.ts's registerHive
@@ -135,6 +138,34 @@ function registerReadTools(server: McpServer, api: IExtensionApi): void {
 // vortex_query all discover *what's callable* rather than reading specific game state.
 function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
   const jsonText = makeJsonText(api);
+  server.registerTool(
+    "automation_status",
+    {
+      description:
+        "Identify this renderer lifetime and isolated harness profile. runtimeId changes after renderer reload; userDataDir is null outside the harness. Contains no credentials.",
+      inputSchema: z.object({}),
+    },
+    async () => ({
+      content: [
+        jsonText({
+          runtimeId: RUNTIME_ID,
+          userDataDir:
+            process.env.VORTEX_E2E === "1" ? (process.env.ELECTRON_USERDATA ?? null) : null,
+        }),
+      ],
+    }),
+  );
+  server.registerTool(
+    "nexus_auth_status",
+    {
+      description:
+        "Report whether a Nexus API key, OAuth access token, and OAuth refresh token are " +
+        "present, without returning credentials. Presence does not prove server validity; " +
+        "Vortex manages token refresh. Check oauthPresent before collection operations.",
+      inputSchema: z.object({}),
+    },
+    async () => ({ content: [jsonText(authStatus(api))] }),
+  );
   server.registerTool(
     "vortex_describe",
     {
@@ -1525,7 +1556,7 @@ function isTokenAuthorized(req: http.IncomingMessage): boolean {
   return req.headers.authorization === `Bearer ${TOKEN}`;
 }
 
-export function startMcpServer(api: IExtensionApi): http.Server {
+function createToolServer(api: IExtensionApi): McpServer {
   const server = new McpServer({ name: "vortex-mcp", version: "0.1.0" });
   registerReadTools(server, api);
   // Fail closed: writes (profile switch, mod enable/disable, deploy, purge, install,
@@ -1533,9 +1564,13 @@ export function startMcpServer(api: IExtensionApi): http.Server {
   // has explicitly opted in by setting a token. No token means no write tool exists to call.
   if (TOKEN !== undefined) {
     registerWriteTools(server, api);
-  } else {
-    log("warn", "[vortex-mcp] VORTEX_MCP_TOKEN not set — write tools disabled, read-only mode");
   }
+  return server;
+}
+
+export function startMcpServer(api: IExtensionApi): http.Server {
+  if (TOKEN === undefined)
+    log("warn", "[vortex-mcp] VORTEX_MCP_TOKEN not set — write tools disabled, read-only mode");
 
   const validateHost = localhostHostValidation();
   const validateOrigin = localhostOriginValidation();
@@ -1557,11 +1592,24 @@ export function startMcpServer(api: IExtensionApi): http.Server {
       return;
     }
 
-    // Stateless: a fresh transport per request, no session bookkeeping — matches
-    // the 2026-07-28 MCP spec, which dropped the initialize handshake / session id.
+    // A Protocol owns one transport. Sharing it across HTTP requests can route
+    // a late-arriving request body onto a newer client's transport and shares
+    // cancellation state between clients using the same JSON-RPC ids.
+    const server = createToolServer(api);
     const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+    res.once("close", () => {
+      void server.close().catch(() => undefined);
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      log("error", "[vortex-mcp] request failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+      if (!res.headersSent) res.writeHead(500).end();
+      else res.end();
+    }
   });
 
   httpServer.on("error", (err: NodeJS.ErrnoException) => {

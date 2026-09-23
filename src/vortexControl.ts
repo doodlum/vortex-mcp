@@ -491,6 +491,10 @@ const EVENT_HINTS = new Map<string, string>([
       "completion carefully — see list_dialogs/closeDialog.",
   ],
   [
+    "start-install",
+    'archivePath: string, "__CALLBACK__" — install a local archive into the active game; resolves to the installed mod id. FOMOD dialogs may require UI actions.',
+  ],
+  [
     "activate-game",
     "gameId: string — fire-and-forget, no callback (omit the sentinel entirely). Vortex " +
       "validates the id itself; an unknown gameId silently no-ops rather than throwing.",
