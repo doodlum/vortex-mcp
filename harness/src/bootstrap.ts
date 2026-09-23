@@ -36,6 +36,8 @@ import {
 } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { requireOAuth } from "./auth";
+import { bethesdaSandboxPaths } from "./bethesdaSandbox";
+import { resetDisposableGameData } from "./sandbox";
 
 /**
  * Bumped when a change here makes previously-cached snapshots wrong (a different
@@ -243,6 +245,21 @@ export async function bootstrap(
     report("seeding the working directory from the snapshot");
     removeInstanceDir(live);
     fs.cpSync(snapshot, live, { recursive: true });
+    // The reset profile has deployed nothing, so neither may its disposable game.
+    const bethesda = bethesdaSandboxPaths(config.cacheDir);
+    const isBethesdaSandbox =
+      config.gamePath !== undefined &&
+      path.resolve(config.gamePath).toLowerCase() === path.resolve(bethesda.gamePath).toLowerCase();
+    if (
+      resetDisposableGameData(
+        config,
+        isBethesdaSandbox
+          ? { keep: ["Fallout4.esm"], pluginLists: path.dirname(bethesda.pluginsTxt) }
+          : {},
+      )
+    ) {
+      report("cleared the disposable game's deployed files");
+    }
   }
 
   // Both are idempotent, and both matter on the warm path, which does not go

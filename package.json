@@ -33,6 +33,7 @@
     "ai:test:zoom": "tsx harness/src/tests/zoom.e2e.ts",
     "ai:test:nexus": "tsx harness/src/tests/nexus-collection.e2e.ts",
     "ai:test:large-library": "tsx harness/src/tests/large-library.e2e.ts",
+    "ai:test:bethesda": "tsx harness/src/tests/bethesda.e2e.ts",
     "install-plugin": "node scripts/install-local.mjs",
     "docs:tools": "node scripts/generate-readme-tools-table.mjs",
     "docs:tools:check": "node scripts/generate-readme-tools-table.mjs --check"

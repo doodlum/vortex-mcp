@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { extensionRoot, MCP_EXTENSION_ID, type HarnessConfig } from "./config";
 import { VortexMcpClient } from "./mcpClient";
 import { installSandboxExtension } from "./sandbox";
+import { preparePreload, verifyPreload } from "./mainPreload";
 
 const execFileAsync = promisify(execFile);
 
@@ -74,6 +75,12 @@ export function buildInstanceEnv(
   env.VORTEX_MCP_PORT = String(config.mcpPort);
   env.VORTEX_AI_AUTH_CACHE = authCacheFile(config);
   if (config.headless) env.VORTEX_E2E_HEADLESS = "1";
+  // Vortex reads LOCALAPPDATA straight from the environment for plugins.txt and
+  // loadorder.txt, in both processes. Documents cannot be moved this way; see
+  // mainPreload.ts.
+  if (config.profileRedirect !== undefined) {
+    env.LOCALAPPDATA = config.profileRedirect.localAppData;
+  }
   // A source checkout only loads its extensions and devtools wiring under
   // development; a released build ignores this.
   if (config.target.kind === "dev") env.NODE_ENV = "development";
@@ -299,11 +306,21 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
     );
   }
 
+  const redirect = config.profileRedirect;
+  const env = buildInstanceEnv(userDataDir, config);
+  const preload =
+    redirect !== undefined
+      ? preparePreload(userDataDir, { documents: redirect.documents })
+      : undefined;
+  if (preload !== undefined) {
+    env.NODE_OPTIONS = [env.NODE_OPTIONS, preload.nodeOptions].filter(Boolean).join(" ");
+  }
+
   const child = spawn(
     target.executable,
     [...target.args, `--remote-debugging-port=${String(config.cdpPort)}`],
     {
-      env: buildInstanceEnv(userDataDir, config),
+      env,
       cwd: path.dirname(target.executable),
       stdio: options.inheritStdio === true ? "inherit" : "ignore",
       // Detached so the instance survives the CLI process that started it; an
@@ -314,6 +331,18 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
   );
   child.unref();
   recordPid(config, child.pid);
+
+  if (redirect !== undefined && preload !== undefined) {
+    try {
+      // The record is written on the main process's first line; game activation, the
+      // first thing that writes under Documents, is seconds later in the renderer.
+      await verifyPreload(preload.recordFile, { documents: redirect.documents }, 5_000);
+    } catch (err) {
+      // Stopped before a game could activate: nothing reached the real folders.
+      child.kill();
+      throw err;
+    }
+  }
 
   const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 

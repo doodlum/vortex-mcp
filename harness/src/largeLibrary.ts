@@ -30,7 +30,21 @@ export interface LibraryOptions {
   count: number;
   /** Files per mod. Deployment cost scales with files, rendering cost with mods. */
   filesPerMod?: number;
+  /**
+   * Give each mod a plugin of its own (`<id>.esp`, with the given master), for a Bethesda
+   * game's Plugins page. Its bytes come from the caller, so this module stays game-agnostic.
+   */
+  plugin?: (modId: string) => { name: string; bytes: Uint8Array };
+  /**
+   * Stamp each mod with a collection reference tag (`referenceTag(modId)`), as a member a
+   * collection installed would carry, so a collection can list the library as members that
+   * are already installed.
+   */
+  tagged?: boolean;
 }
+
+/** The collection reference tag a tagged library mod carries. */
+export const referenceTag = (modId: string): string => `vortex-mcp-${modId}`;
 
 export interface Library {
   gameId: string;
@@ -71,6 +85,11 @@ export async function seedLibrary(mcp: VortexMcpClient, options: LibraryOptions)
       const target = path.join(dir, "library", `${id}-${String(file)}.txt`);
       if (!fs.existsSync(target)) fs.writeFileSync(target, `${id} ${String(file)}\n`);
     }
+    if (options.plugin !== undefined) {
+      const plugin = options.plugin(id);
+      const target = path.join(dir, plugin.name);
+      if (!fs.existsSync(target)) fs.writeFileSync(target, plugin.bytes);
+    }
     return {
       id,
       state: "installed",
@@ -80,6 +99,9 @@ export async function seedLibrary(mcp: VortexMcpClient, options: LibraryOptions)
         name: `Library Mod ${String(index).padStart(5, "0")}`,
         version: "1.0.0",
         installTime,
+        ...(options.tagged === true
+          ? { referenceTag: referenceTag(id), referenceTags: [referenceTag(id)] }
+          : {}),
       },
     };
   });

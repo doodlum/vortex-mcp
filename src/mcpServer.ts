@@ -10,9 +10,11 @@ import {
 import { z } from "zod";
 
 import type { types } from "@nexusmods/vortex-api";
-import { log } from "@nexusmods/vortex-api";
+import { log, util } from "@nexusmods/vortex-api";
 import * as control from "./vortexControl";
 import * as ui from "./uiAutomation";
+import * as perf from "./perfTrace";
+import { probeCounts } from "./checkProbe";
 import { authStatus } from "./authStatus";
 
 type IExtensionApi = types.IExtensionApi;
@@ -126,12 +128,46 @@ function makeJsonText(api: IExtensionApi): (value: unknown) => { type: "text"; t
 }
 
 function registerReadTools(server: McpServer, api: IExtensionApi): void {
+  registerCheckProbeTool(server, api);
   registerDiscoveryTools(server, api);
   registerModInventoryTools(server, api);
   registerDownloadAndRuleTools(server, api);
   registerDiagnosticTools(server, api);
   registerDialogTools(server, api);
   registerUiReadTools(server, api);
+}
+
+/** The per-user folders Vortex resolved, or null for one it cannot report. */
+function vortexPaths(): { documents: string | null; localAppData: string | null } {
+  const resolve = (id: "documents" | "localAppData"): string | null => {
+    try {
+      return util.getVortexPath(id);
+    } catch {
+      return null;
+    }
+  };
+  return { documents: resolve("documents"), localAppData: resolve("localAppData") };
+}
+
+function registerCheckProbeTool(server: McpServer, api: IExtensionApi): void {
+  const jsonText = makeJsonText(api);
+  server.registerTool(
+    "check_probe_counts",
+    {
+      description:
+        "How many times Vortex has run its health checks for each test event " +
+        "(plugins-changed, mod-installed, mod-activated, settings-changed, gamemode-activated, " +
+        "profile-did-change), counted by a no-op probe check this extension registers through " +
+        "Vortex's own registerTest (harness instances only; empty otherwise). A count that stops " +
+        "rising while its event keeps firing means Vortex is suppressing that event's checks — " +
+        "which is how a warning like Missing Masters silently never appears. Checks run 500ms " +
+        "after their event, debounced.",
+      inputSchema: z.object({}),
+    },
+    async () => ({
+      content: [jsonText(process.env.VORTEX_E2E === "1" ? probeCounts() : [])],
+    }),
+  );
 }
 
 // Split from one large registerReadTools by domain — vortex_describe/scan_extension_actions/
@@ -142,7 +178,7 @@ function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
     "automation_status",
     {
       description:
-        "Identify this renderer lifetime and isolated harness profile. runtimeId changes after renderer reload; userDataDir is null outside the harness. Contains no credentials.",
+        "Identify this renderer lifetime and isolated harness profile. runtimeId changes after renderer reload; userDataDir is null outside the harness. `paths` are the per-user folders Vortex resolved (documents, localAppData) — what a Bethesda game's INI files and plugins.txt are written under — so a harness can refuse to manage a game unless they are its own sandbox copies. Contains no credentials.",
       inputSchema: z.object({}),
     },
     async () => ({
@@ -151,6 +187,7 @@ function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
           runtimeId: RUNTIME_ID,
           userDataDir:
             process.env.VORTEX_E2E === "1" ? (process.env.ELECTRON_USERDATA ?? null) : null,
+          paths: vortexPaths(),
         }),
       ],
     }),
@@ -861,8 +898,74 @@ function registerDialogTools(server: McpServer, api: IExtensionApi): void {
   );
 }
 
+/**
+ * Performance tracing. Write-tier although it changes no state: it wraps the store's
+ * dispatch for the lifetime of the renderer, which is not something a read-only client
+ * should be able to do to someone's Vortex.
+ */
+function registerPerfTools(server: McpServer, api: IExtensionApi): void {
+  const jsonText = makeJsonText(api);
+  server.registerTool(
+    "perf_trace_start",
+    {
+      description:
+        "Start timing the renderer: every Redux dispatch by action type (a dispatch runs " +
+        "middleware including persistence diffing, reducers and subscribers synchronously), " +
+        "every main-thread task over 50ms (where React rendering shows up), and the JS heap. " +
+        "Discards any previous trace. Use around an operation that feels slow — a deploy, an " +
+        "install, a filter change — then call perf_trace_stop. Outside a trace the cost is " +
+        "one boolean check per dispatch.",
+      inputSchema: z.object({
+        heapSampleMs: z
+          .number()
+          .int()
+          .min(100)
+          .optional()
+          .describe("How often to sample the heap. Defaults to 1000."),
+      }),
+    },
+    async ({ heapSampleMs }) => {
+      if (api.store === undefined) throw new Error("Vortex store not initialized yet");
+      perf.installDispatchTracer(
+        api.store as unknown as Parameters<typeof perf.installDispatchTracer>[0],
+      );
+      return { content: [jsonText(perf.startTrace({ heapSampleMs }))] };
+    },
+  );
+  server.registerTool(
+    "perf_trace_stop",
+    {
+      description:
+        "Stop the trace started by perf_trace_start and return: duration; dispatch count and " +
+        "total time; the action types that cost the most time and those dispatched most " +
+        "often (count, total and max ms each); long-task count, total and max ms; and heap " +
+        "start/max/end in MB. Time inside long tasks but outside dispatches is rendering or " +
+        "other work — profile it over CDP to attribute it.",
+      inputSchema: z.object({
+        top: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Entries per list. Defaults to 15."),
+      }),
+    },
+    async ({ top }) => ({ content: [jsonText(perf.stopTrace({ top }))] }),
+  );
+  server.registerTool(
+    "perf_trace_status",
+    {
+      description: "Whether a perf trace is running, and for how long.",
+      inputSchema: z.object({}),
+    },
+    async () => ({ content: [jsonText(perf.traceStatus())] }),
+  );
+}
+
 function registerWriteTools(server: McpServer, api: IExtensionApi): void {
   const jsonText = makeJsonText(api);
+  registerPerfTools(server, api);
   server.registerTool(
     "switch_profile",
     {

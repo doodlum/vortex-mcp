@@ -11,6 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { assertRedirected } from "./bethesdaSandbox";
 import type { HarnessConfig } from "./config";
 import type { VortexMcpClient } from "./mcpClient";
 import { realHover } from "./cdp";
@@ -158,6 +159,16 @@ export async function ensureGameManaged(
   gameId: string,
   options: EnsureGameOptions,
 ): Promise<EnsureGameResult> {
+  const redirect = options.config.profileRedirect;
+  if (redirect !== undefined) {
+    // Checked before the game is registered or activated: both write to its per-user
+    // folders, and for the fake Fallout 4 those must be the sandbox's.
+    const status = await mcp.call<{
+      paths?: { documents: string | null; localAppData: string | null };
+    }>("automation_status");
+    assertRedirected(redirect, status.paths);
+  }
+
   const game = KNOWN_GAMES[gameId];
   if (
     options.gamePath !== undefined &&

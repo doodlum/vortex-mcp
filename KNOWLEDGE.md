@@ -420,6 +420,50 @@ Traps found while measuring:
 - tsx compiles named functions with an `__name` helper that the page does not have.
   Pass `page.evaluate` source text, not a function, from harness scripts.
 
+### After a completed collection, Vortex stops running its checks
+
+`InstallDriver.startInstall` suppresses the `plugins-changed`, `mod-installed`,
+`mod-activated` and `settings-changed` checks while a collection installs, and only cancel
+or pause released them. A successful install ends through the review screen's Done/Close,
+which did not. So Missing Masters, and every other check on those events, never ran again
+until restart. Nothing is logged: the test runner drops suppressed events without a trace.
+
+This is present in 2.6 through master of September 2026, and fixed by
+Nexus-Mods/Vortex#24282. It is reproduced by `ai:test:bethesda`, and visible with
+`check_probe_counts`, whose `plugins-changed` count stops rising.
+
+### Getting code into Vortex's main process
+
+Packaged and source builds need different routes to redirect Documents, and three
+obvious ways fail silently:
+
+- **`--inspect-brk` hangs every install.** The released build honours it, but Node worker
+  threads inherit break-on-start. Vortex hashes archives in a worker, so every install
+  waits forever. There is no log line, and the renderer and MCP server look healthy.
+  Stripping `process.execArgv` does not help: workers copy the parent's _parsed_ options.
+- **`inspector.close()` from the session that is still attached deadlocks main.** It
+  blocks until no session is connected. Main then sits at 0% CPU and stops logging.
+- **A `--require` preload cannot use `require("electron")` directly.** The built-in module
+  does not exist yet, so it resolves to the npm package's path string. Hook `Module._load`
+  and act on the app's own first `require("electron")`, as `mainPreload.ts` does.
+- **Paths in NODE_OPTIONS:** quoted backslashes are escapes, so use forward slashes.
+
+Packaged Vortex (2.7.0) ignores NODE_OPTIONS, so this only works on source builds. The
+harness verifies a record the preload writes and kills the instance within 5s otherwise,
+before a game can activate. `automation_status.paths` reports what Vortex actually resolved.
+
+### A reset profile does not reset the game directory
+
+`--fresh`, cold and rebuild starts replace Vortex's profile, staging included. The game
+folder kept the previous run's deployed files and `vortex.deployment.json`. The next deploy
+then stops on External Changes, "Source files were deleted", and purges leave strays.
+Bootstrap now empties a disposable game's `Data` (keeping `Fallout4.esm`) and its plugin
+lists whenever the working profile is reset. It only touches games inside the cache.
+
+In the External Changes dialog, "Source files were deleted" → Save removes deployed copies
+of files whose source is already gone. "Links were deleted" → Save deletes the **staging**
+files. The harness confirms the first and refuses the second.
+
 ### Virtualised rows are not in the DOM
 
 Vortex's mod, plugin and game lists are windowed: a row simply does not exist

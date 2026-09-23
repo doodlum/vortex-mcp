@@ -12,6 +12,37 @@ export function sandboxConfig(config: HarnessConfig): HarnessConfig {
   return { ...config, gameId: "vortexaisandbox", gamePath };
 }
 
+/**
+ * Empty a disposable game's deployed files when its working profile is reset.
+ *
+ * A fresh profile knows about no deployment, but the game directory kept the last run's
+ * files and manifest. Vortex then reports them as changed outside it (sources deleted)
+ * and blocks the next deploy on that dialog, and purges leave them behind. Only a game
+ * directory inside the harness cache is ever touched; `keep` names files the fixture
+ * itself provides, such as a Bethesda game's own master.
+ */
+export function resetDisposableGameData(
+  config: HarnessConfig,
+  options: { keep?: string[]; pluginLists?: string } = {},
+): boolean {
+  if (config.gamePath === undefined) return false;
+  const relative = path.relative(path.resolve(config.cacheDir), path.resolve(config.gamePath));
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  const data = path.join(config.gamePath, "Data");
+  if (!fs.existsSync(data)) return false;
+  const keep = new Set((options.keep ?? []).map((name) => name.toLowerCase()));
+  for (const entry of fs.readdirSync(data)) {
+    if (keep.has(entry.toLowerCase())) continue;
+    fs.rmSync(path.join(data, entry), { recursive: true, force: true });
+  }
+  if (options.pluginLists !== undefined) {
+    for (const list of ["plugins.txt", "loadorder.txt"]) {
+      fs.rmSync(path.join(options.pluginLists, list), { force: true });
+    }
+  }
+  return true;
+}
+
 /** A real game-support extension, without game-specific writes to Documents or AppData. */
 export function installSandboxExtension(instanceDir: string, config: HarnessConfig): void {
   if (config.gameId !== "vortexaisandbox") return;

@@ -244,4 +244,18 @@ describe("autoAnswerDialogs", () => {
     expect(refused).toHaveLength(1);
     expect(refused[0]).toMatch(/staging files/);
   });
+
+  it("still confirms deleted sources, whose default only removes the deployed copies", async () => {
+    const { mcp, clicked } = dialogMcp(
+      'Mod files were changed outside Vortex. Source files were deleted ("Save" will remove the ' +
+        'corresponding files permanently, "Revert" will restore them)Revert all changes | Save all ' +
+        "changes | example-mod 1 fileSave change (delete file)",
+    );
+    const controller = new AbortController();
+    const answering = autoAnswerDialogs(mcp, { signal: controller.signal, pollMs: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    controller.abort();
+    await answering;
+    expect(clicked).toContain("r4");
+  });
 });

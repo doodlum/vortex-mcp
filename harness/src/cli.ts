@@ -29,6 +29,7 @@ import {
 import { captureLogin } from "./bootstrap";
 import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
 import { sandboxConfig } from "./sandbox";
+import { bethesdaSandboxConfig, isolateUserFolders } from "./bethesdaSandbox";
 import { installLocalMod } from "./localMod";
 import { installCollection } from "./collections";
 import { deployMods, needsDeployment, purgeGame } from "./deployment";
@@ -60,6 +61,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     "help",
     "installed",
     "sandbox",
+    "bethesda-sandbox",
+    "isolate-user-folders",
     "headless",
     "oauth",
     "no-wait",
@@ -125,7 +128,12 @@ function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
   if (typeof flags["cache-dir"] === "string") overrides.cacheDir = path.resolve(flags["cache-dir"]);
   if (flags.headless === true) overrides.headless = true;
   const config = loadConfig(overrides);
-  return flags.sandbox === true ? sandboxConfig(config) : config;
+  if (flags.sandbox === true && flags["bethesda-sandbox"] === true) {
+    throw new ConfigError("Choose one of --sandbox and --bethesda-sandbox.");
+  }
+  if (flags["bethesda-sandbox"] === true) return bethesdaSandboxConfig(config);
+  const chosen = flags.sandbox === true ? sandboxConfig(config) : config;
+  return flags["isolate-user-folders"] === true ? isolateUserFolders(chosen) : chosen;
 }
 
 function log(message: string): void {
@@ -214,6 +222,9 @@ Target and isolation (repeat the same flags for all commands)
   --exe <path>           Explicit Vortex.exe
   --dev-dir <path>       Explicit source checkout
   --sandbox              Disposable test game for local install/deploy tests
+  --bethesda-sandbox     Fake Fallout 4 (plugins, LOOT, masters) with private
+                         LocalAppData and Documents; no game install needed
+  --isolate-user-folders Give any game private LocalAppData and Documents folders
   --game <id> --game-path <dir>   Real game integration; use a disposable copy
   --cache-dir <dir>      Profiles and private OAuth cache
   --port <n> --cdp-port <n>      MCP/CDP endpoints (3701/9222 by default)

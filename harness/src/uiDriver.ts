@@ -316,8 +316,11 @@ export const DEFAULT_DIALOG_POLICIES: DialogPolicy[] = [
     // 3,000-mod fixture: only the snapshot's size limit stopped this policy from
     // confirming it and wiping every staging folder. Revert would be safe for the
     // staging files, but choosing between the two is the operator's call.
+    // Only that section is refused. "Source files were deleted" defaults to the same label,
+    // but there it removes the deployed copy of a file whose staging source is already
+    // gone, which is the removal the policy above lets stand.
     refuse: {
-      match: /links were deleted|delete file/i,
+      match: /links were deleted/i,
       because:
         "deployed links were deleted, and confirming the default would permanently delete " +
         "the mods' staging files; choose Revert or Save in Vortex",

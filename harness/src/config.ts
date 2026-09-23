@@ -77,6 +77,12 @@ export interface HarnessConfig {
   target: VortexTarget;
   /** Hide the window. Off by default — layout measurement needs a real window. */
   headless: boolean;
+  /**
+   * Private stand-ins for the per-user folders a Bethesda game writes to: plugins.txt
+   * under LocalAppData, INI files under Documents. Set by the Bethesda sandbox; when set,
+   * Vortex must start with both redirected or not at all.
+   */
+  profileRedirect?: { localAppData: string; documents: string };
 }
 
 function envFlag(name: string): boolean {
