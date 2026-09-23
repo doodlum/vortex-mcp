@@ -29,6 +29,7 @@ import { captureScreenshot } from "./cdp";
 import { captureLogin } from "./bootstrap";
 import { installCollection } from "./collections";
 import { deployMods, needsDeployment, purgeGame } from "./deployment";
+import { runE2e } from "./e2e";
 import {
   buildVortexSource,
   detectGitHubUser,
@@ -173,6 +174,17 @@ Deployment
                          another instance has touched is blocked outright.
   purge                  Reset the game directory to unmodded, for a repeatable
                          run. Implies --purge's consent.
+
+End to end
+  e2e <collection>       Run the whole chain from scratch and check every step
+                         against what Vortex itself reports: start, manage the
+                         game, install the collection, confirm Vortex calls it
+                         complete, deploy, launch.
+    --runs <n>           Repeat it n times (default 1). Each run starts from a
+                         wiped working directory.
+    --purge              Let it reset a game directory another Vortex instance
+                         deployed to. DELETES those files.
+    --keep               Do not wipe the working directory between runs.
 
 Testing
   responsive             Sweep window sizes, report width-dependent issues
@@ -491,6 +503,41 @@ async function main(): Promise<number> {
       log("");
       log("Vortex was stopped to flush its state; bring it back with `vortex-ai up`.");
       return 0;
+    }
+
+    case "e2e": {
+      const target = typeof flags.url === "string" ? flags.url : positional[0];
+      if (target === undefined) {
+        throw new ConfigError("e2e needs a collection, e.g.\n  vortex-ai e2e <collection url>");
+      }
+      requireApiKey(config);
+      const runs = typeof flags.runs === "string" ? Number.parseInt(flags.runs, 10) : 1;
+      if (!Number.isInteger(runs) || runs < 1)
+        throw new ConfigError("--runs must be a positive integer");
+
+      const outcomes: boolean[] = [];
+      for (let run = 1; run <= runs; run++) {
+        log("");
+        log(`=== run ${String(run)} of ${String(runs)} ===`);
+        try {
+          const result = await runE2e(config, {
+            collection: target,
+            fresh: flags.keep !== true,
+            purge: flags.purge === true,
+            onProgress: (m) => log(m),
+          });
+          outcomes.push(result.ok);
+          log(`run ${String(run)} PASSED in ${String(Math.round(result.elapsedMs / 1000))}s`);
+        } catch (err) {
+          outcomes.push(false);
+          log(`run ${String(run)} FAILED: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      const passed = outcomes.filter(Boolean).length;
+      log("");
+      log(`${String(passed)}/${String(runs)} runs passed`);
+      return passed === runs ? 0 : 1;
     }
 
     case "build-extension": {

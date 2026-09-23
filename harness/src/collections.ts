@@ -174,28 +174,6 @@ interface CollectionMod {
 }
 
 /**
- * Members that have actually finished installing.
- *
- * A mod row appears in state the moment its install *starts*, not when it
- * finishes — it sits at `state: "installing"`, keeps its archive filename
- * instead of its real name, and stays disabled while its FOMOD wizard is still
- * open. Counting rows therefore counts installs that have merely begun, and a
- * collection reports itself complete while several installers are still waiting
- * for input. Deploying on that signal writes a half-installed set into the game
- * directory, which is what happened here.
- */
-function installedMembers(mods: Record<string, CollectionMod> | null): CollectionMod[] {
-  // The collection mod itself is not a member.
-  return Object.values(mods ?? {}).filter(
-    (m) => m.type !== "collection" && m.state === "installed",
-  );
-}
-
-function stillInstalling(mods: Record<string, CollectionMod> | null): CollectionMod[] {
-  return Object.values(mods ?? {}).filter((m) => m.state === "installing");
-}
-
-/**
  * How many member mods installing this collection should actually produce.
  *
  * Nexus's `modCount` counts everything the collection lists, optional mods
@@ -298,14 +276,14 @@ export async function installCollection(
     if (expected !== resolved.modCount) {
       report(`${String(expected)} of the ${String(resolved.modCount)} listed mods are required`);
     }
-    const installed = await waitForMembers(mcp, ref, expected, timeoutMs, report);
+    const status = await waitForCompletion(mcp, ref, timeoutMs, report);
 
     return {
       ref,
       modId: collectionMod.id,
-      modCount: installed,
-      expectedModCount: expected,
-      complete: installed >= expected,
+      modCount: status.satisfied,
+      expectedModCount: status.required,
+      complete: status.complete,
       answeredDialogs: [],
     };
   } finally {
@@ -415,61 +393,84 @@ async function waitForCollectionMod(
   }
 }
 
+export interface CollectionRuleStatus {
+  reference: string;
+  modId?: string;
+  satisfied: boolean;
+  installedButDisabled: boolean;
+}
+
+export interface CollectionCompleteness {
+  collectionModId: string;
+  name: string;
+  complete: boolean;
+  required: number;
+  satisfied: number;
+  unsatisfied: CollectionRuleStatus[];
+}
+
 /**
- * Wait for the member mods, reporting progress as they land.
+ * Wait until Vortex itself calls the collection complete.
  *
- * Counts rather than waits for a completion event: the driver installs members
- * one at a time over minutes, and a count that stops climbing is the signal
- * worth surfacing. Returns what was installed even on timeout via the thrown
- * message, so a partial result is diagnosable.
+ * Counting installed mods is not the same question, and getting that wrong is
+ * what made this report success on a half-finished install. Vortex resolves
+ * every required rule through its own reference matcher and additionally
+ * requires the matched mod to be enabled in the active profile, so a collection
+ * can have every member installed, correctly named, with nothing left
+ * installing — and still be Incomplete.
+ *
+ * `collection_status` runs that exact check inside the app, so this waits on
+ * the same answer the Collections page displays rather than a proxy for it.
  */
-async function waitForMembers(
+async function waitForCompletion(
   mcp: VortexMcpClient,
   ref: CollectionRef,
-  expected: number,
   timeoutMs: number,
   report: (message: string) => void,
-): Promise<number> {
+): Promise<CollectionCompleteness> {
   const started = Date.now();
-  let last = -1;
+  let last = "";
   let lastChange = Date.now();
 
   for (;;) {
-    const mods = await mcp
-      .call<Record<string, CollectionMod> | null>("vortex_query", {
-        path: ["persistent", "mods", ref.gameId],
-      })
-      .catch(() => null);
-    const members = installedMembers(mods).length;
-    const pending = stillInstalling(mods).length;
+    const all = await mcp
+      .call<CollectionCompleteness[]>("collection_status", { gameId: ref.gameId })
+      .catch(() => [] as CollectionCompleteness[]);
+    const status = all[0];
 
-    if (members !== last) {
-      last = members;
-      lastChange = Date.now();
-      report(
-        `${String(members)}/${String(expected)} member mods installed` +
-          (pending > 0 ? ` (${String(pending)} still installing)` : ""),
-      );
+    if (status !== undefined) {
+      if (status.complete) {
+        report(`${String(status.satisfied)}/${String(status.required)} required mods — complete`);
+        return status;
+      }
+      const line = `${String(status.satisfied)}/${String(status.required)} required mods satisfied`;
+      if (line !== last) {
+        last = line;
+        lastChange = Date.now();
+        report(line);
+      }
     }
-    // Both conditions matter. The count alone can be reached while later members
-    // are still installing, and "nothing installing" alone is true in the gap
-    // before the next install starts.
-    if (members >= expected && pending === 0) return members;
 
     if (Date.now() - started > timeoutMs) {
+      const missing = (status?.unsatisfied ?? [])
+        .map(
+          (u) => `    ${u.reference}${u.installedButDisabled ? "  (installed but disabled)" : ""}`,
+        )
+        .join("\n");
       throw new CollectionError(
-        `"${ref.slug}" stopped at ${String(members)}/${String(expected)} mods after ` +
-          `${String(Math.round(timeoutMs / 60000))} minutes. Check list_dialogs for a modal the ` +
-          `harness does not know how to answer, and list_notifications for install failures.`,
+        `"${ref.slug}" is still incomplete after ` +
+          `${String(Math.round(timeoutMs / 60000))} minutes.\n\n` +
+          `  Vortex still considers these rules unsatisfied:\n${missing}\n\n` +
+          `  "installed but disabled" means the mod is there and switched off, which satisfies\n` +
+          `  nothing; anything else never installed. Check list_dialogs for an installer waiting\n` +
+          `  on input, and list_notifications for failures.\n`,
       );
     }
-    // A long stall with no new mods almost always means a modal appeared that
-    // no policy matched; say so rather than sitting silently until timeout.
+
+    // A long stall almost always means a modal appeared that no policy matched.
     if (Date.now() - lastChange > 5 * 60 * 1000) {
       lastChange = Date.now();
-      report(
-        `no progress for 5 minutes at ${String(members)}/${String(expected)} — check for a modal`,
-      );
+      report(`no progress for 5 minutes at ${last} — check for a modal`);
     }
     await new Promise((resolve) => setTimeout(resolve, 5_000));
   }

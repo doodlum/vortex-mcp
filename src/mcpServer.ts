@@ -272,6 +272,26 @@ function registerModInventoryTools(server: McpServer, api: IExtensionApi): void 
   );
 
   server.registerTool(
+    "collection_status",
+    {
+      description:
+        "Whether each installed collection is COMPLETE, by Vortex's own definition — the same " +
+        'check behind the Collections page\'s "Incomplete" badge. Use this, not a mod count, to ' +
+        "decide whether a collection finished: a collection can have every member installed, " +
+        "correctly named and nothing left installing, and still be incomplete, because Vortex " +
+        "resolves each required rule through its own reference matcher AND requires the matched " +
+        "mod to be enabled in the active profile. Unsatisfied rules are listed, and " +
+        'installedButDisabled distinguishes "never installed" from "installed but switched off".',
+      inputSchema: z.object({
+        gameId: z.string().optional().describe("Game id; defaults to the active game"),
+      }),
+    },
+    async ({ gameId }) => ({
+      content: [jsonText(control.collectionStatus(api, gameId))],
+    }),
+  );
+
+  server.registerTool(
     "list_mods",
     {
       description:

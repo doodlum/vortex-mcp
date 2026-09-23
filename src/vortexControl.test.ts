@@ -774,7 +774,7 @@ describe("vortexControl: games", () => {
           },
         },
       });
-      const runExecutable = vi.fn(async () => undefined);
+      const runExecutable = vi.fn(async (..._args: unknown[]) => undefined);
       (api as unknown as { runExecutable: typeof runExecutable }).runExecutable = runExecutable;
 
       const launched = await launchGame(api, "skyrimse", { processWaitMs: 0 });

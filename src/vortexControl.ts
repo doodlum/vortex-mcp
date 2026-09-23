@@ -3015,3 +3015,86 @@ export async function checkNexusModUpdates(
   const updatedModIds = await fn(targetGameId, targetMods, false);
   return { checkedCount: targetMods.length, updatedModIds, eligibleCount: eligibleIds.length };
 }
+
+interface CollectionModRule {
+  type: string;
+  ignored?: boolean;
+  reference: types.IModReference;
+}
+
+export interface CollectionRuleStatus {
+  /** What the collection asks for, rendered the way Vortex renders it. */
+  reference: string;
+  /** Id of the mod satisfying it, when one does. */
+  modId?: string;
+  satisfied: boolean;
+  /** Installed but switched off in the active profile — satisfies nothing. */
+  installedButDisabled: boolean;
+}
+
+export interface CollectionStatus {
+  collectionModId: string;
+  name: string;
+  /** Vortex's own verdict: the Collections page shows "Incomplete" when false. */
+  complete: boolean;
+  required: number;
+  satisfied: number;
+  unsatisfied: CollectionRuleStatus[];
+}
+
+/**
+ * Whether a collection is installed, by Vortex's own definition.
+ *
+ * Counting installed mods is not that definition, and the difference is not
+ * academic: a run here reported 8/8 members installed, nothing left installing
+ * and no dialogs open, while Vortex's Collections page still said "Incomplete".
+ *
+ * Vortex resolves every non-ignored `requires` rule through `findModByRef` and
+ * additionally requires the matched mod to be **enabled in the active profile**;
+ * a rule whose reference matches nothing, or matches a disabled mod, counts as
+ * unsatisfied. So a mod can be installed, named correctly and sitting in the mod
+ * list while the rule pointing at it is still unsatisfied — because the
+ * reference did not match it, or the profile has it switched off.
+ *
+ * `findModByRef` is Vortex's own matcher, imported rather than reimplemented:
+ * its matching rules (version ranges, file hashes, logical names) are exactly
+ * what decides this, and a private approximation would drift from the answer
+ * the UI shows.
+ */
+export function collectionStatus(api: IExtensionApi, gameId?: string): CollectionStatus[] {
+  const st = state(api);
+  const targetGameId = resolveGameId(gameId, st);
+  const mods = (st.persistent.mods?.[targetGameId] ?? {}) as Record<string, types.IMod>;
+  const profile = selectors.activeProfile(st) as
+    | { modState?: Record<string, { enabled?: boolean }> }
+    | undefined;
+
+  return Object.values(mods)
+    .filter((mod) => mod.type === "collection")
+    .map((collection) => {
+      const rules = ((collection.rules ?? []) as unknown as CollectionModRule[]).filter(
+        (rule) => rule.type === "requires" && rule.ignored !== true,
+      );
+
+      const statuses: CollectionRuleStatus[] = rules.map((rule) => {
+        const mod = util.findModByRef(rule.reference, mods);
+        const enabled = mod === undefined ? false : profile?.modState?.[mod.id]?.enabled === true;
+        return {
+          reference: util.renderModReference(rule.reference),
+          modId: mod?.id,
+          satisfied: mod !== undefined && enabled,
+          installedButDisabled: mod !== undefined && !enabled,
+        };
+      });
+
+      const unsatisfied = statuses.filter((s) => !s.satisfied);
+      return {
+        collectionModId: collection.id,
+        name: util.renderModName(collection),
+        complete: unsatisfied.length === 0,
+        required: statuses.length,
+        satisfied: statuses.length - unsatisfied.length,
+        unsatisfied,
+      };
+    });
+}
