@@ -432,6 +432,34 @@ This is present in 2.6 through master of September 2026, and fixed by
 Nexus-Mods/Vortex#24282. It is reproduced by `ai:test:bethesda`, and visible with
 `check_probe_counts`, whose `plugins-changed` count stops rising.
 
+### Measuring a slow Vortex without measuring the harness
+
+Three things made measurements wrong, found while profiling 2,000-member collections:
+
+- **The observer was the hotspot.** The dialog watcher and the collection driver polled a
+  full `ui_snapshot` every second. Each measures every rendered element, and with a big mod
+  list that made `getBoundingClientRect` the top entry in the profile. Poll with
+  `ui_active_dialogs` instead.
+- **"fetch failed: ECONNRESET" meant the renderer was frozen, not broken.** The MCP server
+  lives in the renderer. Node's 5s keep-alive timeout fired late after a long freeze and
+  closed a socket as the client reused it. The server now keeps idle sockets for 10 minutes,
+  and pollers retry.
+- **Development React.** Source builds run React's development build unless started with
+  `--production`, so rendering-heavy timings are inflated there.
+
+What the profiles showed, for next time:
+
+- **Collections.** `minimatch` recompiling each member's fileExpression for every installed
+  mod took 36% of CPU. `ADD_MOD_RULE` compared every rule with `_.isEqual` per add (25s for
+  2,000 rules). `updateRules` ran a linear scan per member (Nexus-Mods/Vortex#24283).
+- **The Plugins page.** Toggling a plugin renumbers every row, and SuperTable copied its
+  whole value cache per changed row (Nexus-Mods/Vortex#24284). Clearing the filter (about
+  1.2s) is spread across React, react-select's AutosizeInput and `nameMatch`, with no single
+  hotspot.
+- **Downloads.** Progress and speed dispatch once a second each, both into the persisted
+  `persistent.downloads` hive: 94 persist:diff per minute with four downloads (LAZ-1168). No
+  slow writes or long tasks reproduced without a real collection's database load.
+
 ### Getting code into Vortex's main process
 
 Packaged and source builds need different routes to redirect Documents, and three
@@ -550,3 +578,44 @@ Directory **renames** are worse: they can fail with EPERM for reasons unrelated
 to Vortex (an indexer or scanner holding a transient handle on any descendant),
 and retrying does not reliably help. Prefer building in place and writing a
 marker file last over the staging-directory-then-rename pattern.
+
+## Tooling on Windows
+
+### `git commit -F -` fails with a PowerShell here-string
+
+In Windows PowerShell 5.1, piping a here-string into `git commit -F -` fails with "did not match
+any file(s)", so it looks like a pathspec error. Write the message to a file and pass
+`git commit -F <file>`.
+
+### `oxfmt` with a PowerShell array fails
+
+`pnpm exec oxfmt $files`, where `$files` is a PowerShell array, fails with "Expected at least one
+target file". Pass each path as its own argument, or use `@files` splatting.
+
+### Silent `oxlint` looks the same as no `oxlint`
+
+`pnpm exec oxlint <files>` prints nothing when the files are clean, so you can't tell a pass from a
+run that checked nothing. In a Vortex checkout, `pnpm nx run @vortex/renderer:lint` prints an
+explicit result. Use that as the evidence.
+
+### Vortex's E2E suite cannot give a local baseline as-is
+
+On this machine, stock `packages/e2e` has two problems:
+
+- The account specs fail instantly: "Missing required environment variable
+  E2E_NEXUS_FREE_USER_USERNAME".
+- Almost every other spec fails in fixture setup with "Vortex process exited unexpectedly with
+  code 0 before the main window appeared", then waits out its 6-minute timeout. That's a
+  main-window startup race in `packages/e2e/src/fixtures/vortex-app.ts`.
+
+A full run takes about 6 hours and proves nothing. Upstream CI runs E2E only when `packages/e2e`
+changes, or on a schedule on self-hosted runners that have the test accounts. So PRs outside that
+path never get E2E in CI, and the local run is the only E2E gate. Use the kit's E2E runner,
+`pnpm run ai:vortex-e2e -- --checkout <dir>` (see harness/AGENTS.md, "Vortex's own E2E suite"). It
+applies `harness/patches/e2e-window-startup.patch` for the run and restores the file byte for byte,
+and leaves out the account specs whose credentials are absent, reporting them separately. Don't
+run bare `playwright test`.
+
+The account specs can't be skipped by file: `game-management.spec.ts` mixes a signed-out test with
+a free-user one, and the tier loops (`account.spec.ts`, `mods*.spec.ts`) set `nexusUser` from a loop
+variable. The runner reads each describe's `test.use({ nexusUser })` and the tier in its title.

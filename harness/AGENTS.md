@@ -31,7 +31,8 @@ pnpm run ai:test
 creates a disposable game directory and installs a tiny game-support extension.
 It supports real local archive installation, enabling/disabling, deployment, and
 purge. It cannot launch a playable game. Tests allocate their own profile and ports;
-they do not stop a working automation instance. To run tests against the installed
+they do not stop a working automation instance, but they hold the instance lease (see
+"The instance lease" below). To run tests against the installed
 build when a source checkout exists, set `VORTEX_AI_INSTALLED=1` in the environment.
 
 For global UI work without a game, use `setup --installed --no-game`.
@@ -142,6 +143,52 @@ A server from another cache is not stopped just because it occupies the same por
 
 Use `--cache-dir <dir> --port <n> --cdp-port <n>` for another independent instance.
 Keep those flags consistent across commands. Both ports must be free.
+
+## The instance lease: one agent drives Vortex at a time
+
+Only one harness Vortex runs per machine, and several agents may use this kit. A
+machine-wide lease (`~/.vortex-ai/leases`, shared by every kit checkout; override with
+`VORTEX_AI_LEASE_DIR`) says who has it. The owner is `--owner <name>`, else
+`VORTEX_AI_OWNER`, else `anonymous`. Use one owner name for a whole session.
+
+```powershell
+pnpm run ai -- lease status                       # who holds what, live or stale
+pnpm run ai -- lease acquire --owner qa --purpose "PR 24290 QA" --ttl 120
+pnpm run ai -- up --owner qa --sandbox            # joins qa's lease
+pnpm run ai -- down --owner qa
+pnpm run ai -- lease release --owner qa
+pnpm run ai -- lease run --owner qa --wait 60 -- pnpm run verify
+```
+
+- Everything that starts or stops Vortex holds it: `up`, `bootstrap`, `setup`,
+  `save-login`, `down`, `e2e`, `vortex-e2e`, `ai:test` (for the whole run, from its global
+  setup) and the `ai:test:*` scripts, which refuse to drive an instance another owner holds.
+  Free or stale: taken implicitly for the command. Same owner: joined. Another live owner:
+  refused before anything is stopped, with the holder, its purpose and how to wait or
+  release.
+- `up` leaves the lease held by the running Vortex, so it lasts until `down` (or until that
+  Vortex exits). A command's implicit lease ends with the command.
+- `lease acquire` takes an explicit lease that lasts `--ttl` minutes (default 60; `0` for
+  none) or, with `--pid <n>`, while that process runs. Acquiring again renews it; that is
+  the heartbeat. `up`/`down` inside it leave it held.
+- `lease run [flags] [--] <command...>` holds the lease while the command runs, passes
+  `VORTEX_AI_OWNER` to it (so kit commands inside join rather than refuse), releases it
+  however the command ends, and exits with its code. Flags go before the command; the
+  command starts at its first word, because Windows PowerShell 5.1 strips `--`. Use it for
+  `pnpm run verify` and anything else that touches Vortex without the kit launching it.
+- `--wait <minutes>` on `lease run` and `lease acquire` polls until the holder is done.
+- A lease is stale when every process holding it has exited, or when an explicit lease's
+  TTL passed; the next acquirer reclaims it and says so. Reclaiming a TTL-expired lease
+  whose Vortex still runs means that Vortex gets stopped by the next `up` or `down`.
+- `lease release --force` clears someone else's live lease. Only a human should, after
+  checking its holder is really gone.
+- Commands that rewrite a Vortex checkout also lock it (`checkout:<path>`): the
+  `pr-preflight` revert check and `vortex-e2e`'s fixture patch. `lease run --checkout <dir>`
+  and `lease acquire --checkout <dir>` take the same lock.
+
+Limits: liveness is a PID check, so a reused PID can keep a dead holder's lease looking
+live until `lease status` shows it and its owner releases it. The lease serializes kit
+users; it does not stop a process that ignores it.
 
 ## Drive from any agent or shell
 
@@ -257,11 +304,79 @@ test step from successful tests followed by report encryption or upload failure.
 It exits nonzero while any check is pending or failed and supports
 `--repo <owner/name>` and `--json` for other repositories or automation.
 
-For an upstream E2E CI failure, first run its exact failing spec from
-`.vortex-src/packages/e2e` with `CI=1`, `VORTEX_E2E_HEADED` unset, and
-`pnpm exec playwright test src/tests/<spec>.spec.ts --workers=1 --retries=0`.
-Save before/after logs. Do not substitute the harness's visible app for that
-reproduction. Check the workflow's launch flags, credentials and actual test
+Before pushing a Vortex branch, run `pnpm run ai:preflight` (the same as
+`pnpm run ai -- pr-preflight`) and put its report in the PR. It works on any Vortex
+checkout (default `.vortex-src`, or `--checkout <dir>`) and diffs the committed
+`HEAD` against its merge-base with `--base` (default `upstream/master`). Each check
+prints PASS, WARN, FAIL or SKIP with file:line detail; it exits 1 on any FAIL.
+
+| Check                    | Result                                                                                                                                                                                                                                        |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Size                     | WARN above 400 changed lines or 10 files (Vortex `CONTRIBUTING.md`), ignoring lockfiles, `etc/*.api.md`, snapshots and build output                                                                                                           |
+| Callers outside the diff | WARN, as a to-review list: `git grep -w` hits in `src/` and `extensions/`, outside the diff, for each exported or class-member declaration the diff touches. Test hits are listed separately; comment-only hits and generic names are skipped |
+| Revert check             | FAIL unless the tests pass on the branch and fail with every non-test changed file restored to the base                                                                                                                                       |
+| Measurements in comments | WARN for timing or size figures in added comments                                                                                                                                                                                             |
+| PR description           | With `--pr <number-or-url>`: FAIL for a non-Conventional or over-72-character title, a missing section, "Not run", or no head sha in the body                                                                                                 |
+
+The revert check runs `pnpm exec vitest run` on `--test <path>` (repeatable), or on the
+test files the diff adds or changes, in each test's nearest `package.json` directory
+(`--project-dir <dir>` overrides). `--revert <path>` (repeatable) reverts only those
+files, which is how to show a test fails when just the wiring is reverted. It is the only
+check that writes to the checkout. It refuses on uncommitted changes, keeps a backup in
+the temp directory, restores the branch's exact bytes on success, failure, throw and
+Ctrl+C, and then checks hashes and `git status`. `--skip-revert` skips it.
+`--head <ref>` checks a ref without checking it out, for example someone else's
+branch; the revert check is then skipped. `--json` prints the full report, including
+every caller hit.
+
+Limits: symbols come from a regex and indentation heuristic over the declarations
+enclosing each changed line (see `touchedSymbols` in `prPreflight.ts`). Re-exports
+under another name, object-literal methods, and callers that use a different name are
+missed. A member of a class nothing outside the diff names is not searched. A test that
+fails after the revert only because a new export is missing gets a WARN, not a PASS.
+
+### Vortex's own E2E suite
+
+`pnpm run ai:vortex-e2e -- --checkout <dir>` (the same as `pnpm run ai -- vortex-e2e`)
+runs `<checkout>/packages/e2e` the way upstream CI does: `CI=1`, `VORTEX_E2E_HEADED`
+unset, `playwright test --workers=1 --retries=0 --reporter=list,json`. It needs a
+built checkout (`pnpm run build` there) and holds the instance lease and the
+checkout's lock. Stock, that suite gives no usable local result (see KNOWLEDGE.md), so
+for the run only it:
+
+- applies the kit's fixture patches from `harness/patches/`
+  (`e2e-window-startup.patch`: the main-window startup race in
+  `packages/e2e/src/fixtures/vortex-app.ts`). It refuses when those files have
+  uncommitted changes, fails without guessing when `git apply --check` does, skips a
+  patch the checkout already contains, and restores the exact bytes afterwards (also on
+  a throw or Ctrl+C), then checks hashes and `git status`;
+- leaves out, with `--grep-invert`, the tests that need a Nexus test account whose
+  credentials (`E2E_NEXUS_FREE_USER_*`, `E2E_NEXUS_PREMIUM_USER_*`, from the environment or
+  `packages/e2e/.env`) are absent. They are found from each describe's
+  `test.use({ nexusUser })` and `freeUser`/`premiumUser` in a test's body, and reported
+  as "skipped for missing credentials", not as failures. It lists the tests again with the
+  filter and refuses to run if the count differs from what it computed.
+
+| Flag                      | Effect                                                              |
+| ------------------------- | ------------------------------------------------------------------- |
+| `--checkout <dir>`        | Vortex checkout (default `.vortex-src`)                             |
+| `--spec <file>`           | Relative to `packages/e2e` or `packages/e2e/src/tests`; repeatable  |
+| `--grep`, `--grep-invert` | Passed to Playwright (the credential filter is added to the latter) |
+| `--compare <report.json>` | Diff against an earlier run: regressions, pre-existing, fixed       |
+| `--json`                  | Print the report as JSON; Playwright's own output goes to stderr    |
+| `--owner <name>`          | Lease owner                                                         |
+
+It prints passed, failed, skipped and credential-skipped counts, each failure with its
+error's first line, the duration, the checkout's HEAD sha and whether the patches were
+applied and restored. The JSON report goes to
+`harness/.artifacts/vortex-e2e/<time>-<sha>.json`, with Playwright's raw report beside it.
+The exit code is 1 on any failure, or with `--compare` on any regression (failing now,
+not failing in the baseline), and on a failed restore. For a PR, run master into a
+baseline report first, then the branch with `--compare <baseline>`.
+
+For an upstream E2E CI failure, first run its exact failing spec with
+`vortex-e2e --spec src/tests/<spec>.spec.ts`. Save before/after reports. Do not
+substitute the harness's visible app for that reproduction. Check the workflow's launch flags, credentials and actual test
 summary, not just its step conclusion. Animation tests need a rendered window;
 see the hidden-window entry in `KNOWLEDGE.md`. Test missing-credential skips with
 the account environment variables empty, alongside a signed-out smoke test.
@@ -316,6 +431,27 @@ Write`, mod sort timings, state backups, memory warnings and renderer crashes. T
   It is counted by no-op probe checks registered through `registerTest`, in harness
   instances only. A count that stops rising while its event fires means that event's
   checks are suppressed.
+
+**Measure in production mode.** A source build normally runs with NODE_ENV=development,
+which loads React's development build, several times slower at rendering. Use
+`up --dev-dir <checkout> --production ...` for any timing that should stand for what
+users see. `automation_status.nodeEnv` confirms the mode, and released builds are always
+in production. Compare A/B builds in the same mode, from the same `--fresh` baseline.
+
+**Keep the observer light.** Poll dialogs with `ui_active_dialogs` (or `openDialogs` in
+`uiDriver.ts`), not full `ui_snapshot`s. A full snapshot measures every rendered element.
+With thousands of mods rendered, one per second costs seconds of renderer time and becomes
+the top entry in the profile being taken. The harness's dialog watcher and collection
+driver already poll this way.
+
+More opt-in performance checks. Each writes JSON evidence (and, where noted, a `.cpuprofile`)
+under `harness/.artifacts`:
+
+| Command                                                   | Needs          | What it measures and fails on                                                                                                                                                                                                                |
+| --------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s. |
+| `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle.                                                                             |
+| `ai:test:download-churn -- --downloads <n> --seconds <s>` | any            | Throttled downloads from a local server (`downloadServer.ts`). Reports persist:diff per minute and per hive, slow writes, dispatches and long tasks. A measurement; it has no pass/fail.                                                     |
 
 `pnpm run ai:test:large-library` is an opt-in performance check against a running
 sandbox instance, for reports that only large mod lists reproduce. It seeds
@@ -388,6 +524,8 @@ live schemas with `tools --json` after changing tool registration.
 | `VORTEX_MCP_TOKEN`                         | Bearer token shared by harness and MCP client        |
 | `VORTEX_AI_NEXUS_API_KEY`                  | Optional legacy Nexus API key                        |
 | `VORTEX_AI_HEADLESS`                       | Hide window; screenshots may be blank                |
+| `VORTEX_AI_OWNER`                          | Lease owner when `--owner` is absent; `anonymous`    |
+| `VORTEX_AI_LEASE_DIR`                      | Lease files; default `~/.vortex-ai/leases`           |
 
 Run `doctor` with the same setup flags when prerequisites are unclear. No UI write
 tools means Vortex started without a token. HTTP 403 means a token/host/origin

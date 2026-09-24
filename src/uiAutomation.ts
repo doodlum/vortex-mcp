@@ -592,6 +592,15 @@ function boxOf(el: Element): CaptureRect {
  * snapshot because a modal is the single most common reason an otherwise-correct
  * click does nothing, and an agent reading a deep tree can easily miss it.
  */
+/**
+ * The text of every visible modal, without walking the rest of the UI. A full snapshot
+ * measures every rendered element; polled every second while a large mod list is on screen,
+ * that alone costs seconds of renderer time and skews what is being measured.
+ */
+export function activeDialogs(): string[] {
+  return collectDialogText();
+}
+
 function collectDialogText(): string[] {
   const out: string[] = [];
   const selectors = ['[role="dialog"]', ".modal.in", ".modal.show", "dialog[open]"];

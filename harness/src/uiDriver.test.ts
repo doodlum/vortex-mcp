@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { VortexMcpClient } from "./mcpClient";
+import { McpError, type VortexMcpClient } from "./mcpClient";
 import {
   advanceFomod,
   findNodes,
@@ -173,10 +173,15 @@ describe("dialogPolicies", () => {
  * spaces. Matching one against the other is what silently stalled three
  * separate runs.
  */
-function dialogMcp(body = "Mod files were changed outside Vortex."): {
+function dialogMcp(
+  body = "Mod files were changed outside Vortex.",
+  options: { withDialogTool?: boolean } = {},
+): {
   mcp: VortexMcpClient;
   clicked: string[];
+  fullSnapshots: () => number;
 } {
+  let fullSnapshots = 0;
   const clicked: string[] = [];
   const tree: SnapshotNode[] = [
     { ref: "r1", role: "heading", name: "External Changes" },
@@ -186,8 +191,15 @@ function dialogMcp(body = "Mod files were changed outside Vortex."): {
   ];
   const mcp = {
     call: (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "ui_active_dialogs") {
+        if (options.withDialogTool === false) {
+          return Promise.reject(new McpError("Tool ui_active_dialogs not found", name));
+        }
+        return Promise.resolve([`External Changes${body}`]);
+      }
       if (name === "ui_snapshot") {
         const scoped = args["selector"] !== undefined;
+        if (!scoped) fullSnapshots += 1;
         return Promise.resolve({
           generation: 1,
           title: "Vortex",
@@ -206,7 +218,7 @@ function dialogMcp(body = "Mod files were changed outside Vortex."): {
       throw new Error(`unexpected tool call: ${name}`);
     },
   } as unknown as VortexMcpClient;
-  return { mcp, clicked };
+  return { mcp, clicked, fullSnapshots: () => fullSnapshots };
 }
 
 describe("autoAnswerDialogs", () => {
@@ -220,6 +232,27 @@ describe("autoAnswerDialogs", () => {
 
     expect(clicked).toContain("r4");
     expect(answered[0]?.clicked).toBe("Confirm changes");
+  });
+
+  it("polls for dialogs without full snapshots, which cost seconds on a big mod list", async () => {
+    const { mcp, clicked, fullSnapshots } = dialogMcp();
+    const controller = new AbortController();
+    const answering = autoAnswerDialogs(mcp, { signal: controller.signal, pollMs: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    controller.abort();
+    await answering;
+    expect(clicked).toContain("r4");
+    expect(fullSnapshots()).toBe(0);
+  });
+
+  it("still finds dialogs through a snapshot on an extension without ui_active_dialogs", async () => {
+    const { mcp, clicked } = dialogMcp(undefined, { withDialogTool: false });
+    const controller = new AbortController();
+    const answering = autoAnswerDialogs(mcp, { signal: controller.signal, pollMs: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    controller.abort();
+    await answering;
+    expect(clicked).toContain("r4");
   });
 
   it("never confirms deleted links, whose default deletes the staging files", async () => {

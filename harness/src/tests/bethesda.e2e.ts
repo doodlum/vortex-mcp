@@ -24,12 +24,15 @@ import { zipSync } from "fflate";
 
 import { bethesdaSandboxPaths, pluginBytes } from "../bethesdaSandbox";
 import { loadConfig } from "../config";
+import { claimInstanceLease } from "../instance";
 import { deployMods } from "../deployment";
 import { installLocalMod } from "../localMod";
 import { VortexMcpClient } from "../mcpClient";
 import { installOfflineCollection, writeOfflineCollection } from "../offlineCollection";
 
 const config = loadConfig();
+// Drives the running instance: refuse while another owner holds it.
+claimInstanceLease(config, "ai:test:bethesda");
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 

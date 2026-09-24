@@ -17,7 +17,7 @@ import path from "node:path";
 import { strToU8, zipSync, type Zippable } from "fflate";
 
 import type { VortexMcpClient } from "./mcpClient";
-import { clickByName, clickInsideDialog, snapshot, waitForNode } from "./uiDriver";
+import { clickByName, clickInsideDialog, openDialogs, waitForNode } from "./uiDriver";
 
 export interface BundledMember {
   /** Display name; the bundled directory is "Bundled - <name> v<version>". */
@@ -115,18 +115,25 @@ export async function installOfflineCollection(
   // The review's close button is disabled while postprocessing; wait for it enabled.
   const closeButton = /^(done|close|no thanks)$/i;
   const deadline = Date.now() + timeoutMs;
+  let lastDialogs: string[] = [];
   for (;;) {
-    const snap = await snapshot(mcp);
-    const review = snap.activeDialogs.find((d) => /collection installation complete/i.test(d));
-    if (review !== undefined) {
-      // Scoped to the dialog: a page-wide lookup finds more than one "Done".
-      const clicked = await clickInsideDialog(mcp, review, closeButton);
-      if (clicked !== undefined) return { collectionModId, closedWith: clicked };
+    // A large collection blocks the renderer for seconds at a time while it resolves and
+    // postprocesses its members, and the MCP server lives in the renderer: a request can
+    // fail mid-block. That is the collection being slow, not finished or broken; retry.
+    const dialogs = await openDialogs(mcp);
+    if (dialogs !== undefined) {
+      lastDialogs = dialogs;
+      const review = dialogs.find((d) => /collection installation complete/i.test(d));
+      if (review !== undefined) {
+        // Scoped to the dialog: a page-wide lookup finds more than one "Done".
+        const clicked = await clickInsideDialog(mcp, review, closeButton).catch(() => undefined);
+        if (clicked !== undefined) return { collectionModId, closedWith: clicked };
+      }
     }
     if (Date.now() > deadline) {
       throw new Error(
         `The collection did not reach its review screen within ${String(timeoutMs)}ms. ` +
-          `Open dialogs: ${snap.activeDialogs.join(" | ") || "none"}`,
+          `Open dialogs: ${lastDialogs.join(" | ") || "none"}`,
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));

@@ -28,8 +28,10 @@ import {
 import { loadConfig, type HarnessConfig } from "../config";
 import { sandboxConfig, installSandboxExtension } from "../sandbox";
 import { ensureGameManaged } from "../gameSetup";
+import { INSTANCE_RESOURCE, addInstancePid, removeInstancePid } from "../lease";
 import {
   buildInstanceEnv,
+  claimInstanceLease,
   ensureExtensionBuilt,
   installMcpExtension,
   prepareUserDataDir,
@@ -111,15 +113,25 @@ export const test = base.extend<NoTestFixtures, AiFixtures>({
       // Whatever the config resolved — a released Vortex.exe by default, or an
       // Electron pointed at a source checkout. CDP is opened so the screenshot
       // helpers can attach alongside Playwright's own connection.
-      const app = await electron.launch({
-        executablePath: config.target.executable,
-        args: [...config.target.args, `--remote-debugging-port=${String(config.cdpPort)}`],
-        env: buildInstanceEnv(userDataDir, config),
-        cwd: path.dirname(config.target.executable),
-        timeout: 180_000,
-      });
-      await use(app);
-      await app.close().catch(() => undefined);
+      // The global setup already holds the instance lease for the run; this joins it, so
+      // a spec run some other way is still serialized against other agents.
+      const lease = claimInstanceLease(config, "ai:test");
+      try {
+        const app = await electron.launch({
+          executablePath: config.target.executable,
+          args: [...config.target.args, `--remote-debugging-port=${String(config.cdpPort)}`],
+          env: buildInstanceEnv(userDataDir, config),
+          cwd: path.dirname(config.target.executable),
+          timeout: 180_000,
+        });
+        const pid = app.process().pid;
+        if (pid !== undefined) addInstancePid(INSTANCE_RESOURCE, pid);
+        await use(app);
+        await app.close().catch(() => undefined);
+        if (pid !== undefined) removeInstancePid(INSTANCE_RESOURCE, pid);
+      } finally {
+        lease.release();
+      }
     },
     { scope: "worker" },
   ],

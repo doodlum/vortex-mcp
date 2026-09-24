@@ -13,9 +13,11 @@ test needs a capability that is missing; verify the workflow after adding it.
 
 ## The shape of a test
 
-When reproducing upstream CI, run the failing spec from `.vortex-src/packages/e2e`
-using its default hidden-window mode (`CI=1`, `VORTEX_E2E_HEADED` unset). Keep a
-failing log before editing and rerun that same command afterward. Our visible
+When reproducing upstream CI, run the failing spec with
+`pnpm run ai -- vortex-e2e --checkout <dir> --spec src/tests/<spec>.spec.ts`: CI's
+hidden-window mode (`CI=1`, `VORTEX_E2E_HEADED` unset), under the instance lease, with
+the fixture's startup race patched for the run only. Keep the failing report before
+editing and rerun that same command afterward (`--compare <report>`). Our visible
 harness app alone does not reproduce CI's painting behavior. See `KNOWLEDGE.md`
 for the hidden-window animation issue and keep login/report-secret failures
 separate from feature assertions. Use real pointer and keyboard input to check

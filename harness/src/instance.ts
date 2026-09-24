@@ -23,8 +23,33 @@ import { extensionRoot, MCP_EXTENSION_ID, type HarnessConfig } from "./config";
 import { VortexMcpClient } from "./mcpClient";
 import { installSandboxExtension } from "./sandbox";
 import { preparePreload, verifyPreload } from "./mainPreload";
+import {
+  INSTANCE_RESOURCE,
+  addInstancePid,
+  holdLease,
+  removeInstancePid,
+  resolveOwner,
+  type HoldResult,
+} from "./lease";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Hold the machine-wide instance lease for the rest of this process (see lease.ts).
+ *
+ * Every path that starts or stops Vortex calls this first, so one agent cannot quit or
+ * replace another's instance. Free or stale: taken. Same owner: joined. Another live
+ * owner: LeaseHeldError, naming the holder and how to wait or release.
+ */
+export function claimInstanceLease(config: HarnessConfig, purpose: string): HoldResult {
+  return holdLease(INSTANCE_RESOURCE, resolveOwner(config.owner), {
+    purpose,
+    onReclaim: (state) =>
+      process.stderr.write(
+        `[lease] reclaimed a stale instance lease from "${state.lease.owner}" (${state.reason})\n`,
+      ),
+  });
+}
 
 export function authCacheFile(config: HarnessConfig): string {
   const key = createHash("sha256")
@@ -83,7 +108,15 @@ export function buildInstanceEnv(
   }
   // A source checkout only loads its extensions and devtools wiring under
   // development; a released build ignores this.
-  if (config.target.kind === "dev") env.NODE_ENV = "development";
+  if (config.target.kind === "dev") {
+    if (config.production) {
+      // Vortex's main process sets NODE_ENV=production itself when it is not development,
+      // as a released build does; an inherited value must not decide otherwise.
+      delete env.NODE_ENV;
+    } else {
+      env.NODE_ENV = "development";
+    }
+  }
 
   return env;
 }
@@ -239,6 +272,8 @@ function isAlive(pid: number): boolean {
  * nothing about the real cause.
  */
 export async function stopStaleInstance(config: HarnessConfig): Promise<boolean> {
+  // Refuses before touching anything when another owner holds the instance.
+  claimInstanceLease(config, "stop a harness instance");
   let stopped = false;
   const file = pidFile(config);
   const pid = fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8").trim()) : undefined;
@@ -269,6 +304,7 @@ export async function stopStaleInstance(config: HarnessConfig): Promise<boolean>
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   fs.rmSync(file, { force: true });
+  if (pid !== undefined && Number.isInteger(pid)) removeInstancePid(INSTANCE_RESOURCE, pid);
   return stopped;
 }
 
@@ -296,6 +332,7 @@ export interface LaunchOptions {
 export async function launchVortex(options: LaunchOptions): Promise<VortexInstance> {
   const { userDataDir, config } = options;
   const { target } = config;
+  claimInstanceLease(config, "launch Vortex");
   installSandboxExtension(userDataDir, config);
   await assertPortAvailable(config.mcpPort);
   await assertPortAvailable(config.cdpPort);
@@ -331,6 +368,8 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
   );
   child.unref();
   recordPid(config, child.pid);
+  // A detached instance keeps the lease after this process exits, until `down`.
+  if (child.pid !== undefined) addInstancePid(INSTANCE_RESOURCE, child.pid);
 
   if (redirect !== undefined && preload !== undefined) {
     try {
@@ -422,6 +461,7 @@ export async function stopInstance(
     if (!(await waitForExit(child, 5_000)))
       throw new Error("Vortex did not exit after forced shutdown.");
   }
+  if (child.pid !== undefined) removeInstancePid(INSTANCE_RESOURCE, child.pid);
 }
 
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

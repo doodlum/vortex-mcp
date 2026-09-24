@@ -61,6 +61,77 @@ fixtures and cover that capability with tests. Do not leave a successful manual
 experiment as the only way to reproduce a result. Preserve compatibility with
 released Vortex; process control and CDP belong in the harness.
 
+## Before a Vortex pull request is ready
+
+A draft PR is not done until each of these is true and stated in its description:
+
+1. **Reproduced and A/B-verified** in the real app, unpatched against patched. Use the same
+   commit and the same `--fresh` baseline, with the relevant opt-in check or scenario.
+   Timings come from `--production` builds, so React runs as it does for users.
+2. **Vortex's full gate passes on the PR's exact commit.** Run `pnpm run verify`, and
+   confirm the formatter left the tree clean. Stop the harness instance first, because
+   verify rewrites `src/main/build`.
+3. **The E2E suite has run** with the kit's runner, master first as the baseline:
+   `pnpm run ai:vortex-e2e -- --owner <you> --checkout <dir>` on master, then the PR's head
+   with `--compare <master report.json>`. It runs `packages/e2e` as CI does, with the
+   fixture's startup race patched for the run only, and leaves out the account specs when
+   their credentials are absent (they need Nexus test accounts and VPN). Report its
+   regressions separately from pre-existing failures and the credential-skipped count,
+   and give both HEAD shas.
+4. **An independent agent has reviewed it adversarially**: the whole diff, claims and
+   evidence, trying to break equivalence and find undisclosed behaviour changes. Fix or
+   answer every confirmed point, then re-verify.
+
+"Not run" is not an acceptable line in a PR description. If a gate cannot run here, say
+exactly what blocked it.
+
+Titles, the description template, the reviewer brief and the lessons log are in
+[PULL-REQUESTS.md](PULL-REQUESTS.md). After every review, add any recurring class of finding to
+its "Review lessons", so the next author checks for it before pushing.
+
+## Several issues at once: orchestrate, don't accumulate
+
+A report often names several problems: a slow deploy, a crash, a missing warning. Working them all in
+one context degrades it. Findings, logs and diffs from one issue leak into reasoning about the next,
+and review points get lost. Split the work:
+
+- **The orchestrator** (the session the user is talking to) triages the report into one task per
+  issue, keeps the list of open PRs and their state, and owns this kit. It is the only agent that
+  edits `vortex-mcp`. It schedules every use of Vortex: A/B timing, `pnpm run verify`, E2E.
+- **One fresh subagent per issue or PR** does the Vortex-side work: reproduce in unit tests, fix,
+  typecheck, lint, commit, push. Give it a self-contained brief: branch, worktree, the problem
+  statement, and any review findings as a file path, not pasted history. It must not start
+  Vortex, touch the kit, or edit the PR description. It reports kit or doc gaps back instead of
+  working around them.
+- **A separate fresh agent does QA and adversarial review on each pushed PR.** It reproduces the
+  problem on the base by itself, confirms the fix in the app, tries to break it, then reviews the
+  diff (see PULL-REQUESTS.md). It is the only other agent that drives Vortex, and only while it
+  holds the instance lease. The orchestrator sends confirmed findings back to a new fix agent,
+  and the cycle repeats until QA and review find nothing blocking.
+
+This separates using the kit to develop Vortex from improving the kit itself. The orchestrator
+turns the gaps agents report into kit changes, so the next agent inherits them.
+
+**Serialize anything that touches Vortex, and hold the lease.** Only one Vortex instance can run at a time: the
+harness, E2E and `verify` share profiles, ports and `src/main/build`. The kit enforces it with a
+machine-wide instance lease (harness/AGENTS.md, "The instance lease"). Give every agent its own
+owner name and have it pass `--owner <name>` (or set `VORTEX_AI_OWNER`) on every command:
+
+- `up`, `down`, `setup`, `vortex-e2e`, `ai:test` and the `ai:test:*` scripts take the lease
+  themselves and refuse, naming the holder, while another owner has it.
+- Wrap anything else that uses Vortex in it:
+  `pnpm run ai -- lease run --owner <name> --wait 60 -- pnpm run verify`.
+- For a longer session (QA across several commands), take it up front with
+  `lease acquire --owner <name> --purpose "<why>" --ttl 120`, renew by acquiring again, and
+  `lease release --owner <name>` at the end. `lease status` shows who has it.
+
+A refused command changed nothing; wait (`--wait`) rather than releasing another owner's lease.
+Keep a single development
+checkout and run fix agents in it one after another, not in parallel worktrees. Extra worktrees
+multiply native-module installs, can hit Windows path-length limits, and make it easy to drive or
+verify the wrong tree. Parallelize only work that never builds or launches Vortex: code reading,
+reviews, and Linear or GitHub triage.
+
 ## Implementing a feature from a design
 
 Translate the supplied design into explicit acceptance criteria before changing

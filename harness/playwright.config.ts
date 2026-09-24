@@ -14,6 +14,8 @@ import { defineConfig } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./src/tests",
+  // Holds the machine-wide instance lease for the whole run.
+  globalSetup: "./src/tests/leaseGlobalSetup.ts",
   // One at a time: the tools under test resize the real window and the MCP
   // server binds a fixed port, neither of which survives parallel workers.
   workers: 1,

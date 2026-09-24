@@ -50,6 +50,8 @@ const HOST = "127.0.0.1";
 // hostname resolves to 127.0.0.1); the token is a second, independent gate for writes.
 const TOKEN = process.env.VORTEX_MCP_TOKEN;
 const RUNTIME_ID = randomUUID();
+/** Idle keep-alive lifetime; see startMcpServer for why it is long. */
+const KEEP_ALIVE_MS = 10 * 60 * 1000;
 
 // Vortex's `confidential` state hive (Nexus API key, OAuth credentials, and anything
 // else Vortex core itself treats as a credential — see Application.ts's registerHive
@@ -188,6 +190,8 @@ function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
           userDataDir:
             process.env.VORTEX_E2E === "1" ? (process.env.ELECTRON_USERDATA ?? null) : null,
           paths: vortexPaths(),
+          // "production" as in a release; "development" loads React's slower dev build
+          nodeEnv: process.env.NODE_ENV ?? null,
         }),
       ],
     }),
@@ -1409,6 +1413,18 @@ function registerUiReadTools(server: McpServer, api: IExtensionApi): void {
   );
 
   server.registerTool(
+    "ui_active_dialogs",
+    {
+      description:
+        "The visible text of each open modal dialog (the same `activeDialogs` a ui_snapshot " +
+        "returns), without walking or measuring the rest of the UI. Use it to poll for a dialog: " +
+        "a full ui_snapshot every second with thousands of mods rendered costs the renderer " +
+        "seconds and skews any timing being taken.",
+      inputSchema: z.object({}),
+    },
+    async () => ({ content: [jsonText(ui.activeDialogs())] }),
+  );
+  server.registerTool(
     "ui_read_console",
     {
       description:
@@ -1724,6 +1740,13 @@ export function startMcpServer(api: IExtensionApi): http.Server {
     }
     log("error", "[vortex-mcp] HTTP server error", { message: err.message });
   });
+
+  // This server runs in the renderer, which Vortex itself can block for tens of seconds (a
+  // large collection install does). Node's default 5s keep-alive timeout then fires late and
+  // closes an idle socket at the moment a client reuses it, and that request fails with
+  // ECONNRESET although nothing was wrong. Loopback-only, so idle sockets cost nothing.
+  httpServer.keepAliveTimeout = KEEP_ALIVE_MS;
+  httpServer.headersTimeout = KEEP_ALIVE_MS + 1_000;
 
   httpServer.listen(PORT, HOST, () => {
     log("info", "[vortex-mcp] MCP server listening", { url: `http://${HOST}:${PORT}/mcp` });

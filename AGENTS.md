@@ -6,15 +6,16 @@ nothing here requires a patched or self-built Vortex.
 
 ## What's here
 
-| Path                | What it is                                                                       |
-| ------------------- | -------------------------------------------------------------------------------- |
-| `src/`              | The Vortex extension: an MCP server exposing Vortex's state **and** its UI       |
-| `harness/`          | `vortex-ai` CLI + Playwright suite — launching, caching, screenshots, hot reload |
-| `harness/AGENTS.md` | **The operating manual.** Start here to actually use any of this                 |
-| `KNOWLEDGE.md`      | Non-obvious Vortex behaviours that fail silently. Read before debugging          |
-| `ARCHITECTURE.md`   | Why the extension reflects Vortex's API instead of wrapping it                   |
-| `.claude/skills/`   | Skills: working on Vortex, driving its UI, writing UI tests                      |
-| `.vortex-src/`      | The Vortex clone this suite manages (gitignored, created by `ai:source`)         |
+| Path                       | What it is                                                                       |
+| -------------------------- | -------------------------------------------------------------------------------- |
+| `src/`                     | The Vortex extension: an MCP server exposing Vortex's state **and** its UI       |
+| `harness/`                 | `vortex-ai` CLI + Playwright suite — launching, caching, screenshots, hot reload |
+| `harness/AGENTS.md`        | **The operating manual.** Start here to actually use any of this                 |
+| `harness/PULL-REQUESTS.md` | Vortex PR titles, description template, reviewer brief, review lessons           |
+| `KNOWLEDGE.md`             | Non-obvious Vortex behaviours that fail silently. Read before debugging          |
+| `ARCHITECTURE.md`          | Why the extension reflects Vortex's API instead of wrapping it                   |
+| `.claude/skills/`          | Skills: working on Vortex, driving its UI, writing UI tests                      |
+| `.vortex-src/`             | The Vortex clone this suite manages (gitignored, created by `ai:source`)         |
 
 ## Getting to a driveable Vortex
 
@@ -110,6 +111,10 @@ Use [harness/WORKFLOWS.md](harness/WORKFLOWS.md) for bug reproduction, regressio
 tests, new features, implementation from design documentation, and checks across
 window widths, heights, and application states.
 
+- **Several issues or PRs: orchestrate.** Give one fresh subagent each issue, one after
+  another in a single Vortex checkout. Reviews come from a separate agent. The orchestrating
+  session owns this kit and runs every gate that needs Vortex, since only one instance can run at
+  a time. See "Several issues at once" in `harness/WORKFLOWS.md`.
 - **The extension must keep working against a stock, released Vortex.** That
   constraint is the reason this design is worth anything. Anything needing the
   main process goes in the harness over CDP, never into a patch to Vortex.

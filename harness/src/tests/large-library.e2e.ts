@@ -28,6 +28,7 @@ import { strToU8, zipSync } from "fflate";
 
 import { attachToRenderer, captureScreenshot } from "../cdp";
 import { loadConfig } from "../config";
+import { claimInstanceLease } from "../instance";
 import { purgeGame } from "../deployment";
 import {
   fillFilterScript,
@@ -38,6 +39,7 @@ import {
 } from "../largeLibrary";
 import { installLocalMod } from "../localMod";
 import { VortexMcpClient } from "../mcpClient";
+import { markLog, readSince, summariseLog } from "../vortexLog";
 
 const flag = (name: string): string | undefined => {
   const index = process.argv.indexOf(`--${name}`);
@@ -58,6 +60,8 @@ const MAX_DEPLOY_RATIO = 1.6;
 const MAX_INSTALL_FREEZE_MS = 1_500;
 
 const config = loadConfig();
+// Drives the running instance: refuse while another owner holds it.
+claimInstanceLease(config, "ai:test:large-library");
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });
@@ -170,6 +174,11 @@ try {
       });
       window.__largeLibraryObserver.observe({ type: "longtask" });
     })()`);
+    // Vortex's own log for the span of the installs: per-install sorts, backups, memory
+    // warnings (LAZ-1079), and persistence churn.
+    const installStatus = await mcp.call<{ userDataDir: string | null }>("automation_status");
+    const installMark =
+      installStatus.userDataDir === null ? undefined : markLog(installStatus.userDataDir);
     const start = Date.now();
     // A name per run: an archive installed by an earlier run makes Vortex ask whether to
     // replace the mod, and nothing answers that unattended.
@@ -189,7 +198,13 @@ try {
       return window.__largeLibraryTasks;
     })()`)) as number[];
     const longestMs = Math.round(Math.max(0, ...tasks));
-    result.installs = { count: installs, wallMs, longTasks: tasks.length, longestMs };
+    result.installs = {
+      count: installs,
+      wallMs,
+      longTasks: tasks.length,
+      longestMs,
+      log: installMark === undefined ? null : summariseLog(readSince(installMark)),
+    };
     if (longestMs > MAX_INSTALL_FREEZE_MS) {
       failures.push(
         `installing ${String(installs)} mods froze the UI for up to ${String(longestMs)}ms at a ` +

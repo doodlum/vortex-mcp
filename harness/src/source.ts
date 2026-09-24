@@ -82,7 +82,7 @@ export function selectPnpmCommand(
  * `CI=1` additionally keeps anything downstream from stopping on a prompt there
  * is no terminal to answer.
  */
-function childEnv(): NodeJS.ProcessEnv {
+export function childEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { CI: "1" };
   for (const [key, value] of Object.entries(process.env)) {
     if (/^(npm_|PNPM_|COREPACK_)/i.test(key)) continue;

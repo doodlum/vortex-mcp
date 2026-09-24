@@ -85,6 +85,24 @@ For an upstream pull request, use `pnpm run ai -- pr-checks <pr>` before changin
 code. It reports the exact head and failed workflow steps, including whether the
 tests passed and only artifact post-processing failed.
 
+## Before calling a PR ready
+
+Follow "Before a Vortex pull request is ready" in `harness/WORKFLOWS.md`:
+
+- A/B in the real app with `--production` builds.
+- `pnpm run verify` on the exact commit.
+- The E2E suite, against a master baseline.
+- An adversarial review by a separate agent, with its findings addressed.
+
+Report each result in the PR.
+
+## More than one issue
+
+Don't fix a batch of reported issues in one context. Triage them. Then hand each issue to a fresh
+subagent, one at a time in the one checkout, and have each PR reviewed by another fresh agent.
+Keep the kit changes and the app-driven gates in the orchestrating session. See "Several issues at
+once" in `harness/WORKFLOWS.md`.
+
 ## Git
 
 Branch from `master`; never commit to it. `origin` is the fork, `upstream` is

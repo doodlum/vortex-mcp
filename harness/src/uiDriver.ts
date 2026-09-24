@@ -13,7 +13,7 @@
  * "the first plausible match" is a policy decision better made where it can be
  * seen and adjusted.
  */
-import type { VortexMcpClient } from "./mcpClient";
+import { McpError, type VortexMcpClient } from "./mcpClient";
 import { withUiLock } from "./uiSession";
 
 export interface SnapshotNode {
@@ -334,6 +334,25 @@ export interface AnsweredDialog {
   because: string;
 }
 
+/**
+ * The text of every open modal, or undefined when the renderer did not answer.
+ *
+ * Asks for the dialogs alone rather than a full snapshot: this runs every second for the
+ * whole of an install, and with thousands of mods rendered a full snapshot costs seconds of
+ * renderer time per poll — enough to show up as the top entry in a CPU profile of the very
+ * install being measured. Falls back to a snapshot on an extension without the tool.
+ */
+export async function openDialogs(mcp: VortexMcpClient): Promise<string[] | undefined> {
+  try {
+    return await mcp.call<string[]>("ui_active_dialogs");
+  } catch (err) {
+    if (err instanceof McpError && /not found|unknown tool/i.test(err.message)) {
+      return (await snapshot(mcp).catch(() => undefined))?.activeDialogs;
+    }
+    return undefined;
+  }
+}
+
 /** Containers Vortex renders modals into, most specific first. */
 const DIALOG_SELECTORS = ['[role="dialog"]', ".modal.in", ".modal.show", "dialog[open]"];
 
@@ -379,10 +398,10 @@ export function autoAnswerDialogs(
       await new Promise((resolve) => setTimeout(resolve, pollMs));
       if (options.signal.aborted) break;
 
-      const snap = await snapshot(mcp).catch(() => undefined);
-      if (snap === undefined || snap.activeDialogs.length === 0) continue;
+      const dialogs = await openDialogs(mcp);
+      if (dialogs === undefined || dialogs.length === 0) continue;
 
-      for (const text of snap.activeDialogs) {
+      for (const text of dialogs) {
         const policy = policies.find((p) => p.match.test(text));
         if (policy === undefined) {
           // The collection coordinator owns this confirmation separately.

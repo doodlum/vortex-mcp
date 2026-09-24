@@ -78,11 +78,23 @@ export interface HarnessConfig {
   /** Hide the window. Off by default — layout measurement needs a real window. */
   headless: boolean;
   /**
+   * Run a source build as a release runs: without NODE_ENV=development, so Vortex switches
+   * itself to production and React loads its production build. Development React is several
+   * times slower at rendering, so any timing meant to stand for users' experience needs this.
+   * Released builds always run like this.
+   */
+  production: boolean;
+  /**
    * Private stand-ins for the per-user folders a Bethesda game writes to: plugins.txt
    * under LocalAppData, INI files under Documents. Set by the Bethesda sandbox; when set,
    * Vortex must start with both redirected or not at all.
    */
   profileRedirect?: { localAppData: string; documents: string };
+  /**
+   * Who is using the kit, for the machine-wide instance lease (lease.ts). From `--owner`
+   * or VORTEX_AI_OWNER; unset means "anonymous".
+   */
+  owner?: string;
 }
 
 function envFlag(name: string): boolean {
@@ -214,6 +226,8 @@ export function loadConfig(overrides: Partial<HarnessConfig> = {}): HarnessConfi
     artifactDir: process.env.VORTEX_AI_ARTIFACT_DIR ?? path.join(HARNESS_ROOT, ".artifacts"),
     target: resolveTargetSafely(),
     headless: envFlag("VORTEX_AI_HEADLESS"),
+    production: envFlag("VORTEX_AI_PRODUCTION"),
+    owner: process.env.VORTEX_AI_OWNER,
     ...overrides,
   };
   for (const port of [config.mcpPort, config.cdpPort]) {

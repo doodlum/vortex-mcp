@@ -26,6 +26,7 @@ import {
   inspectPullRequestChecks,
   pullRequestChecksPassed,
 } from "./prChecks";
+import { PreflightError, formatPreflightReport, runPreflight } from "./prPreflight";
 import { captureLogin } from "./bootstrap";
 import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
 import { sandboxConfig } from "./sandbox";
@@ -34,6 +35,25 @@ import { installLocalMod } from "./localMod";
 import { installCollection } from "./collections";
 import { deployMods, needsDeployment, purgeGame } from "./deployment";
 import { runE2e } from "./e2e";
+import {
+  INSTANCE_RESOURCE,
+  acquireLease,
+  checkoutResource,
+  formatLeaseStates,
+  listLeases,
+  releaseLease,
+  resolveOwner,
+  waitForLease,
+  type LeaseState,
+} from "./lease";
+import { runUnderLease } from "./leaseCommand";
+import {
+  VortexE2eError,
+  e2eExitCode,
+  formatE2eReport,
+  playwrightRunner,
+  runVortexE2e,
+} from "./vortexE2e";
 import {
   buildVortexSource,
   detectGitHubUser,
@@ -47,6 +67,10 @@ interface ParsedArgs {
   command: string;
   positional: string[];
   flags: Record<string, string | boolean>;
+  /** Every value of each string flag, for flags that may repeat (`--test a --test b`). */
+  lists: Record<string, string[]>;
+  /** Everything after a bare `--` (the command for `lease run`). */
+  passthrough: string[];
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -57,6 +81,11 @@ function parseArgs(argv: string[]): ParsedArgs {
   const [command = "help", ...rest] = args;
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
+  const lists: Record<string, string[]> = {};
+  const setValue = (name: string, value: string): void => {
+    flags[name] = value;
+    (lists[name] ??= []).push(value);
+  };
   const booleanFlags = new Set([
     "help",
     "installed",
@@ -64,6 +93,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     "bethesda-sandbox",
     "isolate-user-folders",
     "headless",
+    "production",
     "oauth",
     "no-wait",
     "no-launch",
@@ -82,12 +112,28 @@ function parseArgs(argv: string[]): ParsedArgs {
     "keep",
     "full-page",
     "allow-incomplete",
+    "skip-revert",
+    "force",
   ]);
 
+  const passthrough: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === undefined) continue;
+    if (arg === "--") {
+      // `pnpm run ai:<script> -- --flag` forwards its separator after the command; only
+      // `lease run` gives it a meaning.
+      if (command !== "lease" || positional[0] !== "run") continue;
+      passthrough.push(...rest.slice(i + 1));
+      break;
+    }
     if (!arg.startsWith("--")) {
+      // `lease run [flags] <command...>`: the command starts at its first word even without
+      // `--`, which Windows PowerShell 5.1 strips from native command lines.
+      if (command === "lease" && positional.length === 1 && positional[0] === "run") {
+        passthrough.push(...rest.slice(i));
+        break;
+      }
       positional.push(arg);
       continue;
     }
@@ -95,17 +141,17 @@ function parseArgs(argv: string[]): ParsedArgs {
     const eq = body.indexOf("=");
     const next = rest[i + 1];
     if (eq !== -1) {
-      flags[body.slice(0, eq)] = body.slice(eq + 1);
+      setValue(body.slice(0, eq), body.slice(eq + 1));
     } else if (booleanFlags.has(body)) {
       flags[body] = true;
     } else if (next !== undefined && !next.startsWith("--")) {
-      flags[body] = next;
+      setValue(body, next);
       i++;
     } else {
       throw new ConfigError(`--${body} needs a value. Run help for supported flags.`);
     }
   }
-  return { command, positional, flags };
+  return { command, positional, flags, lists, passthrough };
 }
 
 function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
@@ -127,6 +173,8 @@ function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
   if (typeof flags["cdp-port"] === "string") overrides.cdpPort = Number(flags["cdp-port"]);
   if (typeof flags["cache-dir"] === "string") overrides.cacheDir = path.resolve(flags["cache-dir"]);
   if (flags.headless === true) overrides.headless = true;
+  if (flags.production === true) overrides.production = true;
+  if (typeof flags.owner === "string") overrides.owner = flags.owner;
   const config = loadConfig(overrides);
   if (flags.sandbox === true && flags["bethesda-sandbox"] === true) {
     throw new ConfigError("Choose one of --sandbox and --bethesda-sandbox.");
@@ -189,6 +237,42 @@ Instance lifecycle
     --where              Print managed source path
   pr-checks <pr>         Diagnose current GitHub checks and their failed steps
     --repo <owner/name>  Repository to inspect (default: Nexus-Mods/Vortex)
+  pr-preflight           Mechanical checks on a Vortex branch before pushing: size,
+                         callers outside the diff, revert check (negative control),
+                         measurements in comments, PR description
+    --checkout <dir>     Vortex checkout (default: .vortex-src)
+    --base <ref>         Base to diff from (default: upstream/master, via merge-base)
+    --head <ref>         Compare this ref without checking it out (no revert check)
+    --test <path>        Test file for the revert check; repeatable (default: the
+                         test files the diff adds or changes)
+    --project-dir <dir>  Where to run vitest (default: each test's nearest package.json)
+    --revert <path>      Revert only this file; repeatable (default: every non-test file)
+    --skip-revert        Skip the revert check
+    --pr <number|url>    Also lint that PR's title and description (--repo as above)
+    --json               Machine-readable report; exit code 1 on any failure
+  vortex-e2e             Run Vortex's own E2E suite (packages/e2e, CI=1, one worker, no
+                         retries) under the instance lease, with the kit's fixture
+                         patches applied for the run and restored byte-identically, and
+                         account specs left out when their credentials are absent
+    --checkout <dir>     Vortex checkout (default: .vortex-src)
+    --spec <file>        Spec to run, relative to packages/e2e or src/tests; repeatable
+    --grep <re> --grep-invert <re>   Playwright title filters
+    --compare <json>     Diff against an earlier report: regressions vs pre-existing
+    --json               Print the report as JSON (Playwright's output goes to stderr)
+
+Leases (one harness Vortex per machine; several agents may share the kit)
+  lease status           Who holds what, live or stale (--json)
+  lease acquire          Hold the instance lease: --owner <name> [--purpose <text>]
+                         [--ttl <minutes>, default 60; 0 = none] [--pid <n>] [--wait <min>]
+                         [--checkout <dir>: lock that checkout instead]. Re-run to renew.
+  lease release          --owner <name> [--force] [--checkout <dir>]
+  lease run [flags] [--] <cmd...>
+                         Hold the lease (and --checkout's) while <cmd> runs; exit code
+                         propagated. --owner <name> [--wait <minutes>] [--purpose <text>]
+                         Flags go before the command, which starts at its first word.
+  Commands that start or stop Vortex take the lease implicitly and refuse while another
+  owner holds it; up keeps it until down. Owner: --owner, else VORTEX_AI_OWNER, else
+  "anonymous".
 
 Driving a running instance
   tools --json           Discover every live tool and its full input schema
@@ -228,14 +312,17 @@ Target and isolation (repeat the same flags for all commands)
   --game <id> --game-path <dir>   Real game integration; use a disposable copy
   --cache-dir <dir>      Profiles and private OAuth cache
   --port <n> --cdp-port <n>      MCP/CDP endpoints (3701/9222 by default)
+  --owner <name>         Lease owner for this command (default VORTEX_AI_OWNER)
   --headless             Hide the window; screenshots/layout may differ
+  --production           Run a source build as releases run (production React);
+                         use for any timing meant to reflect users' experience
 
 Without a target flag: .vortex-src if present, otherwise installed Vortex.
 Read harness/AGENTS.md, the relevant skills and KNOWLEDGE.md first.
 For Vortex changes also follow its AGENTS.md and linked task-specific docs.
 `;
 async function main(): Promise<number> {
-  const { command, flags, positional } = parseArgs(process.argv.slice(2));
+  const { command, flags, positional, lists, passthrough } = parseArgs(process.argv.slice(2));
 
   if (command === "help" || flags.help === true) {
     log(HELP);
@@ -252,6 +339,34 @@ async function main(): Promise<number> {
     log(flags.json === true ? JSON.stringify(report, null, 2) : formatPullRequestChecks(report));
     return pullRequestChecksPassed(report) ? 0 : 1;
   }
+
+  if (command === "pr-preflight") {
+    const text = (name: string): string | undefined =>
+      typeof flags[name] === "string" ? flags[name] : undefined;
+    let report;
+    try {
+      report = await runPreflight({
+        checkout: text("checkout") ?? vortexSourceDir(),
+        base: text("base"),
+        head: text("head"),
+        tests: [...(lists.test ?? []), ...positional],
+        projectDir: text("project-dir"),
+        revert: lists.revert,
+        skipRevert: flags["skip-revert"] === true,
+        pr: text("pr"),
+        repo: text("repo"),
+        onProgress: (message) => process.stderr.write(`${message}\n`),
+        owner: text("owner"),
+      });
+    } catch (err) {
+      if (err instanceof PreflightError) throw new ConfigError(err.message);
+      throw err;
+    }
+    log(flags.json === true ? JSON.stringify(report, null, 2) : formatPreflightReport(report));
+    return report.passed ? 0 : 1;
+  }
+
+  if (command === "lease") return leaseCommand(positional, flags, passthrough);
 
   const config = configFrom(flags);
 
@@ -668,10 +783,134 @@ async function main(): Promise<number> {
       return 0;
     }
 
+    case "vortex-e2e": {
+      const text = (name: string): string | undefined =>
+        typeof flags[name] === "string" ? flags[name] : undefined;
+      let report;
+      try {
+        report = await runVortexE2e({
+          checkout: text("checkout") ?? vortexSourceDir(),
+          artifactDir: config.artifactDir,
+          specs: [...(lists.spec ?? []), ...positional],
+          grep: text("grep"),
+          grepInvert: text("grep-invert"),
+          owner: config.owner,
+          compare: text("compare"),
+          // With --json, stdout carries only the report; Playwright's progress goes to stderr.
+          runner: playwrightRunner(flags.json === true ? process.stderr : process.stdout),
+          onProgress: (message) => process.stderr.write(`${message}\n`),
+        });
+      } catch (err) {
+        if (err instanceof VortexE2eError) throw new ConfigError(err.message);
+        throw err;
+      }
+      log(flags.json === true ? JSON.stringify(report, null, 2) : formatE2eReport(report));
+      return e2eExitCode(report);
+    }
+
     default:
       log(`Unknown command "${command}".\n`);
       log(HELP);
       return 1;
+  }
+}
+
+async function leaseCommand(
+  positional: string[],
+  flags: ParsedArgs["flags"],
+  passthrough: string[],
+): Promise<number> {
+  const text = (name: string): string | undefined =>
+    typeof flags[name] === "string" ? flags[name] : undefined;
+  const minutes = (name: string, fallback: number): number => {
+    const raw = text(name);
+    const value = raw === undefined ? fallback : Number(raw);
+    if (!Number.isFinite(value) || value < 0) {
+      throw new ConfigError(`--${name} must be a number of minutes.`);
+    }
+    return value;
+  };
+  const owner = resolveOwner(text("owner"));
+  const checkout = text("checkout");
+  // `lease run` holds the instance and, with --checkout, that checkout too.
+  const resources =
+    checkout === undefined ? [INSTANCE_RESOURCE] : [INSTANCE_RESOURCE, checkoutResource(checkout)];
+  // acquire/release address one resource: the checkout when given, else the instance.
+  const resource = checkout === undefined ? INSTANCE_RESOURCE : checkoutResource(checkout);
+  const onReclaim = (state: LeaseState): void =>
+    log(
+      `Reclaimed a stale ${state.lease.resource} lease from "${state.lease.owner}" (${state.reason}).`,
+    );
+
+  switch (positional[0]) {
+    case "status": {
+      const states = listLeases();
+      log(flags.json === true ? JSON.stringify(states, null, 2) : formatLeaseStates(states));
+      return 0;
+    }
+    case "acquire": {
+      const pid = text("pid") === undefined ? undefined : Number(text("pid"));
+      if (pid !== undefined && (!Number.isInteger(pid) || pid <= 0))
+        throw new ConfigError("--pid must be a process id.");
+      const ttl = minutes("ttl", 60);
+      const result = await waitForLease(
+        () =>
+          acquireLease(resource, owner, {
+            mode: "explicit",
+            purpose: text("purpose"),
+            ttlMinutes: ttl,
+            boundPid: pid,
+          }),
+        minutes("wait", 0) * 60_000,
+        (err) => log(`Waiting for the lease:\n${err.message}\n`),
+      );
+      if (result.reclaimed !== undefined) onReclaim(result.reclaimed);
+      const until =
+        result.lease.expiresAt === undefined ? "with no expiry" : `until ${result.lease.expiresAt}`;
+      log(
+        `${result.joined ? "Renewed" : "Acquired"} the ${resource} lease for "${owner}" ${until}` +
+          (pid === undefined ? "" : `, while pid ${String(pid)} runs`) +
+          `. Renew by acquiring again; release with \`lease release --owner ${owner}\`.`,
+      );
+      return 0;
+    }
+    case "release": {
+      const result = releaseLease(resource, owner, { force: flags.force === true });
+      if (!result.released) {
+        log(`Not released: ${result.reason ?? "unknown"}.`);
+        return result.reason === "not held" ? 0 : 1;
+      }
+      log(`Released the ${resource} lease.`);
+      if (result.stillRunning.length > 0) {
+        log(
+          `A harness Vortex (pid ${result.stillRunning.join(", ")}) is still running; the next ` +
+            "owner's up or down will stop it. Run `down` first to stop it yourself.",
+        );
+      }
+      return 0;
+    }
+    case "run": {
+      const [cmd, ...args] = passthrough;
+      if (cmd === undefined) {
+        throw new ConfigError(
+          "lease run needs a command after --, e.g. lease run --owner qa -- pnpm run verify",
+        );
+      }
+      return runUnderLease({
+        command: cmd,
+        args,
+        owner,
+        resources,
+        purpose: text("purpose"),
+        waitMs: minutes("wait", 0) * 60_000,
+        onWaiting: (err) => log(`Waiting for the lease:\n${err.message}\n`),
+        onReclaim,
+      });
+    }
+    default:
+      throw new ConfigError(
+        "lease needs acquire, release, status or run. See help, or harness/AGENTS.md.",
+      );
   }
 }
 

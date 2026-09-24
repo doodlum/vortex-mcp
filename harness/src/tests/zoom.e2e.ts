@@ -6,6 +6,7 @@ import { loadConfig } from "../config";
 import { VortexMcpClient } from "../mcpClient";
 import { clickByName } from "../uiDriver";
 import { bootstrap } from "../bootstrap";
+import { claimInstanceLease } from "../instance";
 
 const signedOut = process.argv.includes("--signed-out");
 const baseConfig = loadConfig();
@@ -18,6 +19,8 @@ const config = signedOut
       cdpPort: baseConfig.cdpPort + 1,
     })
   : baseConfig;
+// Drives (or, signed out, starts) an instance: refuse while another owner holds it.
+claimInstanceLease(config, "ai:test:zoom");
 const ownedInstance = signedOut
   ? (await bootstrap(config, { skipGame: true, onProgress: console.log })).instance
   : undefined;
