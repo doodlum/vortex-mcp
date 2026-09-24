@@ -728,6 +728,13 @@ In Windows PowerShell 5.1, piping a here-string into `git commit -F -` fails wit
 any file(s)", so it looks like a pathspec error. Write the message to a file and pass
 `git commit -F <file>`.
 
+### `git show … | Set-Content` corrupts source files
+
+In Windows PowerShell 5.1, piping `git show <sha>:<path>` into `Set-Content` or `Out-File`
+re-encodes the content and changes its line endings. Vitest may then report "no tests" for the
+file, or the revert looks like a real change. To restore a file from another commit, use
+`git restore --source=<sha> --worktree -- <path>`.
+
 ### A commit message file written by PowerShell starts with a BOM
 
 Windows PowerShell 5.1's `Set-Content -Encoding utf8` and `Out-File -Encoding utf8` write a

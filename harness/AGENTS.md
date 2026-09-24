@@ -542,7 +542,8 @@ Vortex does not expose its collection `InstallDriver`; `registerAPI` only offers
 session. `collection_install_state` (read tool) reports:
 
 - `driver`: `step` (`prepare`, `changelog`, `query` = Install Now shown, `start` = continues on
-  the next update, `disclaimer`, `installing`, `review`), `installDone`, `postprocessing`, the
+  the next update, or with the game-version-cancel fix, once the game-version prompt is
+  answered, `disclaimer`, `installing`, `review`), `installDone`, `postprocessing`, the
   collection id and name. It is read from the `driver` prop Vortex passes its always-mounted
   collection dialogs, by walking React's fiber tree. That is a private shape. When a build stops
   passing the prop, `driver.found` is false with the reason.

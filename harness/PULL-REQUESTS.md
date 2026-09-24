@@ -125,7 +125,9 @@ vortex-mcp/harness/PULL-REQUESTS.md, especially "Getting it right before review"
 lessons". Before changing code, write your callers, exit paths and behaviour changes list. Then
 write a test that fails on the base, make the smallest complete fix, and run the scoped tests,
 typecheck and lint. Run `pnpm run ai:preflight -- --checkout <checkout> --pr <number>` and resolve
-everything it reports. Commit with Conventional Commits and push to origin. Never skip hooks.
+everything it reports. Treat each WARN entry (callers, readers of changed state, dispatchers) as a checklist,
+and write a disposition for each one in your report. Before finishing, stop every background shell or wait loop you
+started; an orphaned `until … sleep` loop outlives you. Commit with Conventional Commits and push to origin. Never skip hooks.
 
 Do not start Vortex (no `ai:up`, `ai:test*` or E2E), edit vortex-mcp, edit the PR description, or
 use any other checkout. `ai:preflight` is allowed, because it never starts Vortex. The renderer's
@@ -181,6 +183,9 @@ Then review:
 
 The author's callers, exit-path and behaviour lists and the pr-preflight report are at <path>.
 Treat them as claims to check, not as facts.
+
+Save the report to <scratchpad>/reviews/<pr>-round<n>-qa.md as well as returning it. Before finishing, stop every background shell or wait loop you
+started; an orphaned `until … sleep` loop outlives you.
 
 Report:
 - **QA:** the scenarios you ran and their results, unpatched against patched. Give commands,
@@ -246,7 +251,7 @@ catch it.
 10. **No measurements in code comments.** (#24284.)
 11. **Make a performance fix fail without its wiring.** When the fix doesn't change behaviour, a
     "fails on the base" test is impossible. Count the work instead: wrap the input in a counting
-    `Proxy` and assert reads, dispatches or calls per item, so the test fails on the base and
+    `Proxy` (or, for a structure that is rebuilt each pass, count through the functions that copy it, since a Proxy only sees the first copy) and assert reads, dispatches or calls per item, so the test fails on the base and
     with only the wiring reverted. (#24283: reads per rule 779 against 38.) A connected class
     component such as `SuperTable` can be tested without a store: mock the `ComponentEx`
     wrappers (`connect`, `extend`, `translate`) as identity functions and make `setState` commit
@@ -260,3 +265,10 @@ catch it.
     resolution. Also give new test files names that won't collide.
     (#24282 with the game-version Cancel fix: the merge was clean and the double release became a
     no-op. #24281 with #24284: both touch `Table.tsx`.)
+14. **Render-path changes must keep unchanged items the same object.** When a change touches how
+    derived state or rows are rebuilt, assert that unchanged items keep their reference (`toBe`),
+    including when values are `null` or `undefined`, not just that the values are equal. QA must
+    then exercise every major consumer of the changed component in the app, not only the one the
+    fix is for. (#24284: every Mods-page row got a new object because a `null` column looked
+    changed on every pass, so adding one mod went from 1.1 s to 12.9 s. The Plugins page, the
+    fix's target, got 3× faster.)
