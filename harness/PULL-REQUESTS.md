@@ -251,7 +251,7 @@ catch it.
 10. **No measurements in code comments.** (#24284.)
 11. **Make a performance fix fail without its wiring.** When the fix doesn't change behaviour, a
     "fails on the base" test is impossible. Count the work instead: wrap the input in a counting
-    `Proxy` (or, for a structure that is rebuilt each pass, count through the functions that copy it, since a Proxy only sees the first copy) and assert reads, dispatches or calls per item, so the test fails on the base and
+    `Proxy` (or, for a structure that is rebuilt each pass, count through the functions that copy it, since a Proxy only sees the first copy; a copy made from a call's own earlier copy is invisible without a production hook, and then a relative-timing test (N changed items against 1, fastest of several runs, sized past V8's ~1,000-property dictionary threshold) is the fallback, disclosed in the PR) and assert reads, dispatches or calls per item, so the test fails on the base and
     with only the wiring reverted. (#24283: reads per rule 779 against 38.) A connected class
     component such as `SuperTable` can be tested without a store: mock the `ComponentEx`
     wrappers (`connect`, `extend`, `translate`) as identity functions and make `setState` commit
