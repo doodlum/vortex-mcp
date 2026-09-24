@@ -26,7 +26,7 @@ import { runDoctor, formatDoctorReport } from "./doctor";
 import { parseJson, stripBom } from "./jsonFile";
 import { RendererEvalRefused, evalInRenderer } from "./rendererEval";
 import { watchAndReload } from "./hotReload";
-import { ensureExtensionBuilt, stopStaleInstance } from "./instance";
+import { attachedLeaseResources, ensureExtensionBuilt, stopStaleInstance } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep, viewportList } from "./responsive";
 import { captureScreenshot } from "./cdp";
@@ -290,8 +290,8 @@ Leases (one harness Vortex per machine; several agents may share the kit)
                          propagated. --owner <name> [--wait <minutes>] [--purpose <text>]
                          Flags go before the command, which starts at its first word.
   Commands that start or stop Vortex take the lease implicitly and refuse while another
-  owner holds it; up keeps it until down. Owner: --owner, else VORTEX_AI_OWNER, else
-  "anonymous".
+  owner holds it; up keeps it until down. Vortex run from a checkout also locks that
+  checkout until it exits. Owner: --owner, else VORTEX_AI_OWNER, else "anonymous".
 
 Driving a running instance
   tools --json           Discover every live tool and its full input schema
@@ -342,7 +342,8 @@ Target and isolation (repeat the same flags for all commands)
   --owner <name>         Lease owner for this command (default VORTEX_AI_OWNER)
   --headless             Hide the window; screenshots/layout may differ
   --production           Run a source build as releases run (production React);
-                         use for any timing meant to reflect users' experience
+                         use for any timing meant to reflect users' experience.
+                         up fails unless the renderer loaded production React
 
 Without a target flag: .vortex-src if present, otherwise installed Vortex.
 Read harness/AGENTS.md, the relevant skills and KNOWLEDGE.md first.
@@ -854,7 +855,8 @@ async function main(): Promise<number> {
         command: process.execPath,
         args: [tsxCli(), abs, ...passthrough],
         owner: resolveOwner(config.owner),
-        resources: [INSTANCE_RESOURCE],
+        // The running Vortex's checkout too, so nobody rebuilds it under the script.
+        resources: attachedLeaseResources(config),
         purpose: `script ${path.basename(abs)}`,
         waitMs: (typeof flags.wait === "string" ? Number(flags.wait) : 0) * 60_000,
         shell: false,
@@ -973,6 +975,13 @@ async function leaseCommand(
       if (!result.released) {
         log(`Not released: ${result.reason ?? "unknown"}.`);
         return result.reason === "not held" ? 0 : 1;
+      }
+      if (result.keptForRunning === true) {
+        log(
+          `Released your hold on ${resource}, but it stays locked while Vortex (pid ` +
+            `${result.stillRunning.join(", ")}) runs from it. \`down\` ends that; --force clears it.`,
+        );
+        return 0;
       }
       log(`Released the ${resource} lease.`);
       if (result.stillRunning.length > 0) {

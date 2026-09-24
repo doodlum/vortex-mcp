@@ -28,13 +28,14 @@ import {
 import { loadConfig, type HarnessConfig } from "../config";
 import { sandboxConfig, installSandboxExtension } from "../sandbox";
 import { ensureGameManaged } from "../gameSetup";
-import { INSTANCE_RESOURCE, addInstancePid, removeInstancePid } from "../lease";
 import {
   buildInstanceEnv,
   claimInstanceLease,
   ensureExtensionBuilt,
+  forgetLaunchedPid,
   installMcpExtension,
   prepareUserDataDir,
+  recordLaunchedPid,
   removeInstanceDir,
 } from "../instance";
 import { VortexMcpClient } from "../mcpClient";
@@ -125,10 +126,10 @@ export const test = base.extend<NoTestFixtures, AiFixtures>({
           timeout: 180_000,
         });
         const pid = app.process().pid;
-        if (pid !== undefined) addInstancePid(INSTANCE_RESOURCE, pid);
+        if (pid !== undefined) recordLaunchedPid(config, pid);
         await use(app);
         await app.close().catch(() => undefined);
-        if (pid !== undefined) removeInstancePid(INSTANCE_RESOURCE, pid);
+        if (pid !== undefined) forgetLaunchedPid(config, pid);
       } finally {
         lease.release();
       }

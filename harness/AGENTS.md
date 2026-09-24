@@ -140,7 +140,9 @@ its own state database; the harness does not edit its storage format.
 `harness/.env` API key (`up` says so). With a key, Vortex looks every locally installed
 archive up on Nexus, and for a fixture archive that lookup only ends at its 60 s timeout, so
 each install looks hung. `--with-api-key` seeds it anyway. The key is part of the snapshot key,
-so the first start after changing this is cold; pass the same choice to every command.
+so the first start after changing this is cold; pass the same choice to every command. Without
+the key in use, `VORTEX_AI_NEXUS_API_KEY` and `NEXUS_API_KEY` are also left out of the
+environment Vortex is launched with.
 
 `down` waits for clean shutdown. An unresponsive instance is reported and left
 intact; the harness does not blindly kill a recorded PID and then certify a
@@ -191,6 +193,13 @@ pnpm run ai -- lease run --owner qa --wait 60 -- pnpm run verify
 - Commands that rewrite a Vortex checkout also lock it (`checkout:<path>`): the
   `pr-preflight` revert check and `vortex-e2e`'s fixture patch. `lease run --checkout <dir>`
   and `lease acquire --checkout <dir>` take the same lock.
+- Running Vortex from a checkout locks it too. A launch with `--dev-dir <dir>` (or the managed
+  `.vortex-src`) takes or joins `checkout:<dir>` besides `instance`, and its Vortex holds both
+  until it exits, so nobody rebuilds or switches the checkout under it; a holder of the checkout
+  lock who starts Vortex takes `instance` too. `script` and the `ai:test:*` checks, which drive
+  a running instance, take the checkout it was launched from (recorded in
+  `<cache>/instance.json`). Releasing your explicit checkout lease while your Vortex still runs
+  from it leaves it held by that Vortex (`down` ends it).
 
 Limits: liveness is a PID check, so a reused PID can keep a dead holder's lease looking
 live until `lease status` shows it and its owner releases it. The lease serializes kit
@@ -270,7 +279,7 @@ clients still need to coordinate UI actions.
 | `ui_detect_layout_issues`, `ui_responsive_sweep` | Advisory layout findings                                                                  |
 | `ui_read_console`                                | Renderer console/errors since a sequence number                                           |
 | `nexus_auth_status`                              | Credential-presence booleans, never credentials                                           |
-| `automation_status`                              | Isolated profile path and renderer lifetime ID                                            |
+| `automation_status`                              | Profile path, renderer lifetime ID, NODE_ENV and the React build loaded (`react.build`)   |
 | `collection_install_state`                       | Collection InstallDriver step, install session and collection dialogs (see below)         |
 | `vortex_query`, `vortex_dispatch`                | Inspect state, invoke documented actions/events                                           |
 
@@ -358,17 +367,22 @@ prints PASS, WARN, FAIL or SKIP with file:line detail; it exits 1 on any FAIL.
 | Size                     | WARN above 400 changed lines or 10 files (Vortex `CONTRIBUTING.md`), ignoring lockfiles, `etc/*.api.md`, snapshots and build output                                                                                             |
 | Callers outside the diff | WARN, as a to-review list: hits in `src/` and `extensions/`, outside the diff, for each exported or class-member declaration the diff touches. Test hits are listed separately; comment-only hits and generic names are skipped |
 | Readers of changed state | WARN: for each class field whose assignment the diff adds or removes (`this.mStep = …`), the other lines of the file that read it, by member, and the uses outside the diff of any getter that exposes it (`driver.step`)       |
+| Dispatchers of reducers  | WARN: for each reducer handler the diff changes (`[actions.addModRule as any]: (state, payload) => …`), its action creator and every call of it, extensions included, plus lines using its type string (`"ADD_MOD_RULE"`)       |
 | Revert check             | FAIL unless the tests pass on the branch and fail with every non-test changed file restored to the base                                                                                                                         |
 | Measurements in comments | WARN for timing or size figures in added comments                                                                                                                                                                               |
 | PR description           | With `--pr <number-or-url>`: FAIL for a non-Conventional or over-72-character title, a missing section, "Not run", or no head sha in the body                                                                                   |
 
 How callers are found:
 
+- "Outside the diff" means outside its hunks, not outside its files: a call on an unchanged
+  line of a changed file counts, and the report says how many hits are in changed files. The
+  symbol's own declaration line is left out.
 - An exported function, component or type: `git grep -w` for its name.
 - A class member: only **member uses**, `x.name`, `this.name`, `x?.name`, or a JSX attribute
   `name={…}`. Bare words are locals and imports. A file that declares its own member of that
-  name belongs to another class, so its declaration and `this.name` uses are left out. The
-  report says how many hits were left out.
+  name belongs to another class, so its declaration and `this.name` uses are left out; in the
+  member's own file `this.name` counts. The report says how many hits were left out. A member of
+  a class nothing outside the diff reaches is still searched in its own file.
 - The class or component itself. Every consumer of it can notice a change to any member, so
   the report lists them: references by name and, when it is the file's default export
   (`export default translate(…)(SuperTable)`), every module importing that default, including
@@ -496,6 +510,21 @@ installs them with no Nexus or account:
   `postprocessed`: whether `collection-postprocess-complete` fired for this collection, seen
   through the extension's `onEvent` listener.
 
+- **Rules and references.** `modRules` on the collection writes inter-member rules; a member's
+  `fileExpression` overrides its bundle name (a glob, for an already-installed member matched by
+  tag).
+- **Updating to a new revision.** `updateOfflineCollection(mcp, oldCollectionModId, archive,
+{ remove, keep })` does what Vortex's `collectionUpdate` does once the new revision is
+  downloaded: marks `keep` members as installed individually, removes the old collection mod
+  (and `remove`) with `remove-mods` and reason `collection_update`, keeping the other members,
+  then installs the new revision from its download. It returns `removeMs` and the install
+  result. Not reproduced: the changelog, the "Remove mods from old revision?" question (pass its
+  answer), and re-enabling optional members.
+- **Clicking inside a dialog.** `clickInsideDialog` throws when it clicks nothing (listing each
+  dialog container and its buttons) or when `ui_click` reports clicking something other than the
+  button; pollers pass `{ required: false }` and get undefined. It identifies the container by the
+  scoped snapshot's `rootText`.
+
 Bundled optional members that are then installed have stalled until Vortex's stall watchdog
 fired (5 min) in QA. That is not diagnosed yet; the default skips them.
 
@@ -552,8 +581,15 @@ Write`, mod sort timings, state backups, memory warnings and renderer crashes. T
 **Measure in production mode.** A source build normally runs with NODE_ENV=development,
 which loads React's development build, several times slower at rendering. Use
 `up --dev-dir <checkout> --production ...` for any timing that should stand for what
-users see. `automation_status.nodeEnv` confirms the mode, and released builds are always
-in production. Compare A/B builds in the same mode, from the same `--fresh` baseline.
+users see. It launches with NODE_ENV=production and then checks the renderer: `up` stops
+Vortex and fails unless `automation_status` shows `nodeEnv: "production"` and
+`react.build: "production"` (react and react-dom loaded `react*.production*.js`). It warns when
+the checkout is a development bundle (a plain `pnpm run build`): React is then production, but
+Vortex's own development-only branches, inlined at build time, still run. For full release
+parity build with `$env:NODE_ENV='production'; pnpm run build`, then clear it (nx caches the
+two modes separately). Released builds are always in production. Compare A/B builds in the
+same mode, from the same `--fresh` baseline, and record `automation_status.react` with the
+numbers.
 
 **Keep the observer light.** Poll dialogs with `ui_active_dialogs` (or `openDialogs` in
 `uiDriver.ts`), not full `ui_snapshot`s. A full snapshot measures every rendered element.
@@ -566,10 +602,27 @@ under `harness/.artifacts`:
 
 | Command                                                   | Needs          | What it measures and fails on                                                                                                                                                                                                                                                 |
 | --------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s.                                  |
+| `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s. Options below.                   |
 | `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle.                                                                                                              |
 | `ai:test:download-churn -- --downloads <n> --seconds <s>` | any            | Throttled downloads from a local server (`downloadServer.ts`). Reports persist:diff per minute and per hive, slow writes, dispatches and long tasks. A measurement; it has no pass/fail.                                                                                      |
 | `ai:test:mods-scroll -- --mods <n> [--conflicts <pairs>]` | sandbox        | The Mods table under real wheel input: rows on arrival, longest frame gap during a flick, blank rows after it settles, dropdown direction and clipping at both edges, noShrink Status width, rows left rendered after a scroll-through, the conflict editor's virtualisation. |
+
+`ai:test:collection-scale` with no options installs only required members and no rules, as it
+always has, so older reports stay comparable. Options add what real collections have
+(`collectionScale.ts`, deterministic, so A and B builds get the same collection):
+
+| Option             | Adds                                                                                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--optional <f>`   | a fraction of optional members (e.g. `0.1`); they are skipped at the review                                                                     |
+| `--glob <f>`       | a fraction referenced by a glob `fileExpression` (`Bundled - x?*`)                                                                              |
+| `--duplicates <n>` | duplicate member entries, alternately with the other type                                                                                       |
+| `--rules <n>`      | inter-member `modRules` with tag, literal and glob fileExpression, and unresolvable (logicalFileName) references, duplicates, before-then-after |
+| `--update`         | then revision 2, installed as `collectionUpdate` does (`updateOfflineCollection`): drops 5%, flips optional, adds `--extra <n>` (default 50)    |
+
+Install and update are reported separately (`phases.install`, `phases.update`): wall time,
+`longestFreezeMs`, long tasks, `updatingRulesMs` and the other steps, and the update's
+`removeMs`. The freeze budget applies to each. Example, the shape QA used for #24283:
+`--members 2000 --optional 0.1 --glob 0.04 --duplicates 20 --rules 1000 --update`.
 
 `pnpm run ai:test:large-library` is an opt-in performance check against a running
 sandbox instance, for reports that only large mod lists reproduce. It seeds

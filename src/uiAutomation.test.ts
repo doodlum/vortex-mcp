@@ -160,6 +160,21 @@ describe("snapshot", () => {
     expect(snapshot().activeDialogs).toEqual(["Files changed outside Vortex"]);
   });
 
+  it("reports a scoped root's text exactly as activeDialogs reports that dialog", () => {
+    // The conflict editor: a filter box whose placeholder names it in the tree, but is not
+    // text. Matching the dialog's text against the tree's names never lined up.
+    setBody(
+      '<div role="dialog" id="conflict-editor-dialog"><span>Multiple</span>' +
+        '<input placeholder="Search for a rule..." /><div>Conflict A 0000</div>' +
+        "<button>Cancel</button><button>Save</button></div>",
+    );
+    const scoped = snapshot({ selector: "#conflict-editor-dialog" });
+    expect(scoped.activeDialogs).toEqual(["MultipleConflict A 0000CancelSave"]);
+    expect(scoped.rootText).toBe(scoped.activeDialogs[0]);
+    expect(flatten(scoped.tree).map((n) => n.name ?? n.text)).toContain("Search for a rule...");
+    expect(snapshot().rootText).toBeUndefined();
+  });
+
   it("excludes hidden elements unless asked for them", () => {
     setBody('<button style="display:none">Hidden</button><button>Shown</button>');
     expect(snapshot().tree.map((n) => n.name)).toEqual(["Shown"]);

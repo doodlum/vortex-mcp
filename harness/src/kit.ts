@@ -26,6 +26,7 @@ export { claimInstanceLease } from "./instance";
 export { readJsonFile, parseJson } from "./jsonFile";
 
 export * as bethesda from "./bethesdaSandbox";
+export * as collectionScale from "./collectionScale";
 export * as deployment from "./deployment";
 export * as largeLibrary from "./largeLibrary";
 export * as localMod from "./localMod";

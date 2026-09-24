@@ -320,6 +320,19 @@ which is the thing CSS cannot express. Note that `[role="dialog"]` can match
 several nested elements of a single dialog, so indices are not one-per-dialog —
 confirm with the dialog's text before acting, as `clickInsideDialog` does.
 
+### A dialog's text is not its snapshot tree's text
+
+`clickInsideDialog` used to confirm a scoped snapshot was the right dialog by looking for the
+first 20 characters of its `activeDialogs` text (the container's `textContent`) in the tree's
+names and texts. On the conflict editor that never matched: the tree names the filter box by
+its placeholder ("Search for a rule..."), which is not text, so "Multiple" and "Conflict A 0000"
+were never adjacent in it. No container matched, nothing was clicked, and the function returned
+undefined, which a one-shot caller never checked; Save simply did not happen. A scoped
+`ui_snapshot` now returns `rootText`, built exactly as the `activeDialogs` entry is, and that is
+what is compared. `clickInsideDialog` throws (listing each container and its buttons) when it
+clicks nothing, and when the element `ui_click` reports clicking is not the button it found.
+Pollers pass `{ required: false }`.
+
 ### A mod exists in state before it is installed
 
 A mod row appears the moment its install _starts_, not when it finishes. Until
@@ -492,6 +505,11 @@ saw that lookup end only at its 60 s timeout, so each sandbox install took a min
 looked hung, with nothing in the UI. `up` used to seed `harness/.env`'s key into
 sandbox profiles. Sandbox runs now leave it out unless `--with-api-key` is given.
 
+Leaving it out of the profile was not enough: `harness/.env` loads the key into the harness's
+own environment, and Vortex was launched with a copy of it, so `VORTEX_AI_NEXUS_API_KEY` was in
+Vortex's `process.env` in every sandbox run. The launch environment now drops it (and
+`NEXUS_API_KEY`) whenever the key is not in use.
+
 ### Measuring a slow Vortex without measuring the harness
 
 Three things made measurements wrong, found while profiling 2,000-member collections:
@@ -505,7 +523,46 @@ Three things made measurements wrong, found while profiling 2,000-member collect
   closed a socket as the client reused it. The server now keeps idle sockets for 10 minutes,
   and pollers retry.
 - **Development React.** Source builds run React's development build unless started with
-  `--production`, so rendering-heavy timings are inflated there.
+  `--production`, so rendering-heavy timings are inflated there. And `--production` itself
+  gave development React on a plain `pnpm run build` until September 2026; see the next entry.
+
+### `--production` on a development bundle ran development React
+
+Vortex's bundlers inline `process.env.NODE_ENV` at build time (rolldown `define` for main,
+webpack for the renderer, `rolldown.base.mjs`), and nx caches the two modes separately
+(`{ "env": "NODE_ENV" }` is a build input). A plain `pnpm run build` has no NODE_ENV, so it
+makes a development bundle, in which:
+
+- main.cjs's "switch to production unless development" (`main.ts`, `setEnv("NODE_ENV",
+"production", true)`) compiles to `if (false)`;
+- renderer.tsx's "set `process.env.NODE_ENV` to production" branch is dead code too.
+
+The kit's `--production` used to delete NODE_ENV from the launch environment and rely on
+main to set it. On a development bundle nothing did: the renderer ran with no NODE_ENV, and
+React, required at run time rather than bundled, loaded `react.development.js` and
+`react-dom.development.js`. `automation_status.nodeEnv` was null and nothing checked it. On a
+bundle built with NODE_ENV=production the renderer sets it itself, so the same kit gave
+production React on one build of a checkout and development React on the next. That is why
+QA of #24281 and #24282 saw "production" every run and QA of #24283 (after a plain rebuild of
+the same checkout) saw null. It was never a kit regression: `instance.ts` has done this since
+`--production` was added in 4da873d.
+
+Now `--production` launches with NODE_ENV=production, and `up` asks the renderer which React
+files it loaded (`automation_status.react`, from the module cache). It stops Vortex and fails
+unless NODE_ENV is production and both react and react-dom are production builds. It also
+warns when `src/main/build/renderer.js` is a development bundle: React is then production, but
+Vortex's own development branches still run (main-process file logging, renderer source maps
+and process-warning traces, missing-icon checks). For full release parity build with
+`$env:NODE_ENV='production'; pnpm run build` and clear it afterwards.
+
+Which numbers to distrust: any `--production` timing whose `automation_status.nodeEnv` was not
+"production". The #24281 figures above (production every run) and #24283 round-2 QA (a
+NODE_OPTIONS preload forced production) stand. The #24283 round-1 A/B (collection-scale with
+2,000 members: 158.5 → 99.7 s wall, longest freeze 24.0 → 7.8 s, updateRules 8.3 s → 0.19 s)
+loaded `react.development.js` and is development-React. The collection profiles under "What the
+profiles showed" date from the same session and have no React check; treat their proportions
+as development-React ones. With production React, master's longest freeze for 2,000 required
+members was 21.2 s (round-2 QA, 3 runs).
 
 What the profiles showed, for next time:
 
@@ -551,6 +608,16 @@ lists whenever the working profile is reset. It only touches games inside the ca
 In the External Changes dialog, "Source files were deleted" → Save removes deployed copies
 of files whose source is already gone. "Links were deleted" → Save deletes the **staging**
 files. The harness confirms the first and refuses the second.
+
+### Registered dialogs are always mounted
+
+A dialog registered with `registerDialog` is rendered by `DialogContainer` for the whole
+session. Its `show` prop only hides the Modal. So its hooks and selectors run on every
+matching store change even while nobody can see it. A `useMemo` over `persistent.mods` in
+`InstallFinishedDialog` cost 42–49 s of a collection install on a hidden dialog (with
+#24283 applied; 125–139 s on master), from `findModByRef` per optional member on each skip
+dispatch. When profiling a freeze, check whether hidden dialogs are doing the work, and gate
+expensive derived state on the dialog's own show condition.
 
 ### Virtualised rows are not in the DOM
 
@@ -638,6 +705,20 @@ Directory **renames** are worse: they can fail with EPERM for reasons unrelated
 to Vortex (an indexer or scanner holding a transient handle on any descendant),
 and retrying does not reliably help. Prefer building in place and writing a
 marker file last over the staging-directory-then-rename pattern.
+
+## Leases
+
+### Running Vortex from a checkout did not lock the checkout
+
+The instance lease stopped two agents driving Vortex at once, but a launch with `--dev-dir X`
+took only `instance`. So one agent could hold `instance` and run Vortex from `C:\dev\vx-ab`
+while another held `checkout:c:/dev/vx-ab` and rebuilt it underneath, and neither was refused.
+A launch from a source build now takes (or joins) `checkout:<dir>` as well, records its Vortex
+on both leases, and keeps both until that Vortex exits. Scripts and `ai:test:*` checks that
+drive a running instance take the checkout it was launched from (`<cache>/instance.json`), not
+the one their own configuration would pick. Releasing an explicit checkout lease while a
+Vortex still runs from it leaves the lease held by that Vortex; before, the release deleted
+the file outright and the checkout was free again.
 
 ## Tooling on Windows
 

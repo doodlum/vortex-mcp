@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import { McpError, type VortexMcpClient } from "./mcpClient";
 import {
+  DialogClickError,
   advanceFomod,
+  clickInsideDialog,
   findNodes,
   findOne,
   autoAnswerDialogs,
   DEFAULT_DIALOG_POLICIES,
   dialogPolicies,
+  snapshotIsDialog,
   type Snapshot,
   type SnapshotNode,
 } from "./uiDriver";
@@ -290,5 +293,119 @@ describe("autoAnswerDialogs", () => {
     controller.abort();
     await answering;
     expect(clicked).toContain("r4");
+  });
+});
+
+/**
+ * The conflict editor as Vortex renders it: its filter box's placeholder is part of the
+ * snapshot tree (as the textbox's name) but not of the dialog's text, which is what
+ * `activeDialogs` reports.
+ */
+const CONFLICT_TEXT =
+  "MultipleConflict A 0000Before All | After AllLoadConflict A 0000 (v1.0.0)beforeafter" +
+  "never together withConflict B 0000Clear RulesUse SuggestionsHide ResolvedCancelSave";
+
+function conflictEditorMcp(options: { rootText?: boolean; clickReports?: string }): {
+  mcp: VortexMcpClient;
+  clicked: string[];
+} {
+  const clicked: string[] = [];
+  const tree: SnapshotNode[] = [
+    { ref: "c1", role: "tab", name: "Multiple" },
+    { ref: "c2", role: "textbox", name: "Search for a rule..." },
+    { ref: "c3", role: "text", text: "Conflict A 0000" },
+    { ref: "c4", role: "button", name: "Before All" },
+    { ref: "c5", role: "button", name: "Cancel" },
+    { ref: "c6", role: "button", name: "Save" },
+  ];
+  const mcp = {
+    call: (name: string, args: Record<string, unknown> = {}) => {
+      if (name === "ui_snapshot") {
+        const index = Number(args["index"] ?? 0);
+        if (args["selector"] !== '[role="dialog"]' || index > 0) {
+          return Promise.reject(new McpError("No element matches selector", name));
+        }
+        return Promise.resolve({
+          generation: 1,
+          title: "Vortex",
+          viewport: { width: 1280, height: 800 },
+          nodeCount: tree.length,
+          truncated: false,
+          activeDialogs: [CONFLICT_TEXT],
+          ...(options.rootText === false ? {} : { rootText: CONFLICT_TEXT }),
+          tree,
+        } satisfies Snapshot);
+      }
+      if (name === "ui_click") {
+        clicked.push(String(args["ref"]));
+        return Promise.resolve({
+          ref: args["ref"],
+          role: "button",
+          name: options.clickReports ?? "Save",
+        });
+      }
+      throw new Error(`unexpected tool call: ${name}`);
+    },
+  } as unknown as VortexMcpClient;
+  return { mcp, clicked };
+}
+
+describe("clickInsideDialog", () => {
+  it("finds the conflict editor's Save, which a tree-text prefix never matched", async () => {
+    // Regression: the tree read "Multiple Search for a rule... Conflict A 0000", so the
+    // dialog's first 20 characters were never adjacent in it and nothing was clicked.
+    const { mcp, clicked } = conflictEditorMcp({});
+    await expect(clickInsideDialog(mcp, CONFLICT_TEXT, /^save$/i)).resolves.toBe("Save");
+    expect(clicked).toEqual(["c6"]);
+  });
+
+  it("still matches through the tree on an extension without rootText", async () => {
+    const { mcp, clicked } = conflictEditorMcp({ rootText: false });
+    await expect(clickInsideDialog(mcp, CONFLICT_TEXT, /^save$/i)).resolves.toBe("Save");
+    expect(clicked).toEqual(["c6"]);
+  });
+
+  it("throws, listing what it saw, instead of silently clicking nothing", async () => {
+    const { mcp, clicked } = conflictEditorMcp({});
+    const error = await clickInsideDialog(mcp, CONFLICT_TEXT, /^apply$/i).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(DialogClickError);
+    expect(String(error)).toMatch(/"Cancel", "Save"/);
+    expect(clicked).toEqual([]);
+    // A poller can still ask for undefined.
+    await expect(
+      clickInsideDialog(mcp, CONFLICT_TEXT, /^apply$/i, { required: false }),
+    ).resolves.toBeUndefined();
+    await expect(
+      clickInsideDialog(mcp, "Purge files from different instance?", /^cancel$/i),
+    ).rejects.toThrow(/another dialog/);
+  });
+
+  it("throws when the element clicked is not the button that was found", async () => {
+    const { mcp } = conflictEditorMcp({ clickReports: "Cancel" });
+    await expect(clickInsideDialog(mcp, CONFLICT_TEXT, /^save$/i)).rejects.toThrow(
+      /Clicked "Cancel"/,
+    );
+  });
+});
+
+describe("snapshotIsDialog", () => {
+  const snap = (rootText?: string, tree: SnapshotNode[] = []): Snapshot => ({
+    ...snapshotOf(tree),
+    ...(rootText === undefined ? {} : { rootText }),
+  });
+
+  it("compares the scoped root's text with the dialog's, whitespace and ellipsis aside", () => {
+    expect(
+      snapshotIsDialog(snap("External  Changes Mod files…"), "External ChangesMod files"),
+    ).toBe(true);
+    expect(snapshotIsDialog(snap("Game version mismatch"), "External Changes")).toBe(false);
+    expect(snapshotIsDialog(snap(""), "External Changes")).toBe(false);
+    expect(snapshotIsDialog(snap("anything"), "")).toBe(false);
+  });
+
+  it("without rootText, needs the dialog's text in the tree in order", () => {
+    const tree = [node("External Changes"), node("Confirm changes")];
+    expect(snapshotIsDialog(snap(undefined, tree), "External ChangesConfirm")).toBe(true);
+    expect(snapshotIsDialog(snap(undefined, tree), "Confirm changesExternal")).toBe(false);
   });
 });

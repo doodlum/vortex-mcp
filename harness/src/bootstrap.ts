@@ -276,7 +276,7 @@ export async function bootstrap(
   installMcpExtension(live);
 
   report(`launching Vortex (${tier})`);
-  const instance = await launchVortex({ userDataDir: live, config });
+  const instance = await launchVortex({ userDataDir: live, config, onProgress: report });
   if (liveUsable && legacyMatch && liveMarker) {
     fs.writeFileSync(
       path.join(live, MARKER_FILE),
@@ -409,7 +409,7 @@ async function buildSnapshot(
   installMcpExtension(snapshot);
 
   report("cold: starting a blank Vortex");
-  const instance = await launchVortex({ userDataDir: snapshot, config });
+  const instance = await launchVortex({ userDataDir: snapshot, config, onProgress: report });
 
   let game: EnsureGameResult;
   try {

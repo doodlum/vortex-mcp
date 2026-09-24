@@ -91,7 +91,8 @@ failure of the steps before it. Work in three layers, cheapest first:
 
 2. **`pr-preflight` checks it mechanically** (`pnpm run ai:preflight -- --pr <number>`; flags in
    [AGENTS.md](AGENTS.md)). It lists callers
-   outside the diff, reverts the non-test changes and confirms the tests then fail, flags
+   outside the diff's hunks (changed files included), the dispatch sites of any action whose
+   reducer changed, reverts the non-test changes and confirms the tests then fail, flags
    measurements in added comments, checks size against `CONTRIBUTING.md`, and lints the PR
    description. The author runs it before pushing and puts its report in the PR. The reviewer
    gets the report too, so it does not redo mechanical work.

@@ -318,7 +318,8 @@ export async function installCollection(
     if (options.autoAnswer !== false) {
       for (const dialog of (await snapshot(mcp)).activeDialogs) {
         if (/collection installation complete/i.test(dialog))
-          await clickInsideDialog(mcp, dialog, /^no thanks$/i);
+          // Best effort: the dialog watcher answers the same prompt if this misses it.
+          await clickInsideDialog(mcp, dialog, /^no thanks$/i, { required: false });
       }
     }
 

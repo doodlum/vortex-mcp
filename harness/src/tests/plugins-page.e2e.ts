@@ -32,7 +32,7 @@ const MAX_ACTION_BLOCKED_MS = 1_500;
 
 const config = loadConfig();
 // Drives the running instance: refuse while another owner holds it.
-claimInstanceLease(config, "ai:test:plugins-page");
+claimInstanceLease(config, "ai:test:plugins-page", {}, { attach: true });
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 const status = await mcp.call<{ paths?: { documents: string | null } }>("automation_status");

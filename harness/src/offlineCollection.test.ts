@@ -9,6 +9,7 @@ import type { VortexMcpClient } from "./mcpClient";
 import {
   addOfflineCollection,
   collectionManifest,
+  updateOfflineCollection,
   watchEvent,
   writeOfflineCollection,
 } from "./offlineCollection";
@@ -70,6 +71,56 @@ describe("the collection manifest", () => {
     };
     expect(manifest.mods[0]?.source.fileExpression).toBe("Bundled - A v1.0.0");
     expect(Object.keys(entries)).toContain("bundled/Bundled - A v1.0.0/A.esp");
+  });
+
+  it("writes inter-member modRules and a member's own fileExpression", () => {
+    const rule = { source: { tag: "a" }, type: "before", reference: { fileExpression: "B*" } };
+    const manifest = collectionManifest({
+      name: "C",
+      gameId: "vortexaisandbox",
+      members: [{ name: "lib-00012", files: {}, fileExpression: "Bundled - lib-0001?*" }],
+      modRules: [rule],
+    });
+    expect(manifest.modRules).toEqual([rule]);
+    expect(
+      (manifest.mods as Array<{ source: { fileExpression: string } }>)[0]?.source,
+    ).toMatchObject({ fileExpression: "Bundled - lib-0001?*" });
+    expect(collectionManifest({ name: "C", gameId: "g", members: [] }).modRules).toEqual([]);
+  });
+});
+
+describe("updating an offline collection", () => {
+  it("removes the old collection mod as collectionUpdate does, then installs the new revision", async () => {
+    const root = tempDir();
+    const archive = path.join(root, "rev2.zip");
+    fs.writeFileSync(archive, "zip");
+    const { mcp: base, dispatched } = fakeVortex(path.join(root, "downloads"));
+    const stop = new Error("stop at Install Now");
+    const mcp = {
+      call: async (tool: string, args: Record<string, unknown>) => {
+        if (tool === "poll_listener") return { lastSeq: 0, entries: [] };
+        if (tool === "vortex_dispatch" && args.action === "onEvent") return { listenerId: "l1" };
+        if (tool === "ui_click") throw stop;
+        return base.call(tool, args);
+      },
+    } as unknown as VortexMcpClient;
+
+    await expect(
+      updateOfflineCollection(mcp, "collection-rev1", archive, { keep: ["m1"], remove: ["m2"] }),
+    ).rejects.toBe(stop);
+    expect(dispatched.map((d) => d.action)).toEqual([
+      "setModAttribute",
+      "remove-mods",
+      "addLocalDownload",
+      "start-install-download",
+    ]);
+    expect(dispatched[0]?.args).toEqual(["fallout4", "m1", "installedAsDependency", false]);
+    expect(dispatched[1]?.args).toEqual([
+      "fallout4",
+      ["collection-rev1", "m2"],
+      "__CALLBACK__",
+      { incomplete: true, ignoreInstalling: true, reason: "collection_update" },
+    ]);
   });
 });
 

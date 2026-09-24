@@ -6,11 +6,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  actionTypeOf,
   assignedFields,
   commentText,
   computeSize,
   declaresOwnMember,
   defaultExportMentions,
+  dispatchUse,
   exportedNames,
   filterMemberHits,
   importTargets,
@@ -23,6 +25,7 @@ import {
   runPreflight,
   sizeCheck,
   stateReaders,
+  touchedReducers,
   touchedSymbols,
   type FileDiff,
   type PullRequestText,
@@ -755,7 +758,7 @@ export default translate(["common"])(
     const text = report.checks.find((c) => c.id === "callers")?.details.join("\n") ?? "";
     expect(text).toContain(
       "SuperTable.renderRow [method] src/controls/Table.tsx:10: 2 references in 2 files " +
-        "(4 bare-name or other-class hits left out)",
+        "(5 bare-name, other-class or declaration hits left out)",
     );
     expect(text).toContain("src/views/Use.ts:1:");
     expect(text).toContain("extensions/ext/src/view.tsx:6:");
@@ -785,3 +788,176 @@ export default translate(["common"])(
     expect(text).toContain("extensions/other/src/other.tsx:9: export const now = driver.step;");
   });
 });
+
+const REDUCER = `import * as actions from "../actions/mods";
+import { referenceEqual } from "../util/ref";
+
+export const modsReducer = {
+  reducers: {
+    [actions.setModName as any]: (state, payload) => {
+      return { ...state, name: payload.name };
+    },
+    [actions.addModRule as any]: (state, payload) => {
+      const existing = state.rules ?? [];
+      return { ...state, rules: [...existing, payload.rule] };
+    },
+  },
+  defaults: {},
+};
+
+export function hasRule(rules, rule) {
+  return rules.some((r) => referenceEqual(r, rule));
+}
+`;
+
+describe("reducer handlers and their dispatchers", () => {
+  const at = (text: string): number => REDUCER.split("\n").findIndex((l) => l.includes(text)) + 1;
+
+  it("finds the handler enclosing a changed line, and none outside the handler map", () => {
+    expect(touchedReducers(REDUCER, [at("const existing")], "r.ts")).toEqual([
+      { action: "addModRule", file: "r.ts", line: at("[actions.addModRule") },
+    ]);
+    expect(touchedReducers(REDUCER, [at("[actions.setModName")], "r.ts")[0]?.action).toBe(
+      "setModName",
+    );
+    expect(touchedReducers(REDUCER, [at("rules.some")], "r.ts")).toEqual([]);
+    expect(touchedReducers(REDUCER, [at("defaults")], "r.ts")).toEqual([]);
+  });
+
+  it("tells a creator's definition and calls from imports, keys and mentions", () => {
+    expect(dispatchUse("export const addModRule = safeCreateAction(", "addModRule")).toBe(
+      "definition",
+    );
+    expect(
+      dispatchUse("api.store.dispatch(actions.addModRule(gameId, id, rule));", "addModRule"),
+    ).toBe("call");
+    expect(dispatchUse("onAdd: (r) => dispatch(addModRule(g, m, r)),", "addModRule")).toBe("call");
+    expect(dispatchUse("[actions.addModRule as any]: (state, payload) => {", "addModRule")).toBe(
+      undefined,
+    );
+    expect(dispatchUse("  addModRule,", "addModRule")).toBeUndefined();
+    expect(dispatchUse("import { addModRule } from './actions';", "addModRule")).toBeUndefined();
+  });
+
+  it("reads the action type a creator is defined with, across lines", () => {
+    expect(
+      actionTypeOf(
+        'export const addModRule = safeCreateAction(\n  "ADD_MOD_RULE",\n  (a) => ({ a }),\n);',
+        "addModRule",
+      ),
+    ).toBe("ADD_MOD_RULE");
+    expect(actionTypeOf("export const other = 1;", "addModRule")).toBeUndefined();
+  });
+});
+
+describe(
+  "callers in changed files and dispatchers of a changed reducer",
+  { timeout: 60_000 },
+  () => {
+    let repo: string;
+    const INSTALLER = (body: string, extra: string) => `import { referenceEqual } from "./util/ref";
+import * as actions from "./actions/mods";
+
+class Installer {
+  private helper(rule) {
+    ${body}
+  }
+
+  public install(api, rule) {
+    if (referenceEqual(rule, rule)) return;
+    api.store.dispatch(actions.addModRule("game", "mod", rule));
+    return this.helper(rule);
+  }
+}
+
+export function run() {
+  ${extra}
+}
+`;
+
+    beforeEach(() => {
+      repo = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-dispatch-"));
+      run(repo, "init", "-q", "-b", "master");
+      run(repo, "config", "user.email", "test@example.test");
+      run(repo, "config", "user.name", "Test");
+      run(repo, "config", "core.autocrlf", "false");
+      write(
+        repo,
+        "src/util/ref.ts",
+        "export function referenceEqual(a, b) {\n  return a === b;\n}\n",
+      );
+      write(
+        repo,
+        "src/actions/mods.ts",
+        'export const addModRule = safeCreateAction(\n  "ADD_MOD_RULE",\n  (gameId, modId, rule) => ({ gameId, modId, rule }),\n);\n' +
+          'export const setModName = safeCreateAction("SET_MOD_NAME", (name) => ({ name }));\n',
+      );
+      write(repo, "src/reducers/mods.ts", REDUCER);
+      write(repo, "src/installer.ts", INSTALLER("return rule;", "return 1;"));
+      write(
+        repo,
+        "extensions/ext/src/index.ts",
+        'import { actions } from "vortex-api";\n' +
+          "export const go = (api) => api.store.dispatch(actions.addModRule(1, 2, 3));\n" +
+          'export const raw = { type: "ADD_MOD_RULE", payload: {} };\n',
+      );
+      run(repo, "add", ".");
+      run(repo, "commit", "-q", "-m", "base");
+      run(repo, "checkout", "-q", "-b", "fix");
+      write(
+        repo,
+        "src/util/ref.ts",
+        "export function referenceEqual(a, b) {\n  return a.id === b.id;\n}\n",
+      );
+      write(
+        repo,
+        "src/reducers/mods.ts",
+        REDUCER.replace(
+          "const existing = state.rules ?? [];",
+          "const existing = state.rules || [];",
+        ),
+      );
+      write(repo, "src/installer.ts", INSTALLER("return { ...rule };", "return 2;"));
+      run(repo, "add", "-A");
+      run(repo, "commit", "-q", "-m", "fix: rules");
+    });
+
+    afterEach(() => {
+      fs.rmSync(repo, { recursive: true, force: true });
+    });
+
+    it("lists callers in changed files outside their hunks, and the class's own this.uses", async () => {
+      const report = await runPreflight({ checkout: repo, base: "master", skipRevert: true });
+      const text = report.checks.find((c) => c.id === "callers")?.details.join("\n") ?? "";
+      // Both files are in the diff; neither call is on a changed line.
+      expect(text).toContain(
+        "referenceEqual [function] src/util/ref.ts:1: 4 references in 2 files; 4 in changed files, outside their hunks",
+      );
+      expect(text).toContain("src/installer.ts:10: if (referenceEqual(rule, rule)) return;");
+      expect(text).toContain("src/reducers/mods.ts:18: return rules.some");
+      // Nothing outside the file reaches Installer, but its own install() calls helper().
+      expect(text).toContain(
+        "Installer.helper [method] src/installer.ts:5: 1 references in 1 files",
+      );
+      expect(text).toContain("src/installer.ts:12: return this.helper(rule);");
+    });
+
+    it("lists every dispatch of an action whose reducer changed, extensions and type strings too", async () => {
+      const report = await runPreflight({ checkout: repo, base: "master", skipRevert: true });
+      const check = report.checks.find((c) => c.id === "dispatch");
+      expect(check?.status).toBe("warn");
+      const text = check?.details.join("\n") ?? "";
+      expect(text).toContain(
+        "addModRule (ADD_MOD_RULE): reducer at src/reducers/mods.ts:9; 2 dispatch sites in 2 files, 1 in extensions",
+      );
+      expect(text).toContain("created at src/actions/mods.ts:1:");
+      expect(text).toContain("src/installer.ts:11: api.store.dispatch(actions.addModRule(");
+      expect(text).toContain("extensions/ext/src/index.ts:2:");
+      expect(text).toContain("by type string ADD_MOD_RULE: 1 lines");
+      expect(text).toContain(
+        'extensions/ext/src/index.ts:3: export const raw = { type: "ADD_MOD_RULE"',
+      );
+      expect(text).not.toContain("setModName");
+    });
+  },
+);

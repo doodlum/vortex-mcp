@@ -420,6 +420,12 @@ export interface SnapshotResult {
   truncated: boolean;
   /** Text of any modal dialog currently on screen — the thing most likely to block an action. */
   activeDialogs: string[];
+  /**
+   * With a `selector`: the scoped root's text, built exactly as an `activeDialogs` entry is,
+   * so a caller can tell which of several matched containers is the dialog it read. The
+   * tree's names are no substitute: they include placeholders and labels that are not text.
+   */
+  rootText?: string;
   tree: SnapshotNode[];
 }
 
@@ -536,6 +542,7 @@ export function snapshot(options: SnapshotOptions = {}): SnapshotResult {
     nodeCount: emitted,
     truncated,
     activeDialogs: collectDialogText(),
+    ...(selector === undefined ? {} : { rootText: dialogTextOf(root) }),
     tree,
   };
 }
@@ -601,13 +608,18 @@ export function activeDialogs(): string[] {
   return collectDialogText();
 }
 
+/** How a dialog's text is reported, in `activeDialogs` and a scoped snapshot's `rootText`. */
+function dialogTextOf(el: Element): string {
+  return truncate(textOf(el), 400);
+}
+
 function collectDialogText(): string[] {
   const out: string[] = [];
   const selectors = ['[role="dialog"]', ".modal.in", ".modal.show", "dialog[open]"];
   for (const sel of selectors) {
     for (const el of Array.from(doc().querySelectorAll(sel))) {
       if (!isVisible(el)) continue;
-      const t = truncate(textOf(el), 400);
+      const t = dialogTextOf(el);
       if (t !== "" && !out.includes(t)) out.push(t);
     }
   }

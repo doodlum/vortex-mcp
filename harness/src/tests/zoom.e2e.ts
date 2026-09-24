@@ -20,7 +20,7 @@ const config = signedOut
     })
   : baseConfig;
 // Drives (or, signed out, starts) an instance: refuse while another owner holds it.
-claimInstanceLease(config, "ai:test:zoom");
+claimInstanceLease(config, "ai:test:zoom", {}, { attach: true });
 const ownedInstance = signedOut
   ? (await bootstrap(config, { skipGame: true, onProgress: console.log })).instance
   : undefined;

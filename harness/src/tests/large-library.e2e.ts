@@ -68,7 +68,7 @@ const MAX_INSTALL_FREEZE_MS = 1_500;
 
 const config = loadConfig();
 // Drives the running instance: refuse while another owner holds it.
-claimInstanceLease(config, "ai:test:large-library");
+claimInstanceLease(config, "ai:test:large-library", {}, { attach: true });
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });

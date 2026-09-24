@@ -17,6 +17,7 @@ import * as perf from "./perfTrace";
 import { probeCounts } from "./checkProbe";
 import { authStatus } from "./authStatus";
 import * as collectionState from "./collectionState";
+import { loadedReactBuild } from "./reactBuild";
 
 type IExtensionApi = types.IExtensionApi;
 
@@ -181,7 +182,7 @@ function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
     "automation_status",
     {
       description:
-        "Identify this renderer lifetime and isolated harness profile. runtimeId changes after renderer reload; userDataDir is null outside the harness. `paths` are the per-user folders Vortex resolved (documents, localAppData) — what a Bethesda game's INI files and plugins.txt are written under — so a harness can refuse to manage a game unless they are its own sandbox copies. Contains no credentials.",
+        "Identify this renderer lifetime and isolated harness profile. runtimeId changes after renderer reload; userDataDir is null outside the harness. `paths` are the per-user folders Vortex resolved (documents, localAppData) — what a Bethesda game's INI files and plugins.txt are written under — so a harness can refuse to manage a game unless they are its own sandbox copies. `nodeEnv` is the renderer's NODE_ENV; `react.build` is which React build the renderer actually loaded (production, development, or unknown), read from the module cache — the harness refuses a --production run unless it is production. Contains no credentials.",
       inputSchema: z.object({}),
     },
     async () => ({
@@ -193,6 +194,8 @@ function registerDiscoveryTools(server: McpServer, api: IExtensionApi): void {
           paths: vortexPaths(),
           // "production" as in a release; "development" loads React's slower dev build
           nodeEnv: process.env.NODE_ENV ?? null,
+          // What React actually loaded, which is what decides rendering speed
+          react: loadedReactBuild(),
         }),
       ],
     }),

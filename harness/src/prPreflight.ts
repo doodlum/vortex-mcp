@@ -30,7 +30,7 @@ const execFileAsync = promisify(execFile);
 export type CheckStatus = "pass" | "warn" | "fail" | "skip";
 
 export interface CheckResult {
-  id: "size" | "callers" | "state" | "revert" | "comments" | "description";
+  id: "size" | "callers" | "state" | "dispatch" | "revert" | "comments" | "description";
   title: string;
   status: CheckStatus;
   summary: string;
@@ -953,6 +953,45 @@ const GETTER = (name: string): RegExp =>
     `^\\s+(?:(?:public|protected|static|override)\\s+)*get\\s+${escapeRegExp(name)}\\s*\\(`,
   );
 
+/** The head-side lines each file's diff adds (with --unified=0, exactly its hunks). */
+export function changedLines(files: FileDiff[]): Map<string, Set<number>> {
+  const out = new Map<string, Set<number>>();
+  for (const file of files) {
+    if (file.newPath === undefined) continue;
+    out.set(file.newPath, new Set(file.added.map((l) => l.line)));
+  }
+  return out;
+}
+
+/**
+ * Hits of a touched symbol that are callers: not its own declaration, and, for a class
+ * member, member uses. In the member's own file `this.name` counts (it is that class's);
+ * elsewhere a file declaring a same-named member is another class's (filterMemberHits).
+ */
+export function callerHits(symbol: TouchedSymbol, hits: CallerHit[]): FilteredHits {
+  const own = (hit: CallerHit): boolean => hit.file === symbol.file;
+  const declaration = (hit: CallerHit): boolean =>
+    own(hit) && symbol.side === "head" && hit.line === symbol.line;
+  const candidates = hits.filter((hit) => !declaration(hit));
+  if (symbol.className === undefined) {
+    return { kept: candidates, dropped: hits.length - candidates.length };
+  }
+  const inFile = candidates.filter(
+    (hit) =>
+      own(hit) &&
+      memberUse(hit.text, symbol.name, hit.file) !== undefined &&
+      !declaresOwnMember(hit.text, symbol.name),
+  );
+  const elsewhere = filterMemberHits(
+    candidates.filter((hit) => !own(hit)),
+    symbol.name,
+  ).kept;
+  const kept = [...inFile, ...elsewhere].toSorted(
+    (a, b) => a.file.localeCompare(b.file) || a.line - b.line,
+  );
+  return { kept, dropped: hits.length - kept.length };
+}
+
 function symbolLabel(symbol: TouchedSymbol): string {
   const name = symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`;
   const where = `${symbol.file}:${String(symbol.line)}${symbol.side === "base" ? " (base)" : ""}`;
@@ -1019,7 +1058,7 @@ async function callersCheck(
   let withCallers = 0;
   const quiet: string[] = [];
   const references: Record<string, CallerHit[]> = {};
-  const repo = new RepoReader(dir, headSha, inDiff);
+  const repo = new RepoReader(dir, headSha, inDiff, changedLines(files));
   const listHits = (label: string, hits: CallerHit[], limit: number, note = ""): void => {
     const code = hits.filter((hit) => !isTestFile(hit.file));
     const tests = hits.filter((hit) => isTestFile(hit.file));
@@ -1047,7 +1086,10 @@ async function callersCheck(
     const key = `${file}#${name}`;
     let found = reach.get(key);
     if (found === undefined) {
-      const direct = (await repo.outside(name)).filter((hit) => !isTestFile(hit.file));
+      // The class's own file mentioning it (its declaration, `export default`) consumes nothing.
+      const direct = (await repo.outside(name)).filter(
+        (hit) => !isTestFile(hit.file) && hit.file !== file,
+      );
       const content = await repo.read(file);
       const modules =
         content !== undefined && defaultExportMentions(content, name)
@@ -1063,6 +1105,9 @@ async function callersCheck(
   for (const symbol of ordered) {
     const label =
       symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`;
+    // Set for a member of a class nothing outside the diff reaches: only its own file's
+    // uses (`this.name` outside the hunks) can be its callers.
+    let ownFileOnly = false;
     if (symbol.className !== undefined) {
       // A member is reached through its class. If nothing outside the diff reaches the
       // class, a search for the member only finds unrelated same-named ones.
@@ -1070,10 +1115,7 @@ async function callersCheck(
       const entry = enclosing.get(consumers.file + consumers.name) ?? { consumers, members: [] };
       entry.members.push(symbol.name);
       enclosing.set(consumers.file + consumers.name, entry);
-      if (consumerCount(consumers) === 0) {
-        quiet.push(label);
-        continue;
-      }
+      if (consumerCount(consumers) === 0) ownFileOnly = true;
     } else if (symbol.kind !== "type" && symbol.side === "head") {
       const consumers = await consumersOf(symbol.name, symbol.file);
       if (consumers.modules !== undefined) {
@@ -1085,22 +1127,30 @@ async function callersCheck(
       }
     }
     if (GENERIC_NAMES.has(symbol.name) || symbol.name.length < 3) {
+      if (ownFileOnly) {
+        quiet.push(label);
+        continue;
+      }
       details.push(
         `${symbolLabel(symbol)}: name too generic to search; review its callers by hand`,
       );
       continue;
     }
     // A removed symbol's callers live on the head; the head is what must still work.
-    let hits = await repo.outside(symbol.name);
+    // Members are reached as `x.name`, `this.name` or a JSX attribute, never as a bare
+    // word: those are locals, imports and same-named members of other classes.
+    const filtered = callerHits(symbol, await repo.outside(symbol.name));
+    const hits = ownFileOnly
+      ? filtered.kept.filter((hit) => hit.file === symbol.file)
+      : filtered.kept;
+    const declarations = filtered.dropped;
     let note = "";
-    if (symbol.className !== undefined) {
-      // Members are reached as `x.name`, `this.name` or a JSX attribute, never as a bare
-      // word: those are locals, imports and same-named members of other classes.
-      const filtered = filterMemberHits(hits, symbol.name);
-      hits = filtered.kept;
-      if (filtered.dropped > 0) {
-        note = ` (${String(filtered.dropped)} bare-name or other-class hits left out)`;
-      }
+    if (symbol.className !== undefined && declarations > 0) {
+      note = ` (${String(declarations)} bare-name, other-class or declaration hits left out)`;
+    }
+    const inChanged = hits.filter((hit) => inDiff.has(hit.file) && !isTestFile(hit.file));
+    if (inChanged.length > 0) {
+      note += `; ${String(inChanged.length)} in changed files, outside their hunks`;
     }
     references[label] = hits;
     if (hits.length === 0) {
@@ -1184,10 +1234,16 @@ export interface ModuleConsumers {
 class RepoReader {
   private contents = new Map<string, string | undefined>();
 
+  /**
+   * @param inDiff files the diff touches, left out of file-level searches (`files`)
+   * @param changed head-side lines the diff adds, per file: word hits on them are the diff
+   *   itself, while a caller elsewhere in a changed file is still a caller outside the diff
+   */
   constructor(
     readonly dir: string,
     readonly commit: string,
     readonly inDiff: Set<string>,
+    readonly changed: Map<string, Set<number>> = new Map(),
   ) {}
 
   async read(file: string): Promise<string | undefined> {
@@ -1200,10 +1256,15 @@ class RepoReader {
     return this.contents.get(file);
   }
 
-  /** Word hits outside the diff, comment-only lines left out. */
+  /**
+   * Word hits outside the diff's hunks, comment-only lines left out. A file the diff
+   * touches still counts: `referenceEqual` called at reducers/mods.ts:184 was missed while
+   * whole changed files were skipped, because the PR changed other lines of that file.
+   */
   async outside(name: string): Promise<CallerHit[]> {
     return (await findReferences(this.dir, this.commit, name)).filter(
-      (hit) => !this.inDiff.has(hit.file) && !/^(?:\/\/|\/\*|\*)/.test(hit.text),
+      (hit) =>
+        this.changed.get(hit.file)?.has(hit.line) !== true && !/^(?:\/\/|\/\*|\*)/.test(hit.text),
     );
   }
 
@@ -1284,6 +1345,185 @@ async function moduleConsumers(repo: RepoReader, file: string): Promise<ModuleCo
 }
 
 // ---------------------------------------------------------------------------
+// Dispatchers of actions whose reducer changed
+// ---------------------------------------------------------------------------
+
+/** A reducer handler key: `[actions.addModRule as any]: (state, payload) => …`. */
+const REDUCER_KEY = /^(\s*)\[\s*(?:[\w$]+\.)?([A-Za-z_$][\w$]*)(?:\s+as\s+any)?\s*\]\s*:/;
+
+export interface TouchedReducer {
+  /** The action creator's name, as the reducer's key names it. */
+  action: string;
+  file: string;
+  /** 1-based line of the handler's key. */
+  line: number;
+}
+
+/**
+ * The reducer handlers (`[actions.x as any]: (state, payload) => …` in an IReducerSpec's
+ * `reducers`) enclosing each changed line, found by walking up to the nearest key line
+ * indented less than the change, or the change itself.
+ */
+export function touchedReducers(
+  content: string,
+  changed: number[],
+  file: string,
+): TouchedReducer[] {
+  const lines = content.split(/\r?\n/);
+  const found = new Map<string, TouchedReducer>();
+  for (const at of changed) {
+    const start = lines[at - 1];
+    if (start === undefined) continue;
+    let indent = start.trim() === "" ? Number.POSITIVE_INFINITY : indentOf(start);
+    for (let i = at; i >= 1; i--) {
+      const text = lines[i - 1] ?? "";
+      if (text.trim() === "") continue;
+      const own = indentOf(text);
+      const key = REDUCER_KEY.exec(text);
+      if (key !== null && (i === at || own < indent)) {
+        const action = key[2] ?? "";
+        if (!found.has(action)) found.set(action, { action, file, line: i });
+        break;
+      }
+      if (own < indent) {
+        indent = own;
+        // Left the handler map, or reached the top level: not inside a reducer.
+        if (own === 0 || /\breducers\s*:\s*\{/.test(text)) break;
+      }
+    }
+  }
+  return [...found.values()];
+}
+
+export type DispatchUse = "definition" | "call" | "type";
+
+/**
+ * How a line refers to action creator `name`: its definition (`const name = createAction(`),
+ * a call (`dispatch(name(…))`, `actions.name(…)`), or nothing worth listing (an import, a
+ * reducer key, a bare mention).
+ */
+export function dispatchUse(text: string, name: string): DispatchUse | undefined {
+  const n = escapeRegExp(name);
+  if (new RegExp(`\\b(?:const|let|var|function)\\s+${n}\\b`).test(text)) return "definition";
+  if (REDUCER_KEY.test(text) && new RegExp(`\\[\\s*(?:[\\w$]+\\.)?${n}\\b`).test(text))
+    return undefined;
+  if (new RegExp(`(?<![\\w$])(?:[\\w$]+\\.)?${n}\\s*\\(`).test(text)) return "call";
+  return undefined;
+}
+
+/** The action type string a creator is defined with: `createAction("ADD_MOD_RULE", …)`. */
+export function actionTypeOf(content: string, name: string): string | undefined {
+  const n = escapeRegExp(name);
+  const at = content.search(new RegExp(`\\b(?:const|let|var)\\s+${n}\\s*=`));
+  if (at === -1) return undefined;
+  const window = content.slice(at, at + 400);
+  return /[cC]reate\w*Action\s*(?:<[^>]*>)?\s*\(\s*["'`]([^"'`]+)["'`]/.exec(window)?.[1];
+}
+
+async function dispatchCheck(
+  dir: string,
+  files: FileDiff[],
+  mergeBase: string,
+  headSha: string,
+  options: { maxHits: number },
+): Promise<CheckResult> {
+  const inDiff = new Set(
+    files.flatMap((f) => [f.oldPath, f.newPath]).filter((p) => p !== undefined),
+  );
+  const repo = new RepoReader(dir, headSha, inDiff, changedLines(files));
+  const reducers = new Map<string, TouchedReducer>();
+  for (const file of files) {
+    if (file.binary || isTestFile(file.path)) continue;
+    if (file.newPath !== undefined && CODE_FILE.test(file.newPath) && file.added.length > 0) {
+      const content = await repo.read(file.newPath);
+      if (content !== undefined) {
+        const touched = touchedReducers(
+          content,
+          file.added.map((l) => l.line),
+          file.newPath,
+        );
+        for (const r of touched) if (!reducers.has(r.action)) reducers.set(r.action, r);
+      }
+    }
+    if (file.oldPath !== undefined && CODE_FILE.test(file.oldPath) && file.removed.length > 0) {
+      const content = await git(dir, ["show", `${mergeBase}:${file.oldPath}`]).catch(() => "");
+      const touched = touchedReducers(
+        content,
+        file.removed.map((l) => l.line),
+        file.oldPath,
+      );
+      for (const r of touched) if (!reducers.has(r.action)) reducers.set(r.action, r);
+    }
+  }
+  if (reducers.size === 0) {
+    return {
+      id: "dispatch",
+      title: "Dispatchers of changed reducers",
+      status: "pass",
+      summary: "the diff changes no reducer handler",
+      details: [],
+    };
+  }
+
+  const details: string[] = [];
+  const data: Record<string, unknown> = {};
+  let sites = 0;
+  for (const reducer of reducers.values()) {
+    const hits = await repo.outside(reducer.action);
+    const definitions = hits.filter((h) => dispatchUse(h.text, reducer.action) === "definition");
+    const calls = hits.filter((h) => dispatchUse(h.text, reducer.action) === "call");
+    let type: string | undefined;
+    for (const def of definitions) {
+      const content = await repo.read(def.file);
+      type ??= content === undefined ? undefined : actionTypeOf(content, reducer.action);
+    }
+    const byType =
+      type === undefined
+        ? []
+        : (await repo.outside(type)).filter(
+            (h) => !definitions.some((d) => d.file === h.file && Math.abs(d.line - h.line) <= 3),
+          );
+    const code = calls.filter((h) => !isTestFile(h.file));
+    const tests = calls.filter((h) => isTestFile(h.file));
+    sites += code.length + byType.filter((h) => !isTestFile(h.file)).length;
+    data[reducer.action] = { reducer, type, definitions, calls, byType };
+    const inExtensions = code.filter((h) => h.file.startsWith("extensions/")).length;
+    details.push(
+      `${reducer.action}${type === undefined ? "" : ` (${type})`}: reducer at ` +
+        `${reducer.file}:${String(reducer.line)}; ${String(code.length)} dispatch sites in ` +
+        `${String(new Set(code.map((h) => h.file)).size)} files` +
+        (inExtensions > 0 ? `, ${String(inExtensions)} in extensions` : "") +
+        (tests.length > 0 ? `, ${String(tests.length)} in tests` : ""),
+    );
+    for (const def of definitions) {
+      details.push(`    created at ${def.file}:${String(def.line)}: ${truncate(def.text)}`);
+    }
+    for (const hit of code.slice(0, options.maxHits)) {
+      details.push(`    ${hit.file}:${String(hit.line)}: ${truncate(hit.text)}`);
+    }
+    if (code.length > options.maxHits)
+      details.push(`    … ${String(code.length - options.maxHits)} more (use --json for all)`);
+    const typed = byType.filter((h) => !isTestFile(h.file));
+    if (typed.length > 0) {
+      details.push(`    by type string ${String(type)}: ${String(typed.length)} lines`);
+      for (const hit of typed.slice(0, 5)) {
+        details.push(`      ${hit.file}:${String(hit.line)}: ${truncate(hit.text)}`);
+      }
+    }
+  }
+  return {
+    id: "dispatch",
+    title: "Dispatchers of changed reducers",
+    status: sites > 0 ? "warn" : "pass",
+    summary:
+      sites > 0
+        ? `${String(reducers.size)} reducer handlers changed, dispatched from ${String(sites)} places outside the diff; check what each passes still reduces the same`
+        : `${String(reducers.size)} reducer handlers changed, no dispatches found outside the diff`,
+    details,
+    data,
+  };
+}
+// ---------------------------------------------------------------------------
 // Readers of changed class state
 // ---------------------------------------------------------------------------
 
@@ -1301,7 +1541,7 @@ async function stateCheck(
   const inDiff = new Set(
     files.flatMap((f) => [f.oldPath, f.newPath]).filter((p) => p !== undefined),
   );
-  const repo = new RepoReader(dir, headSha, inDiff);
+  const repo = new RepoReader(dir, headSha, inDiff, changedLines(files));
   const details: string[] = [];
   const data: Record<string, unknown> = {};
   let fieldCount = 0;
@@ -1759,6 +1999,9 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
     await callersCheck(dir, files, mergeBase, headSha, { maxHits: options.maxHits ?? 15 }),
   );
   checks.push(await stateCheck(dir, files, headSha, { maxHits: options.maxHits ?? 15 }));
+  checks.push(
+    await dispatchCheck(dir, files, mergeBase, headSha, { maxHits: options.maxHits ?? 15 }),
+  );
 
   if (options.skipRevert === true) {
     checks.push({

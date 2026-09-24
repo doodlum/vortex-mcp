@@ -46,6 +46,12 @@ export interface BundledMember {
   /** An optional member (a `recommends` rule), offered after the required ones. */
   optional?: boolean;
   /**
+   * How the manifest refers to the member's bundle. Default: its bundle directory's name,
+   * as Vortex's exporter writes it. A glob (`Bundled - x?*`) exercises Vortex's pattern
+   * matching; with `files: {}` the member must already be installed, matched by its tag.
+   */
+  fileExpression?: string;
+  /**
    * The member's plugins as the collection lists them. Default: every .esp/.esm/.esl in
    * `files`, enabled.
    */
@@ -62,6 +68,17 @@ export interface OfflineCollection {
    * non-empty, the way Vortex's exporter does for Bethesda games.
    */
   plugins?: CollectionPlugin[];
+  /** Rules between members (`before`, `after`, `conflicts`, …), written as `modRules`. */
+  modRules?: CollectionModRule[];
+}
+
+/** A reference in a collection's modRules: a tag, a fileExpression, a logicalFileName, … */
+export type CollectionModReference = Record<string, string>;
+
+export interface CollectionModRule {
+  source: CollectionModReference;
+  type: string;
+  reference: CollectionModReference;
 }
 
 const bundleName = (member: BundledMember): string =>
@@ -101,12 +118,12 @@ export function collectionManifest(collection: OfflineCollection): Record<string
       domainName: collection.gameId,
       source: {
         type: "bundle",
-        fileExpression: bundleName(member),
+        fileExpression: member.fileExpression ?? bundleName(member),
         updatePolicy: "exact",
         tag: member.tag ?? `vortex-mcp-${member.name}`,
       },
     })),
-    modRules: [],
+    modRules: collection.modRules ?? [],
     ...(plugins.length > 0 ? { plugins, pluginRules: { plugins: [], groups: [] } } : {}),
   };
 }
@@ -367,6 +384,8 @@ async function closeReview(
           mcp,
           review,
           wantsOptionals ? /^install optional mods$/i : closeButton,
+          // Polled: the review's buttons render a moment after its text.
+          { required: false },
         ).catch(() => undefined);
         if (clicked !== undefined && wantsOptionals) {
           // The optional members install, then the review comes back.
@@ -416,4 +435,64 @@ export async function watchEvent(
         })
       ).entries.map((e) => e.args),
   };
+}
+
+export interface UpdateCollectionOptions extends InstallCollectionOptions {
+  /** Old-revision members to remove with the old collection mod ("Remove"/"Review" answers). */
+  remove?: string[];
+  /** Old-revision members to keep as individually installed mods ("Keep All"). */
+  keep?: string[];
+}
+
+export interface CollectionUpdateResult {
+  /** Time to remove the old revision's collection mod (and `remove`). */
+  removeMs: number;
+  /** The new revision's install, from Install Now through its review. */
+  install: CollectionInstallResult;
+}
+
+/**
+ * Update an installed offline collection to a new revision the way Vortex's
+ * `collectionUpdate` (collections/eventHandlers.ts) does once the new revision is
+ * downloaded: mark kept members as installed individually, remove the old collection mod
+ * (and any members being removed) with `remove-mods` and reason `collection_update`, keeping
+ * every other member installed, then install the new revision from its download. Members
+ * the two revisions share are then already installed, so the install resolves them rather
+ * than installing them again.
+ *
+ * Not reproduced: the changelog dialog, the "Remove mods from old revision?" question
+ * (pass its answer as `remove`/`keep`), and re-enabling optional members that were enabled
+ * before the update.
+ */
+export async function updateOfflineCollection(
+  mcp: VortexMcpClient,
+  previousCollectionModId: string,
+  archive: string,
+  options: UpdateCollectionOptions = {},
+): Promise<CollectionUpdateResult> {
+  const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });
+  if (!gameId) throw new Error("Manage a game before updating a collection.");
+  for (const modId of options.keep ?? []) {
+    await mcp.call("vortex_dispatch", {
+      action: "setModAttribute",
+      args: [gameId, modId, "installedAsDependency", false],
+    });
+  }
+  const started = Date.now();
+  await mcp.call(
+    "vortex_dispatch",
+    {
+      action: "remove-mods",
+      args: [
+        gameId,
+        [previousCollectionModId, ...(options.remove ?? [])],
+        "__CALLBACK__",
+        { incomplete: true, ignoreInstalling: true, reason: "collection_update" },
+      ],
+    },
+    options.timeoutMs ?? 600_000,
+  );
+  const removeMs = Date.now() - started;
+  const install = await installOfflineCollection(mcp, archive, options);
+  return { removeMs, install };
 }

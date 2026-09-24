@@ -35,6 +35,8 @@ export interface Snapshot {
   nodeCount: number;
   truncated: boolean;
   activeDialogs: string[];
+  /** With a selector: the scoped root's text, as `activeDialogs` reports it. */
+  rootText?: string;
   tree: SnapshotNode[];
 }
 
@@ -421,7 +423,7 @@ export function autoAnswerDialogs(
           continue;
         }
 
-        const clicked = await clickInsideDialog(mcp, text, policy.button);
+        const clicked = await clickInsideDialog(mcp, text, policy.button, { required: false });
         if (clicked === undefined) {
           if (!warned.has(text)) {
             warned.add(text);
@@ -443,32 +445,78 @@ export function autoAnswerDialogs(
   })();
 }
 
+/** Lowercase with all whitespace removed, so differently-joined text compares equal. */
+function squash(value: string): string {
+  return value.replace(/\s+/g, "").replace(/…$/, "").toLowerCase();
+}
+
+/** Whether `needle`'s characters all appear in `haystack`, in order. */
+function isSubsequence(needle: string, haystack: string): boolean {
+  let at = 0;
+  for (const char of needle) {
+    at = haystack.indexOf(char, at);
+    if (at < 0) return false;
+    at += 1;
+  }
+  return true;
+}
+
+/**
+ * Whether a scoped snapshot is of the dialog whose text was read from `activeDialogs`.
+ *
+ * The scoped root's own text (`rootText`, built the same way as an `activeDialogs` entry)
+ * is compared when the extension reports it. The tree is no substitute, and matching on it
+ * silently failed on the conflict editor: the tree's names include the filter box's
+ * placeholder ("Search for a rule..."), which is not text, so the dialog's first words
+ * ("Multiple", then "Conflict A 0000") were never adjacent in it, no container matched and
+ * Save was never clicked. Against an older extension the tree is used, requiring only that
+ * the dialog's text appear in it in order.
+ */
+export function snapshotIsDialog(snap: Snapshot, dialogText: string): boolean {
+  const wanted = squash(dialogText).slice(0, 60);
+  if (wanted === "") return false;
+  if (snap.rootText !== undefined) {
+    const root = squash(snap.rootText);
+    return root !== "" && (root.startsWith(wanted) || wanted.startsWith(root.slice(0, 60)));
+  }
+  const text = squash(
+    flatten(snap.tree)
+      .map((n) => `${n.name ?? ""} ${n.text ?? ""}`)
+      .join(" "),
+  );
+  return isSubsequence(wanted.slice(0, 30), text);
+}
+
+export class DialogClickError extends Error {}
+
+export interface ClickInsideDialogOptions {
+  /**
+   * Throw a DialogClickError, listing what was there, when the dialog or its button is not
+   * found. Default true: a caller that clicks once must not carry on as if it had. Pollers
+   * that retry (autoAnswerDialogs) pass false and get undefined instead.
+   */
+  required?: boolean;
+}
+
 /**
  * Click a button within the dialog whose text matches, and only within it.
  *
  * Each modal container is snapshotted separately so refs are scoped to that
  * subtree; the right container is identified by its text matching the dialog we
  * decided to answer, which matters when two modals are stacked.
+ *
+ * Returns the clicked button's name. The click is checked: the element `ui_click` reports
+ * having clicked must still match `button`, or this throws. When nothing matches it throws
+ * (or, with `required: false`, returns undefined).
  */
-/** Lowercase with all whitespace removed, so differently-joined text compares equal. */
-function squash(value: string): string {
-  return value.replace(/\s+/g, "").toLowerCase();
-}
-
 export async function clickInsideDialog(
   mcp: VortexMcpClient,
   dialogText: string,
   button: string | RegExp,
+  options: ClickInsideDialogOptions = {},
 ): Promise<string | undefined> {
   return withUiLock(mcp, async () => {
-    // Compared with whitespace removed, because the two sides are built
-    // differently: `activeDialogs` concatenates text nodes with no separator
-    // ("External ChangesMod files..."), while the snapshot joins names and text
-    // with spaces ("External Changes Mod files..."). A marker that straddles that
-    // boundary then never matches, the dialog is left unanswered, and it reads as
-    // a hang rather than as a lookup that failed.
-    const marker = squash(dialogText).slice(0, 20);
-
+    const seen: string[] = [];
     for (const selector of DIALOG_SELECTORS) {
       // `index` picks the nth *match*, which is not what `:nth-of-type(n)` means.
       // That counts position among same-tag siblings, so with two modals mounted
@@ -482,21 +530,51 @@ export async function clickInsideDialog(
         if (snap === undefined || snap.nodeCount === 0) break;
 
         // Only answer the dialog we actually matched on.
-        const flat = flatten(snap.tree);
-        const text = squash(flat.map((n) => `${n.name ?? ""} ${n.text ?? ""}`).join(" "));
-        if (!text.includes(marker)) continue;
-
+        const buttons = findNodes(snap, { role: "button", enabledOnly: false });
+        const label = `${selector}[${String(index)}]`;
+        if (!snapshotIsDialog(snap, dialogText)) {
+          seen.push(`${label}: another dialog (${(snap.rootText ?? "").slice(0, 60)})`);
+          continue;
+        }
         const target = findNodes(snap, { role: "button", name: button })[0];
-        if (target === undefined) continue;
+        if (target === undefined) {
+          seen.push(
+            `${label}: buttons ${buttons.map((b) => `${JSON.stringify(b.name ?? b.text ?? "")}${b.disabled === true ? " (disabled)" : ""}`).join(", ") || "none"}`,
+          );
+          continue;
+        }
 
-        await mcp.call("ui_click", { ref: target.ref });
+        const result = await mcp.call<{ name?: string; role?: string }>("ui_click", {
+          ref: target.ref,
+        });
+        const clickedName = result?.name ?? target.name ?? "";
+        if (!matchesButton(clickedName, button)) {
+          throw new DialogClickError(
+            `Clicked ${JSON.stringify(clickedName)} (${result?.role ?? "?"}) in ${label}, not ` +
+              `${String(button)}: the ref no longer pointed at the button that was found.`,
+          );
+        }
         return target.name ?? String(button);
       }
     }
-    return undefined;
+    if (options.required === false) return undefined;
+    throw new DialogClickError(
+      `No ${String(button)} button clicked in the dialog ${JSON.stringify(dialogText.slice(0, 80))}.` +
+        (seen.length > 0
+          ? `\n  Containers: ${seen.join("\n              ")}`
+          : "\n  No dialog container was open.") +
+        `\n  Snapshot it with ui_snapshot { selector: '[role="dialog"]', index } to see its buttons.`,
+    );
   });
 }
 
+function matchesButton(name: string, button: string | RegExp): boolean {
+  if (button instanceof RegExp) {
+    button.lastIndex = 0;
+    return button.test(name);
+  }
+  return name.trim().toLowerCase() === button.toLowerCase();
+}
 /**
  * The FOMOD installer's own dialog, and the bar holding its step actions.
  *

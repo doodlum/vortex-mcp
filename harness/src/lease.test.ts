@@ -165,6 +165,29 @@ describe("releaseLease", () => {
     });
   });
 
+  it("keeps a checkout locked while a Vortex runs from it, after its explicit hold is released", () => {
+    const checkout = checkoutResource(fs.mkdtempSync(path.join(dir, "checkout-")));
+    // `up` from the checkout recorded its Vortex; the owner then renewed and released.
+    acquireLease(checkout, "qa", { ...env, pid: 1001 });
+    addInstancePid(checkout, 1002, env);
+    acquireLease(checkout, "qa", { ...env, mode: "explicit", ttlMinutes: 60 });
+    alive.delete(1001);
+    expect(releaseLease(checkout, "qa", env)).toMatchObject({
+      released: true,
+      keptForRunning: true,
+      stillRunning: [1002],
+    });
+    expect(readLease(checkout, env)).toMatchObject({ live: true, lease: { mode: "implicit" } });
+    expect(() => acquireLease(checkout, "other", { ...env, pid: 1003 })).toThrow(/held by "qa"/);
+    // Once that Vortex exits the lease is stale, and --force always clears it.
+    alive.delete(1002);
+    expect(readLease(checkout, env)?.live).toBe(false);
+    addInstancePid(checkout, 1002, env);
+    alive.add(1002);
+    expect(releaseLease(checkout, "qa", { ...env, force: true }).keptForRunning).toBeUndefined();
+    expect(readLease(checkout, env)).toBeUndefined();
+  });
+
   it("lets anyone clear a stale lease", () => {
     acquireLease(INSTANCE_RESOURCE, "qa", { ...env, pid: 1001 });
     alive.delete(1001);

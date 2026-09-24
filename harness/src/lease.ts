@@ -417,6 +417,11 @@ export interface ReleaseResult {
   reason?: string;
   /** The Vortex processes still running under the released lease. */
   stillRunning: number[];
+  /**
+   * A checkout lease was not deleted because a Vortex still runs from it: the explicit hold
+   * ended, and the lease stays, held by that Vortex, until it exits.
+   */
+  keptForRunning?: boolean;
 }
 
 /**
@@ -445,8 +450,22 @@ export function releaseLease(
         stillRunning: [],
       };
     }
+    const running = lease.instancePids.filter(resolved.isAlive);
+    if (options.force !== true && running.length > 0 && lease.resource !== INSTANCE_RESOURCE) {
+      // A checkout Vortex is running from stays locked until that Vortex exits: releasing
+      // an explicit hold must not let someone rebuild or switch it underneath.
+      writeFile(file, {
+        ...lease,
+        mode: "implicit",
+        expiresAt: undefined,
+        boundPid: undefined,
+        holders: lease.holders.filter(resolved.isAlive),
+        instancePids: running,
+      });
+      return { released: true, stillRunning: running, keptForRunning: true };
+    }
     fs.rmSync(file, { force: true });
-    return { released: true, stillRunning: lease.instancePids.filter(resolved.isAlive) };
+    return { released: true, stillRunning: running };
   });
 }
 

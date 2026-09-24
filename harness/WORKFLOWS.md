@@ -76,7 +76,8 @@ A draft PR is not done until each of these is true and stated in its description
 
 1. **Reproduced and A/B-verified** in the real app, unpatched against patched. Use the same
    commit and the same `--fresh` baseline, with the relevant opt-in check or scenario.
-   Timings come from `--production` builds, so React runs as it does for users.
+   Timings come from `--production` builds, so React runs as it does for users; `up` fails
+   unless the renderer loaded production React (`automation_status.react`).
 2. **Vortex's full gate passes on the PR's exact commit.** Run `pnpm run verify`, and
    confirm the formatter left the tree clean. Stop the harness instance first, because
    verify rewrites `src/main/build`.

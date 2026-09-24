@@ -39,7 +39,7 @@ import {
 
 const config = loadConfig();
 // Drives the running instance: refuse while another owner holds it.
-claimInstanceLease(config, "ai:test:bethesda");
+claimInstanceLease(config, "ai:test:bethesda", {}, { attach: true });
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 

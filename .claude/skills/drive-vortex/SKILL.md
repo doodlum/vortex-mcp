@@ -47,6 +47,9 @@ any action that re-renders, snapshot again before acting.
   `requireActionable: false`, or use the harness's `realHover()` over CDP.
 - **`ui_press_key` never reaches an OS dialog.** Native file pickers and menus
   are out of reach; use `vortex_dispatch` instead.
+- **Click a dialog's button with `clickInsideDialog`** (harness `uiDriver.ts`), passing the
+  dialog's text from `ui_active_dialogs`. It throws, listing each dialog and its buttons, when
+  it clicks nothing; don't ignore its result with `{ required: false }` unless you poll.
 - **State and screen disagree, legitimately.** `vortex_query`/`list_mods` tell you
   what Vortex believes; `ui_snapshot` tells you what it is showing. A pending
   render or an active filter explains most differences.

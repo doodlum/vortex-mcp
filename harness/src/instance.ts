@@ -26,11 +26,21 @@ import { preparePreload, verifyPreload } from "./mainPreload";
 import {
   INSTANCE_RESOURCE,
   addInstancePid,
+  checkoutResource,
   holdLease,
   removeInstancePid,
   resolveOwner,
   type HoldResult,
+  type LeaseEnv,
 } from "./lease";
+import {
+  ProductionModeError,
+  bundleModeOf,
+  devBundleWarning,
+  productionErrorMessage,
+  productionProblem,
+  type ProductionStatus,
+} from "./productionMode";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,14 +51,104 @@ const execFileAsync = promisify(execFile);
  * replace another's instance. Free or stale: taken. Same owner: joined. Another live
  * owner: LeaseHeldError, naming the holder and how to wait or release.
  */
-export function claimInstanceLease(config: HarnessConfig, purpose: string): HoldResult {
-  return holdLease(INSTANCE_RESOURCE, resolveOwner(config.owner), {
-    purpose,
-    onReclaim: (state) =>
-      process.stderr.write(
-        `[lease] reclaimed a stale instance lease from "${state.lease.owner}" (${state.reason})\n`,
-      ),
-  });
+export function claimInstanceLease(
+  config: HarnessConfig,
+  purpose: string,
+  leaseEnv: LeaseEnv = {},
+  options: { attach?: boolean } = {},
+): HoldResult {
+  const owner = resolveOwner(config.owner);
+  const held: HoldResult[] = [];
+  const resources =
+    options.attach === true ? attachedLeaseResources(config) : instanceLeaseResources(config);
+  try {
+    // The instance first: a caller refused it has touched nothing else.
+    for (const resource of resources) {
+      held.push(
+        holdLease(resource, owner, {
+          ...leaseEnv,
+          purpose,
+          onReclaim: (state) =>
+            process.stderr.write(
+              `[lease] reclaimed a stale ${resource} lease from "${state.lease.owner}" (${state.reason})\n`,
+            ),
+        }),
+      );
+    }
+  } catch (err) {
+    for (const hold of held.toReversed()) hold.release();
+    throw err;
+  }
+  const first = held[0]!;
+  return { ...first, release: () => held.toReversed().forEach((hold) => hold.release()) };
+}
+
+/**
+ * The leases a running Vortex needs: the instance, and for a source build the checkout it
+ * runs from, so nobody rebuilds or switches that checkout underneath it (and a holder of
+ * the checkout lock who starts Vortex also takes the instance).
+ */
+export function instanceLeaseResources(config: HarnessConfig): string[] {
+  const checkout = config.target.kind === "dev" ? config.target.sourceDir : undefined;
+  return checkout === undefined
+    ? [INSTANCE_RESOURCE]
+    : [INSTANCE_RESOURCE, checkoutResource(checkout)];
+}
+
+/**
+ * The leases a command driving an already-running Vortex needs: the instance, and the
+ * checkout that Vortex was launched from (recorded in the cache at launch), not whatever
+ * checkout this command's own configuration would pick.
+ */
+export function attachedLeaseResources(config: HarnessConfig): string[] {
+  const running = runningInstance(config);
+  return running?.sourceDir === undefined
+    ? [INSTANCE_RESOURCE]
+    : [INSTANCE_RESOURCE, checkoutResource(running.sourceDir)];
+}
+
+interface InstanceRecord {
+  pid: number;
+  /** The Vortex checkout it runs from, for a source build. */
+  sourceDir?: string;
+}
+
+function instanceRecordFile(config: HarnessConfig): string {
+  return path.join(config.cacheDir, "instance.json");
+}
+
+function runningInstanceRecord(config: HarnessConfig): InstanceRecord | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(instanceRecordFile(config), "utf8")) as InstanceRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The harness Vortex this cache last launched, while it still runs. */
+export function runningInstance(config: HarnessConfig): InstanceRecord | undefined {
+  const record = runningInstanceRecord(config);
+  return record !== undefined && Number.isInteger(record.pid) && isAlive(record.pid)
+    ? record
+    : undefined;
+}
+
+/** Record a launched Vortex on every lease it needs, so they outlive the launching command. */
+export function recordLaunchedPid(
+  config: HarnessConfig,
+  pid: number,
+  leaseEnv: LeaseEnv = {},
+): void {
+  for (const resource of instanceLeaseResources(config)) addInstancePid(resource, pid, leaseEnv);
+}
+
+/** Forget a Vortex that has exited, on every lease it was recorded on. */
+export function forgetLaunchedPid(
+  config: HarnessConfig,
+  pid: number,
+  leaseEnv: LeaseEnv = {},
+): void {
+  for (const resource of instanceLeaseResources(config)) removeInstancePid(resource, pid, leaseEnv);
 }
 
 export function authCacheFile(config: HarnessConfig): string {
@@ -82,6 +182,9 @@ export interface VortexInstance {
  * discovery. The harness works around that by setting the game path explicitly
  * (see gameSetup.ts), which is faster than a scan and deterministic anyway.
  */
+/** Where the harness reads a Nexus API key from; stripped from Vortex's env unless in use. */
+export const API_KEY_VARIABLES = ["VORTEX_AI_NEXUS_API_KEY", "NEXUS_API_KEY"] as const;
+
 export function buildInstanceEnv(
   userDataDir: string,
   config: HarnessConfig,
@@ -109,13 +212,15 @@ export function buildInstanceEnv(
   // A source checkout only loads its extensions and devtools wiring under
   // development; a released build ignores this.
   if (config.target.kind === "dev") {
-    if (config.production) {
-      // Vortex's main process sets NODE_ENV=production itself when it is not development,
-      // as a released build does; an inherited value must not decide otherwise.
-      delete env.NODE_ENV;
-    } else {
-      env.NODE_ENV = "development";
-    }
+    // Set, never deleted: a plain `pnpm run build` inlines NODE_ENV="development" into
+    // main.cjs, so main never switches itself to production, and a renderer launched
+    // without NODE_ENV loads React's development build (see productionMode.ts).
+    env.NODE_ENV = config.production ? "production" : "development";
+  }
+  // Sandbox runs are local-only and withhold the API key; harness/.env has put it in this
+  // process's environment, and nothing a launched Vortex runs needs to inherit it.
+  if (config.apiKey === undefined || config.apiKey.trim() === "") {
+    for (const key of API_KEY_VARIABLES) delete env[key];
   }
 
   return env;
@@ -245,6 +350,13 @@ function recordPid(config: HarnessConfig, pid: number | undefined): void {
   try {
     fs.mkdirSync(config.cacheDir, { recursive: true });
     fs.writeFileSync(pidFile(config), String(pid));
+    const record: InstanceRecord = {
+      pid,
+      ...(config.target.kind === "dev" && config.target.sourceDir !== undefined
+        ? { sourceDir: config.target.sourceDir }
+        : {}),
+    };
+    fs.writeFileSync(instanceRecordFile(config), `${JSON.stringify(record)}\n`);
   } catch {
     // Best-effort bookkeeping; never fail a launch over it.
   }
@@ -303,8 +415,16 @@ export async function stopStaleInstance(config: HarnessConfig): Promise<boolean>
     }
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
+  const record = runningInstanceRecord(config);
   fs.rmSync(file, { force: true });
-  if (pid !== undefined && Number.isInteger(pid)) removeInstancePid(INSTANCE_RESOURCE, pid);
+  fs.rmSync(instanceRecordFile(config), { force: true });
+  if (pid !== undefined && Number.isInteger(pid)) {
+    forgetLaunchedPid(config, pid);
+    // It may have run from another checkout than this command's configuration names.
+    if (record?.sourceDir !== undefined) {
+      removeInstancePid(checkoutResource(record.sourceDir), pid);
+    }
+  }
   return stopped;
 }
 
@@ -313,6 +433,8 @@ export interface LaunchOptions {
   config: HarnessConfig;
   /** Pipe Vortex's stdio into this process. Off by default — it is very noisy. */
   inheritStdio?: boolean;
+  /** Progress and warnings, such as a development bundle under --production. */
+  onProgress?: (message: string) => void;
 }
 
 /**
@@ -369,7 +491,7 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
   child.unref();
   recordPid(config, child.pid);
   // A detached instance keeps the lease after this process exits, until `down`.
-  if (child.pid !== undefined) addInstancePid(INSTANCE_RESOURCE, child.pid);
+  if (child.pid !== undefined) recordLaunchedPid(config, child.pid);
 
   if (redirect !== undefined && preload !== undefined) {
     try {
@@ -422,12 +544,37 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
     readyController.abort();
   }
 
-  return {
+  const instance: VortexInstance = {
     process: child,
     userDataDir,
     mcp,
-    stop: (stopOptions = {}) => stopInstance(child, mcp, stopOptions),
+    stop: (stopOptions = {}) => stopInstance(child, mcp, { ...stopOptions, config }),
   };
+  await checkProductionMode(instance, config, options.onProgress);
+  return instance;
+}
+
+/**
+ * Under `--production`, refuse an instance whose renderer is not running production React,
+ * stopping it cleanly first. Also warn when the checkout is a development bundle.
+ */
+async function checkProductionMode(
+  instance: VortexInstance,
+  config: HarnessConfig,
+  report: ((message: string) => void) | undefined,
+): Promise<void> {
+  if (config.target.kind !== "dev" || !config.production) return;
+  const sourceDir = config.target.sourceDir;
+  if (sourceDir !== undefined && bundleModeOf(sourceDir) === "development") {
+    (report ?? ((message: string) => process.stderr.write(`${message}\n`)))(
+      `warning: ${devBundleWarning(sourceDir)}`,
+    );
+  }
+  const status = await instance.mcp.call<ProductionStatus>("automation_status");
+  const problem = productionProblem(status);
+  if (problem === undefined) return;
+  await instance.stop().catch(() => instance.stop({ force: true }).catch(() => undefined));
+  throw new ProductionModeError(productionErrorMessage(problem));
 }
 
 /**
@@ -440,7 +587,7 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
 export async function stopInstance(
   child: ChildProcess,
   mcp: VortexMcpClient,
-  options: { force?: boolean; timeoutMs?: number } = {},
+  options: { force?: boolean; timeoutMs?: number; config?: HarnessConfig } = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 20_000;
 
@@ -461,7 +608,10 @@ export async function stopInstance(
     if (!(await waitForExit(child, 5_000)))
       throw new Error("Vortex did not exit after forced shutdown.");
   }
-  if (child.pid !== undefined) removeInstancePid(INSTANCE_RESOURCE, child.pid);
+  if (child.pid !== undefined) {
+    if (options.config === undefined) removeInstancePid(INSTANCE_RESOURCE, child.pid);
+    else forgetLaunchedPid(options.config, child.pid);
+  }
 }
 
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {

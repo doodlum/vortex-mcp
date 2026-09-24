@@ -72,7 +72,7 @@ const MAX_CLIPPED_PX = 2;
 const TABLE = "mods";
 
 const config = loadConfig();
-claimInstanceLease(config, "ai:test:mods-scroll");
+claimInstanceLease(config, "ai:test:mods-scroll", {}, { attach: true });
 const mcp = new VortexMcpClient({ port: config.mcpPort, token: config.mcpToken });
 await mcp.waitUntilReady();
 const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });

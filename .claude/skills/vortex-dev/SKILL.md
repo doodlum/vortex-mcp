@@ -88,18 +88,22 @@ tests passed and only artifact post-processing failed.
 `pnpm run ai:preflight` lists what the change can reach before review does: member uses
 of touched class members, every consumer of the enclosing class or component (default
 imports, `controls/api.ts` and `util/api.ts` re-exports, extensions importing from
-`vortex-api`), and the readers of any class field whose assignment changed. Give `--test`
-paths from the checkout root or from `--project-dir`.
+`vortex-api`), the readers of any class field whose assignment changed, and every dispatch of
+an action whose reducer handler changed. Callers count when they are outside the diff's hunks,
+even in a changed file. Give `--test` paths from the checkout root or from `--project-dir`.
 
 Sandbox runs (`--sandbox`, `--bethesda-sandbox`) don't seed an API key, so local installs
-don't wait on Nexus lookups; `--with-api-key` if a test needs one. For a one-off script
+don't wait on Nexus lookups (the key is kept out of Vortex's environment too);
+`--with-api-key` if a test needs one. Running Vortex from a checkout locks that checkout for
+the run, so another agent's rebuild of it is refused. For a one-off script
 against the kit, `vortex-ai script <file.mts>` (see harness/AGENTS.md).
 
 ## Before calling a PR ready
 
 Follow "Before a Vortex pull request is ready" in `harness/WORKFLOWS.md`:
 
-- A/B in the real app with `--production` builds.
+- A/B in the real app with `--production` builds. `up` refuses to run unless the renderer
+  loaded production React; quote `automation_status.react` with the numbers.
 - `pnpm run verify` on the exact commit.
 - The E2E suite, against a master baseline.
 - An adversarial review by a separate agent, with its findings addressed.
