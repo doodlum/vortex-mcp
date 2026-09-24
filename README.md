@@ -131,6 +131,7 @@ Generated from the live server's actual `tools/list` response — see
 | `vortex_query`                | read   | Read Vortex state. Two modes: `selector` calls that named vortex-api selector as `(state, ...args)` (e.g. selector='activeProfileId', or se… |
 | `list_profiles`               | read   | List Vortex profiles (defaults to every game; pass gameId to filter to one), with name, active status, and mod counts — a formatted join vo… |
 | `collection_status`           | read   | Whether each installed collection is COMPLETE, by Vortex's own definition — the same check behind the Collections page's "Incomplete" badge. |
+| `collection_install_state`    | read   | Where a collection install is right now.                                                                                                     |
 | `list_mods`                   | read   | List mods for a game (defaults to the active game), with friendly names and enabled state for the active profile — a formatted join vortex_… |
 | `list_load_order`             | read   | List the current Gamebryo/LOOT plugin load order (.esp/.esm/.esl), sorted by index.                                                          |
 | `get_plugin_details`          | read   | Get the same rich per-plugin info Vortex's own Plugins tab shows — master list, LOOT messages/warnings, dirty-edit status (ITM/UDR), group,… |

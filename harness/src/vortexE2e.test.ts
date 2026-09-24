@@ -487,6 +487,24 @@ describe("runVortexE2e", { timeout: 30_000 }, () => {
     );
   });
 
+  it("compares against a baseline that PowerShell saved with a byte-order mark", async () => {
+    const options = {
+      checkout,
+      artifactDir,
+      patches: [patch],
+      runner: stubRunner({}),
+      leaseEnv,
+      handleSignals: false,
+    };
+    const first = await runVortexE2e(options);
+    // `Out-File -Encoding utf8` in Windows PowerShell 5.1: a BOM, then the JSON.
+    const baseline = path.join(root, "baseline.json");
+    fs.writeFileSync(baseline, `﻿${fs.readFileSync(first.reportFile ?? "", "utf8")}`);
+    const second = await runVortexE2e({ ...options, compare: baseline });
+    expect(second.compare?.regressions).toEqual([]);
+    expect(second.compare?.preExisting.length).toBeGreaterThan(0);
+  });
+
   it("refuses to patch a fixture with uncommitted changes and leaves it alone", async () => {
     fs.writeFileSync(path.join(checkout, FIXTURE), `${FIXTURE_BEFORE}// mine\n`);
     await expect(

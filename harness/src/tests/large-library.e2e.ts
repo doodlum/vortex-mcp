@@ -8,7 +8,10 @@
  * - clearing a name filter doesn't lock the UI up for seconds;
  * - scrolling to any depth shows rendered rows, never blank placeholders;
  * - installing mods one after another, as a collection does, doesn't freeze the UI;
- * - deploying with the Mods page open costs about what it costs from another page.
+ * - deploying with the modern Mods page costs about what it costs with the classic one,
+ *   whose table always virtualised (and, with --max-deploy-ms, stays under an absolute
+ *   budget). Comparing against another page proves nothing: the Mods page stays mounted
+ *   while hidden, so in production a deploy from Settings is just as slow.
  *
  * These fail on a stock 2.7.0, where the Mods page's sticky header leaves the
  * table's rows observed against a pane that no longer clips, so every row renders in
@@ -20,6 +23,8 @@
  *   --layout <l>    modern | classic (default modern, which is Vortex's default)
  *   --installs <n>  local installs to time (default 10; 0 skips)
  *   --no-deploy     skip the deploy comparison, which takes a few minutes
+ *   --max-deploy-ms <ms>  also fail when the Mods-page deploy takes longer than this
+ *   --settings-deploy     also time a deploy from Settings, for information
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -49,12 +54,14 @@ const count = Number(flag("mods") ?? 3000);
 const layout = flag("layout") ?? "modern";
 const deploy = !process.argv.includes("--no-deploy");
 const installs = Number(flag("installs") ?? 10);
+const maxDeployMs = flag("max-deploy-ms") === undefined ? undefined : Number(flag("max-deploy-ms"));
+const settingsDeploy = process.argv.includes("--settings-deploy");
 
 /** Rendered rows allowed: a screenful plus the observer's 360px margins, generously. */
 const MAX_RENDERED_ROWS = 200;
 /** How long clearing the filter may block the renderer. 2.6 took well under a second. */
 const MAX_CLEAR_BLOCKED_MS = 2_000;
-/** Deploying from the Mods page may cost this much more than from Settings. */
+/** Deploying with the modern Mods page may cost this much more than with the classic one. */
 const MAX_DEPLOY_RATIO = 1.6;
 /** Longest single main-thread task allowed while mods install. */
 const MAX_INSTALL_FREEZE_MS = 1_500;
@@ -261,16 +268,39 @@ try {
       return ms;
     };
 
-    const onMods = await timedFullDeploy("Mods page");
-    await openPage("Settings");
-    const elsewhere = await timedFullDeploy("Settings page");
-    result.deployMs = { onMods, elsewhere, ratio: Number((onMods / elsewhere).toFixed(2)) };
-    if (onMods > elsewhere * MAX_DEPLOY_RATIO) {
+    // The baseline is the same deploy in the classic layout, whose table pane scrolls itself
+    // and always virtualised. Not another page: the Mods page stays mounted while hidden, so
+    // in a production build a deploy from Settings is exactly as slow as one from Mods.
+    const onMods = await timedFullDeploy(`Mods page (${layout})`);
+    const deployMs: Record<string, unknown> = { onMods };
+    if (layout === "modern") {
+      await mcp.call("vortex_dispatch", { action: "setUseModernLayout", args: [false] });
+      await page.waitForTimeout(3_000);
+      await openPage("Mods");
+      await page.waitForTimeout(3_000);
+      const classic = await timedFullDeploy("Mods page (classic baseline)");
+      await mcp.call("vortex_dispatch", { action: "setUseModernLayout", args: [true] });
+      await page.waitForTimeout(3_000);
+      deployMs.classicBaseline = classic;
+      deployMs.ratio = Number((onMods / classic).toFixed(2));
+      if (onMods > classic * MAX_DEPLOY_RATIO) {
+        failures.push(
+          `deploying with the modern Mods page took ${String(onMods)}ms against ` +
+            `${String(classic)}ms with the classic one (allowed ${String(MAX_DEPLOY_RATIO)}x)`,
+        );
+      }
+    }
+    if (settingsDeploy) {
+      await openPage("Settings");
+      deployMs.fromSettings = await timedFullDeploy("Settings page");
+    }
+    if (maxDeployMs !== undefined && onMods > maxDeployMs) {
       failures.push(
-        `deploying from the Mods page took ${String(onMods)}ms against ${String(elsewhere)}ms ` +
-          `from Settings (allowed ${String(MAX_DEPLOY_RATIO)}x)`,
+        `deploying ${String(count)} mods from the Mods page took ${String(onMods)}ms ` +
+          `(allowed ${String(maxDeployMs)}ms)`,
       );
     }
+    result.deployMs = deployMs;
   }
 } finally {
   await mcp

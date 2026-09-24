@@ -564,7 +564,39 @@ const LISTENER_SPECS: Record<
       "when Vortex needs mod metadata for this repository; the real API expects the callback to " +
       "resolve to lookup results, so ours always resolves [] (only args are captured here).",
   },
+  onEvent: {
+    returns: "void",
+    hint:
+      'eventName: string, "__CALLBACK__" — not an api method: subscribes with api.events.on, ' +
+      "so it sees plain events.emit notifications that onAsync never does (e.g. " +
+      "collection-postprocess-complete, did-install-mod, did-deploy). Fires with the event's own " +
+      "args, made JSON-safe. Registering the same event again returns the existing listenerId, " +
+      "so pass a previous lastSeq as `since` rather than expecting a fresh buffer.",
+  },
 };
+
+/** One listener per event for onEvent: events.on has no unregister here, so reuse it. */
+const eventListeners = new Map<string, string>();
+
+/** Event args as JSON can carry them: functions dropped, cycles and depth cut off. */
+export function jsonSafe(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return value;
+  if (value === undefined || typeof value === "function" || typeof value === "symbol")
+    return undefined;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[circular]";
+  if (depth >= 6) return "[depth]";
+  seen.add(value);
+  if (value instanceof Error) return { name: value.name, message: value.message };
+  if (Array.isArray(value)) return value.slice(0, 200).map((v) => jsonSafe(v, depth + 1, seen));
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value).slice(0, 200)) {
+    const safe = jsonSafe(v, depth + 1, seen);
+    if (safe !== undefined) out[key] = safe;
+  }
+  return out;
+}
 
 const MAX_CONCURRENT_LISTENERS = 20;
 const MAX_BUFFER_ENTRIES_PER_LISTENER = 500;
@@ -600,6 +632,14 @@ function registerListener(
         "at the callback position — see vortex_describe's listenerHints.",
     );
   }
+  const eventName = name === "onEvent" ? args[callbackIndex === 0 ? 1 : 0] : undefined;
+  if (name === "onEvent") {
+    if (typeof eventName !== "string" || eventName === "") {
+      throw new Error('onEvent needs the event name first: args=["<event>", "__CALLBACK__"].');
+    }
+    const existing = eventListeners.get(eventName);
+    if (existing !== undefined && listeners.has(existing)) return { listenerId: existing };
+  }
   if (listeners.size >= MAX_CONCURRENT_LISTENERS) {
     throw new Error(
       `Too many active listeners (${MAX_CONCURRENT_LISTENERS} max) — none of these apiMethods ` +
@@ -612,7 +652,13 @@ function registerListener(
   listeners.set(listenerId, record);
 
   const callback = (...callArgs: unknown[]): unknown => {
-    record.buffer.push({ seq: record.nextSeq++, args: callArgs, receivedAt: Date.now() });
+    record.buffer.push({
+      seq: record.nextSeq++,
+      // Plain events carry live objects (mods, errors, callbacks); poll_listener has to
+      // serialise them, so keep only what JSON can hold.
+      args: name === "onEvent" ? (jsonSafe(callArgs) as unknown[]) : callArgs,
+      receivedAt: Date.now(),
+    });
     if (record.buffer.length > MAX_BUFFER_ENTRIES_PER_LISTENER) {
       record.buffer.shift();
     }
@@ -625,6 +671,12 @@ function registerListener(
         return undefined;
     }
   };
+
+  if (name === "onEvent" && typeof eventName === "string") {
+    api.events.on(eventName, callback as (...eventArgs: unknown[]) => void);
+    eventListeners.set(eventName, listenerId);
+    return { listenerId };
+  }
 
   const realArgs = [...args];
   realArgs[callbackIndex] = callback;

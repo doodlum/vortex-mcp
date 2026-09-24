@@ -50,6 +50,21 @@ any action that re-renders, snapshot again before acting.
 - **State and screen disagree, legitimately.** `vortex_query`/`list_mods` tell you
   what Vortex believes; `ui_snapshot` tells you what it is showing. A pending
   render or an active filter explains most differences.
+- **Collections: ask where the install is.** `collection_install_state` gives the
+  install driver's step (query = Install Now, review = review screen), the session's
+  members by status and the open collection dialogs. Poll it rather than guessing
+  from dialogs.
+- **Offline collections for tests.** `installOfflineCollection` in
+  `harness/src/offlineCollection.ts` installs a bundled collection with no account,
+  from a registered download, and can make the game-version prompt appear
+  (`gameVersions`).
+- **Scrolling measurements.** Use `harness/src/tableProbes.ts` (real wheel input,
+  rows on screen, dropdown direction) or `ai:test:mods-scroll`, not hand-written
+  page scripts.
+- **Diagnostics in the renderer.** `vortex-ai eval --expr "<js>"` evaluates in a
+  harness instance only. It is for looking; anything a test relies on belongs in a
+  tool or helper.
+- **PowerShell:** quote comma lists (`--viewports "1024x720,1280x720"`).
 
 ## Screenshots
 

@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, ConfigError, resolveTarget } from "../config";
+import { readJsonFile } from "../jsonFile";
 import { bootstrap } from "../bootstrap";
 import { authCacheFile, stopStaleInstance } from "../instance";
 import { installCollection } from "../collections";
@@ -45,11 +46,11 @@ try {
     path.join(gamePath, "Mods", "vortex.deployment.json"),
     path.join(gamePath, "vortex.deployment.SMAPI.json"),
   ]) {
-    const manifest = JSON.parse(fs.readFileSync(file, "utf8")) as {
+    const manifest = readJsonFile<{
       targetPath: string;
       stagingPath: string;
       files: { target?: string; relPath: string; source: string }[];
-    };
+    }>(file);
     for (const entry of manifest.files) {
       const target = path.join(manifest.targetPath, entry.target ?? "", entry.relPath);
       const source = path.join(manifest.stagingPath, entry.source, entry.relPath);

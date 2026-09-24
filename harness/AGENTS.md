@@ -136,6 +136,12 @@ pnpm run ai -- up --installed --sandbox --rebuild-snapshot
 snapshot; an unrelated working profile is never silently reused. Vortex writes
 its own state database; the harness does not edit its storage format.
 
+`--sandbox` and `--bethesda-sandbox` runs are local-only, so they do **not** seed the
+`harness/.env` API key (`up` says so). With a key, Vortex looks every locally installed
+archive up on Nexus, and for a fixture archive that lookup only ends at its 60 s timeout, so
+each install looks hung. `--with-api-key` seeds it anyway. The key is part of the snapshot key,
+so the first start after changing this is cold; pass the same choice to every command.
+
 `down` waits for clean shutdown. An unresponsive instance is reported and left
 intact; the harness does not blindly kill a recorded PID and then certify a
 possibly unflushed profile. Close the identified harness window before retrying.
@@ -208,8 +214,39 @@ pnpm run ai -- screenshot --label before
 ```
 
 `tools --json` includes live input schemas. `call <tool> --args-file <file>` accepts
-a JSON object and avoids shell-quoting problems. `--args <json>` works when the
-shell preserves JSON quoting. Keep credential-bearing argument files private.
+a JSON object and avoids shell-quoting problems (a byte-order mark from PowerShell is fine).
+`--args <json>` works when the shell preserves JSON quoting. Keep credential-bearing argument
+files private.
+
+### Scratch scripts and renderer diagnostics
+
+`vortex-ai script <file.mts> [its args...]` runs a scratch script with the kit's tsx, holding
+the instance lease (`--owner`, `--wait <minutes>`), with the command's instance settings in the
+environment (cache dir, ports, token). Everything after the file goes to the script. Outside
+this repo:
+
+- name it `.mts`: tsx treats a `.ts` file with no ESM `package.json` above it as CommonJS,
+  where top-level `await` fails;
+- import the kit by `file://` URL, because on Windows `C:\…` in an import is read as a URL
+  scheme, and bare names (`fflate`) do not resolve from outside the repo. One import gives
+  everything: `harness/src/kit.ts` re-exports the harness modules and the zip helpers, and
+  `script` puts its URL in `VORTEX_AI_KIT`:
+
+```ts
+const kit: typeof import("file:///C:/dev/vortex-mcp/harness/src/kit.ts") = await import(
+  process.env.VORTEX_AI_KIT!
+);
+const mcp = kit.clientFor(kit.loadConfig());
+```
+
+A script that proves useful becomes a harness module with a test, not a file passed around.
+
+`vortex-ai eval --expr "<expression>"` (or `eval <file.js>`) evaluates JavaScript in a harness
+instance's renderer over CDP and prints the result as JSON; a promise is awaited, so use an
+async IIFE for statements. It is for diagnostics: a component's props, a computed style, what a
+private object holds. It refuses unless the MCP server reports a profile inside this cache and
+the renderer reached over CDP reports the same one, so it never touches the operator's Vortex.
+Anything a test or workflow relies on belongs in an extension tool or harness helper instead.
 
 The UI loop is snapshot, act, wait, inspect. Refs are opaque and expire on the
 next snapshot, renderer reload, or element removal. Never reuse a stale ref.
@@ -234,6 +271,7 @@ clients still need to coordinate UI actions.
 | `ui_read_console`                                | Renderer console/errors since a sequence number                                           |
 | `nexus_auth_status`                              | Credential-presence booleans, never credentials                                           |
 | `automation_status`                              | Isolated profile path and renderer lifetime ID                                            |
+| `collection_install_state`                       | Collection InstallDriver step, install session and collection dialogs (see below)         |
 | `vortex_query`, `vortex_dispatch`                | Inspect state, invoke documented actions/events                                           |
 
 Harness `clickByName`/`fillByName` use exact case-insensitive strings, or explicit
@@ -289,8 +327,13 @@ running before the command.
 ```powershell
 pnpm run ci
 pnpm run ai:test
-pnpm run ai -- responsive --screenshots --viewports 1024x720,1280x720,1280x1000,1920x1080
+pnpm run ai -- responsive --screenshots --viewports "1024x720,1280x720,1280x1000,1920x1080"
 ```
+
+In PowerShell, quote the viewport list (`--viewports "1024x720,1280x720"`): unquoted, `a,b` is
+an array, and through pnpm's `pnpm.ps1` shim it arrives as one argument with a space
+(`"1024x720 1280x720"`). `responsive` accepts that too, but quote it anyway, and quote any
+other comma-separated value.
 
 CI runs typechecking, lint, formatting checks, unit tests, and a build. The separate
 Playwright suite drives real Vortex through MCP and asserts through Playwright or
@@ -310,17 +353,35 @@ checkout (default `.vortex-src`, or `--checkout <dir>`) and diffs the committed
 `HEAD` against its merge-base with `--base` (default `upstream/master`). Each check
 prints PASS, WARN, FAIL or SKIP with file:line detail; it exits 1 on any FAIL.
 
-| Check                    | Result                                                                                                                                                                                                                                        |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Size                     | WARN above 400 changed lines or 10 files (Vortex `CONTRIBUTING.md`), ignoring lockfiles, `etc/*.api.md`, snapshots and build output                                                                                                           |
-| Callers outside the diff | WARN, as a to-review list: `git grep -w` hits in `src/` and `extensions/`, outside the diff, for each exported or class-member declaration the diff touches. Test hits are listed separately; comment-only hits and generic names are skipped |
-| Revert check             | FAIL unless the tests pass on the branch and fail with every non-test changed file restored to the base                                                                                                                                       |
-| Measurements in comments | WARN for timing or size figures in added comments                                                                                                                                                                                             |
-| PR description           | With `--pr <number-or-url>`: FAIL for a non-Conventional or over-72-character title, a missing section, "Not run", or no head sha in the body                                                                                                 |
+| Check                    | Result                                                                                                                                                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Size                     | WARN above 400 changed lines or 10 files (Vortex `CONTRIBUTING.md`), ignoring lockfiles, `etc/*.api.md`, snapshots and build output                                                                                             |
+| Callers outside the diff | WARN, as a to-review list: hits in `src/` and `extensions/`, outside the diff, for each exported or class-member declaration the diff touches. Test hits are listed separately; comment-only hits and generic names are skipped |
+| Readers of changed state | WARN: for each class field whose assignment the diff adds or removes (`this.mStep = …`), the other lines of the file that read it, by member, and the uses outside the diff of any getter that exposes it (`driver.step`)       |
+| Revert check             | FAIL unless the tests pass on the branch and fail with every non-test changed file restored to the base                                                                                                                         |
+| Measurements in comments | WARN for timing or size figures in added comments                                                                                                                                                                               |
+| PR description           | With `--pr <number-or-url>`: FAIL for a non-Conventional or over-72-character title, a missing section, "Not run", or no head sha in the body                                                                                   |
+
+How callers are found:
+
+- An exported function, component or type: `git grep -w` for its name.
+- A class member: only **member uses**, `x.name`, `this.name`, `x?.name`, or a JSX attribute
+  `name={…}`. Bare words are locals and imports. A file that declares its own member of that
+  name belongs to another class, so its declaration and `this.name` uses are left out. The
+  report says how many hits were left out.
+- The class or component itself. Every consumer of it can notice a change to any member, so
+  the report lists them: references by name and, when it is the file's default export
+  (`export default translate(…)(SuperTable)`), every module importing that default, including
+  `@/` aliases. A barrel that re-exports it (`controls/api.ts`, `util/api.ts`) is followed to
+  the files importing that name from the barrel or from `@nexusmods/vortex-api`, and for
+  `util`-style barrels to `util.name` uses.
 
 The revert check runs `pnpm exec vitest run` on `--test <path>` (repeatable), or on the
 test files the diff adds or changes, in each test's nearest `package.json` directory
-(`--project-dir <dir>` overrides). `--revert <path>` (repeatable) reverts only those
+(`--project-dir <dir>` overrides). A `--test` path may be absolute, relative to the checkout
+root, or relative to `--project-dir`; the first that exists is used, and one that exists in
+neither place fails the check. vitest is then given paths relative to the directory it runs
+in, which the report states. `--revert <path>` (repeatable) reverts only those
 files, which is how to show a test fails when just the wiring is reverted. It is the only
 check that writes to the checkout. It refuses on uncommitted changes, keeps a backup in
 the temp directory, restores the branch's exact bytes on success, failure, throw and
@@ -330,9 +391,13 @@ branch; the revert check is then skipped. `--json` prints the full report, inclu
 every caller hit.
 
 Limits: symbols come from a regex and indentation heuristic over the declarations
-enclosing each changed line (see `touchedSymbols` in `prPreflight.ts`). Re-exports
-under another name, object-literal methods, and callers that use a different name are
-missed. A member of a class nothing outside the diff names is not searched. A test that
+enclosing each changed line (see `touchedSymbols` in `prPreflight.ts`). Imports are
+parsed with a regex too (`parseImports`). Object-literal methods, callers that use a
+different name, and `require()` imports are missed. A subclass using an inherited member
+as `this.name` is left out when it also declares a member of that name. A member of a
+class nothing outside the diff reaches (by name, import or barrel) is not searched. Member
+uses match any object with a member of that name (`props.step` for a `step` getter), so the
+list still needs reading. State readers are found only in the field's own file. A test that
 fails after the revert only because a new export is missing gets a WARN, not a PASS.
 
 ### Vortex's own E2E suite
@@ -405,13 +470,65 @@ tag from source.
 
 `--isolate-user-folders` gives any game the same private folders.
 
-`offlineCollection.ts` builds collection archives whose members are bundled inside them.
-`installOfflineCollection` then drives Install Now → review → Done, with no Nexus or
-account.
+### Offline collections
+
+`offlineCollection.ts` builds collection archives whose members are bundled inside them, and
+installs them with no Nexus or account:
+
+- **Manifest.** Members can be `optional` (a `recommends` rule). The manifest lists the members'
+  plugins (`plugins: [{ name, enabled }]`, by default every root `.esp/.esm/.esl`, enabled), as
+  Vortex's exporter does for Bethesda games. Without that list the gamebryo collection parser
+  throws and postprocessing stops before plugin enabling (KNOWLEDGE.md).
+- **Install from a download.** `addOfflineCollection` copies the archive into the game's
+  download folder, registers it with `addLocalDownload` and installs it with
+  `start-install-download`, as Vortex does with a downloaded collection. The collection mod then
+  has an `archiveId`, so revision information is read from the download. `via: "file"` keeps the
+  old `start-install <path>`, which leaves `archiveId` null.
+- **The game-version prompt.** `gameVersions: [MISMATCHED_GAME_VERSION]` stamps
+  `nexus.ids.revisionId` and `nexus.revisionInfo.gameVersions` on that download
+  (`setRevisionInfo`). The driver then shows "Game version mismatch" at Install Now.
+  `answerGameVersionPrompt(mcp, "continue" | "cancel")` answers it, or
+  `installOfflineCollection(…, { gameVersions, gameVersionAnswer })` does it for you. This is for
+  that prompt only: with a revision id set, the driver also records a pending vote for it.
+- **`installOfflineCollection`** drives Install Now → prompt → review and closes the review. It
+  skips optional members (No Thanks) or, with `optionals: "install"`, clicks Install optional
+  mods first. It fails at once on an "incomplete" review unless `allowIncomplete`. It returns
+  `postprocessed`: whether `collection-postprocess-complete` fired for this collection, seen
+  through the extension's `onEvent` listener.
+
+Bundled optional members that are then installed have stalled until Vortex's stall watchdog
+fired (5 min) in QA. That is not diagnosed yet; the default skips them.
 
 `pnpm run ai:test:bethesda` checks Missing Masters on the fake game: a plugin with an absent
 master must be flagged and reported, before and after a completed offline collection.
-Releases up to master of September 2026 fail the second half (Nexus-Mods/Vortex#24282).
+Releases up to master of September 2026 fail the second half (Nexus-Mods/Vortex#24282). On the
+way it checks the collection's finalize path: `collection-postprocess-complete` fired, and the
+manifest's plugin list was applied (Alpha enabled, Beta disabled). A third scenario installs a
+collection whose revision excludes the installed game version: the prompt must appear and
+Continue must complete the install.
+
+### Where a collection install is
+
+Vortex does not expose its collection `InstallDriver`; `registerAPI` only offers the install
+session. `collection_install_state` (read tool) reports:
+
+- `driver`: `step` (`prepare`, `changelog`, `query` = Install Now shown, `start` = continues on
+  the next update, `disclaimer`, `installing`, `review`), `installDone`, `postprocessing`, the
+  collection id and name. It is read from the `driver` prop Vortex passes its always-mounted
+  collection dialogs, by walking React's fiber tree. That is a private shape. When a build stops
+  passing the prop, `driver.found` is false with the reason.
+- `session`: `state.session.collections.activeSession` summarised, with members by status and
+  type and the ones outstanding.
+- `dialogs`: the open modals, tagged with their step (`query`, `game-version-prompt`,
+  `review`).
+
+`vortex-ai call collection_install_state` from a shell. It is cheap enough to poll.
+
+To wait on a plain Vortex event (`events.emit`, which `onAsync` never sees), use
+`vortex_dispatch` with `action: "onEvent", args: ["<event>", "__CALLBACK__"]`, then
+`poll_listener`. There is one listener per event name: registering it again returns the same
+`listenerId`, so read from a `lastSeq` you took first (`watchEvent` in `offlineCollection.ts`
+does).
 
 ### Measuring renderer, main process and checks
 
@@ -447,11 +564,12 @@ driver already poll this way.
 More opt-in performance checks. Each writes JSON evidence (and, where noted, a `.cpuprofile`)
 under `harness/.artifacts`:
 
-| Command                                                   | Needs          | What it measures and fails on                                                                                                                                                                                                                |
-| --------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s. |
-| `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle.                                                                             |
-| `ai:test:download-churn -- --downloads <n> --seconds <s>` | any            | Throttled downloads from a local server (`downloadServer.ts`). Reports persist:diff per minute and per hive, slow writes, dispatches and long tasks. A measurement; it has no pass/fail.                                                     |
+| Command                                                   | Needs          | What it measures and fails on                                                                                                                                                                                                                                                 |
+| --------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s.                                  |
+| `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle.                                                                                                              |
+| `ai:test:download-churn -- --downloads <n> --seconds <s>` | any            | Throttled downloads from a local server (`downloadServer.ts`). Reports persist:diff per minute and per hive, slow writes, dispatches and long tasks. A measurement; it has no pass/fail.                                                                                      |
+| `ai:test:mods-scroll -- --mods <n> [--conflicts <pairs>]` | sandbox        | The Mods table under real wheel input: rows on arrival, longest frame gap during a flick, blank rows after it settles, dropdown direction and clipping at both edges, noShrink Status width, rows left rendered after a scroll-through, the conflict editor's virtualisation. |
 
 `pnpm run ai:test:large-library` is an opt-in performance check against a running
 sandbox instance, for reports that only large mod lists reproduce. It seeds
@@ -463,7 +581,13 @@ fails when:
 - clearing its name filter blocks the renderer for over 2 s;
 - any scroll depth shows blank placeholder rows;
 - installing 10 mods in a row runs a single main-thread task over 1.5 s;
-- a deploy with the Mods page open takes over 1.6× one from Settings.
+- a deploy with the modern Mods page takes over 1.6× the same deploy with the classic one,
+  whose table always virtualised; with `--max-deploy-ms <ms>`, a Mods-page deploy over that.
+
+The baseline is the classic layout, not another page. The Mods page stays mounted while hidden,
+so in a production build a deploy from Settings is exactly as slow as one from the Mods page;
+a Mods-against-Settings ratio stays near 1 on both a broken and a fixed build.
+`--settings-deploy` still times one, for information.
 
 Deploy times only count after it checks the purge emptied the fixture's files and the
 deploy linked all of them. Flags: `--mods <n>`, `--layout modern|classic`,
@@ -472,6 +596,25 @@ deploy linked all of them. Flags: `--mods <n>`, `--layout modern|classic`,
 KNOWLEDGE.md), so it is outside the stock-compatible `ai:test`. Run it against a
 source build with `up --dev-dir <checkout> --sandbox`, and against `--installed` for
 a baseline. Keep other CPU-heavy work (builds) off the machine while it measures.
+
+`pnpm run ai:test:mods-scroll` measures the Mods table while scrolling, on a seeded library of
+`--mods <n>` (default 3,000), with real wheel input (`page.mouse.wheel` over CDP). It fails when:
+
+- more than 200 rows render on arrival;
+- a 40-tick flick has a frame gap over `--max-frame-gap` ms (default 300);
+- blank placeholder rows remain on screen 1 s after the wheel stops;
+- a row dropdown at the top or bottom edge of the scroll area is cut off by more than 2 px;
+- the Status column, which may widen when a band of disabled mods scrolls into view, narrows
+  again once it scrolls away (noShrink);
+- with `--conflicts <pairs>`, the conflict editor opened on 2 × pairs conflicting mods renders
+  more than 200 entries in full on open, after typing in its filter, or after clearing it.
+
+It also scrolls through the whole list and reports how many rows stay rendered and what
+clearing the filter then costs. Stock Vortex never unmounts a row it has shown (KNOWLEDGE.md), so
+that is a warning, and fails only with `--max-accumulated <n>`. `--no-scroll-through` skips it.
+The helpers are in `tableProbes.ts` (`rowsOnScreen`, `wheelScroll`, `jumpAndSample`,
+`probeRowDropdown`, `columnWidths`, `seedConflictPairs`, `conflictEditorCounts`) for use on any
+SuperTable (`#table-<id>`).
 
 `pnpm run ai:test:zoom -- --signed-out` starts a separate anonymous profile on
 the next MCP/CDP ports, checks the same controls without an account, and stops it.
@@ -522,10 +665,11 @@ live schemas with `tools --json` after changing tool registration.
 | `VORTEX_AI_ARTIFACT_DIR`                   | Screenshots/reports; default `harness/.artifacts`    |
 | `VORTEX_MCP_PORT`, `VORTEX_AI_CDP_PORT`    | MCP/CDP; default 3701/9222                           |
 | `VORTEX_MCP_TOKEN`                         | Bearer token shared by harness and MCP client        |
-| `VORTEX_AI_NEXUS_API_KEY`                  | Optional legacy Nexus API key                        |
+| `VORTEX_AI_NEXUS_API_KEY`                  | Optional legacy key; sandboxes need `--with-api-key` |
 | `VORTEX_AI_HEADLESS`                       | Hide window; screenshots may be blank                |
 | `VORTEX_AI_OWNER`                          | Lease owner when `--owner` is absent; `anonymous`    |
 | `VORTEX_AI_LEASE_DIR`                      | Lease files; default `~/.vortex-ai/leases`           |
+| `VORTEX_AI_KIT`                            | Set by `script`: the `file://` URL of `kit.ts`       |
 
 Run `doctor` with the same setup flags when prerequisites are unclear. No UI write
 tools means Vortex started without a token. HTTP 403 means a token/host/origin

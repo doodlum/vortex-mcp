@@ -10,15 +10,25 @@
  * is also how you tell a broken harness from a broken MCP config.
  */
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { ANONYMOUS, bootstrap, liveDir, readMarker, snapshotDir } from "./bootstrap";
-import { ConfigError, loadConfig, resolveTargetSafely, type HarnessConfig } from "./config";
+import {
+  ConfigError,
+  REPO_ROOT,
+  loadConfig,
+  resolveTargetSafely,
+  type HarnessConfig,
+} from "./config";
 import { runDoctor, formatDoctorReport } from "./doctor";
+import { parseJson, stripBom } from "./jsonFile";
+import { RendererEvalRefused, evalInRenderer } from "./rendererEval";
 import { watchAndReload } from "./hotReload";
 import { ensureExtensionBuilt, stopStaleInstance } from "./instance";
 import { VortexMcpClient } from "./mcpClient";
-import { formatReport, runResponsiveSweep } from "./responsive";
+import { formatReport, runResponsiveSweep, viewportList } from "./responsive";
 import { captureScreenshot } from "./cdp";
 import { startRecording } from "./recording";
 import {
@@ -29,7 +39,7 @@ import {
 import { PreflightError, formatPreflightReport, runPreflight } from "./prPreflight";
 import { captureLogin } from "./bootstrap";
 import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
-import { sandboxConfig } from "./sandbox";
+import { localOnlyConfig, sandboxConfig } from "./sandbox";
 import { bethesdaSandboxConfig, isolateUserFolders } from "./bethesdaSandbox";
 import { installLocalMod } from "./localMod";
 import { installCollection } from "./collections";
@@ -114,12 +124,18 @@ function parseArgs(argv: string[]): ParsedArgs {
     "allow-incomplete",
     "skip-revert",
     "force",
+    "with-api-key",
   ]);
 
   const passthrough: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === undefined) continue;
+    // `script <file> [args...]`: everything after the file is the script's own.
+    if (command === "script" && positional.length === 1) {
+      passthrough.push(...(arg === "--" ? rest.slice(i + 1) : rest.slice(i)));
+      break;
+    }
     if (arg === "--") {
       // `pnpm run ai:<script> -- --flag` forwards its separator after the command; only
       // `lease run` gives it a meaning.
@@ -179,8 +195,11 @@ function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
   if (flags.sandbox === true && flags["bethesda-sandbox"] === true) {
     throw new ConfigError("Choose one of --sandbox and --bethesda-sandbox.");
   }
-  if (flags["bethesda-sandbox"] === true) return bethesdaSandboxConfig(config);
-  const chosen = flags.sandbox === true ? sandboxConfig(config) : config;
+  const keepKey = flags["with-api-key"] === true;
+  if (flags["bethesda-sandbox"] === true) {
+    return localOnlyConfig(bethesdaSandboxConfig(config), keepKey);
+  }
+  const chosen = flags.sandbox === true ? localOnlyConfig(sandboxConfig(config), keepKey) : config;
   return flags["isolate-user-folders"] === true ? isolateUserFolders(chosen) : chosen;
 }
 
@@ -283,6 +302,12 @@ Driving a running instance
   fill --ref <ref> --value <text>
   press --key <Enter>     DOM key events; native typing/defaults require CDP
   screenshot             Save PNG; --label <name>, --full-page
+  eval --expr "<js>"     Diagnostics only: evaluate JavaScript in a harness instance's
+    eval <file.js>       renderer over CDP and print the JSON result (refuses any Vortex
+                         whose profile is not in this cache). Promises are awaited.
+  script <file.mts> [args...]
+                         Run a scratch script with the kit's tsx under the instance lease
+                         (--wait <min>); VORTEX_AI_KIT holds the import URL of harness/src/kit.ts
   record                 Save WebM; --ffmpeg <path> --seconds <1-60> --label <name>
   install <archive>      Install local ZIP/7z through Vortex; no account needed
   collection <url>       Install exact Nexus collection/revision using OAuth
@@ -294,7 +319,7 @@ Driving a running instance
 
 Testing and iteration
   responsive             Scan width AND height changes; persist JSON evidence
-    --viewports 1024x720,1280x720,1280x1080,1920x1080
+    --viewports 1024x720,1280x720,1280x1080,1920x1080   (quote the list in PowerShell)
     --screenshots        Save PNG per viewport
     --strict             Nonzero exit for viewport-dependent findings or overflow
   watch                  Reload after extension/renderer rebuilds
@@ -308,6 +333,8 @@ Target and isolation (repeat the same flags for all commands)
   --sandbox              Disposable test game for local install/deploy tests
   --bethesda-sandbox     Fake Fallout 4 (plugins, LOOT, masters) with private
                          LocalAppData and Documents; no game install needed
+  --with-api-key         Seed harness/.env's API key into a sandbox profile too (off by
+                         default: with a key, every local install waits on a Nexus lookup)
   --isolate-user-folders Give any game private LocalAppData and Documents folders
   --game <id> --game-path <dir>   Real game integration; use a disposable copy
   --cache-dir <dir>      Profiles and private OAuth cache
@@ -426,12 +453,12 @@ async function main(): Promise<number> {
         throw new ConfigError("call needs a tool name; run tools --json to inspect schemas.");
       const raw =
         typeof flags["args-file"] === "string"
-          ? // Windows PowerShell 5.1 writes UTF-8 with a byte-order mark, which JSON.parse rejects
-            fs.readFileSync(flags["args-file"], "utf8").replace(/^﻿/, "")
+          ? fs.readFileSync(flags["args-file"], "utf8")
           : typeof flags.args === "string"
             ? flags.args
             : "{}";
-      const args: unknown = JSON.parse(raw);
+      // Windows PowerShell 5.1 writes UTF-8 with a byte-order mark, which JSON.parse rejects.
+      const args: unknown = parseJson(raw);
       if (args === null || typeof args !== "object" || Array.isArray(args))
         throw new ConfigError("Tool arguments must be a JSON object.");
       const mcp = await requireRunning(config);
@@ -558,7 +585,7 @@ async function main(): Promise<number> {
     case "responsive": {
       const mcp = await requireRunning(config);
       const report = await runResponsiveSweep(mcp, config, {
-        viewports: parseViewports(flags.viewports),
+        viewports: parseViewports(viewportList(flags.viewports, positional)),
         screenshots: flags.screenshots === true,
         label: typeof flags.label === "string" ? flags.label : undefined,
       });
@@ -777,6 +804,73 @@ async function main(): Promise<number> {
       return passed === runs ? 0 : 1;
     }
 
+    case "eval": {
+      const file = positional[0];
+      const source =
+        typeof flags.expr === "string"
+          ? flags.expr
+          : file !== undefined
+            ? stripBom(fs.readFileSync(file, "utf8"))
+            : undefined;
+      if (source === undefined || source.trim() === "") {
+        throw new ConfigError(
+          'eval needs --expr "<expression>" or a file holding one, e.g.\n' +
+            '  vortex-ai eval --expr "document.title"\n' +
+            "  vortex-ai eval probe.js      (an async IIFE for statements)",
+        );
+      }
+      try {
+        const result = await evalInRenderer(config, source);
+        log(JSON.stringify(result.value ?? null, null, 2));
+        if (!result.rendererConfirmed) {
+          process.stderr.write(
+            "note: the renderer could not confirm its profile; the MCP server's check passed.\n",
+          );
+        }
+      } catch (err) {
+        if (err instanceof RendererEvalRefused) throw new ConfigError(err.message);
+        throw err;
+      }
+      return 0;
+    }
+
+    case "script": {
+      const file = positional[0];
+      if (file === undefined) {
+        throw new ConfigError("script needs a file: vortex-ai script <file.mts> [its args...]");
+      }
+      const abs = path.resolve(file);
+      if (!fs.existsSync(abs)) throw new ConfigError(`${abs} does not exist.`);
+      const insideRepo = !path.relative(REPO_ROOT, abs).startsWith("..");
+      if (!/\.(?:mts|mjs)$/.test(abs) && !insideRepo) {
+        throw new ConfigError(
+          `${path.basename(abs)}: name a script outside this repo .mts. tsx treats a .ts file ` +
+            "with no ESM package.json above it as CommonJS, where top-level await and imports fail.",
+        );
+      }
+      const kit = pathToFileURL(path.join(REPO_ROOT, "harness", "src", "kit.ts")).href;
+      log(`script: ${abs} (VORTEX_AI_KIT=${kit})`);
+      return runUnderLease({
+        command: process.execPath,
+        args: [tsxCli(), abs, ...passthrough],
+        owner: resolveOwner(config.owner),
+        resources: [INSTANCE_RESOURCE],
+        purpose: `script ${path.basename(abs)}`,
+        waitMs: (typeof flags.wait === "string" ? Number(flags.wait) : 0) * 60_000,
+        shell: false,
+        // The script's loadConfig() then sees the same instance this command was given.
+        env: {
+          VORTEX_AI_KIT: kit,
+          VORTEX_AI_CACHE_DIR: config.cacheDir,
+          VORTEX_AI_ARTIFACT_DIR: config.artifactDir,
+          VORTEX_MCP_PORT: String(config.mcpPort),
+          VORTEX_AI_CDP_PORT: String(config.cdpPort),
+          VORTEX_MCP_TOKEN: config.mcpToken,
+        },
+        onWaiting: (err) => log(`Waiting for the lease:\n${err.message}\n`),
+      });
+    }
+
     case "build-extension": {
       const root = await ensureExtensionBuilt({ rebuild: true });
       log(`Built vortex-mcp at ${root}`);
@@ -918,6 +1012,15 @@ function targetFrom(flags: ParsedArgs["flags"]): Record<string, unknown> {
   if (typeof flags.ref === "string") return { ref: flags.ref };
   if (typeof flags.selector === "string") return { selector: flags.selector };
   throw new ConfigError("Provide --ref <e12> (from `vortex-ai snapshot`) or --selector <css>.");
+}
+
+/** tsx's CLI in this repo's node_modules, run with this Node. */
+function tsxCli(): string {
+  try {
+    return createRequire(import.meta.url).resolve("tsx/cli");
+  } catch {
+    return path.join(REPO_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+  }
 }
 
 function parseViewports(

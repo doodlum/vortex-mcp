@@ -30,7 +30,7 @@ const execFileAsync = promisify(execFile);
 export type CheckStatus = "pass" | "warn" | "fail" | "skip";
 
 export interface CheckResult {
-  id: "size" | "callers" | "revert" | "comments" | "description";
+  id: "size" | "callers" | "state" | "revert" | "comments" | "description";
   title: string;
   status: CheckStatus;
   summary: string;
@@ -758,6 +758,201 @@ function truncate(text: string, max = 140): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+// ---------------------------------------------------------------------------
+// Member uses, module consumers and state readers
+// ---------------------------------------------------------------------------
+
+const escapeRegExp = (value: string): string => value.replace(/[$.*+?^(){}|[\]\\]/g, "\\$&");
+
+/**
+ * How a line uses `name` as a class member: through member access (`x.name`, `this.name`,
+ * `x?.name`, but not a `...name` spread) or as a JSX attribute (`name={…}`, in .jsx/.tsx).
+ * Undefined for a bare identifier, which is a local or an import of something else.
+ */
+export function memberUse(text: string, name: string, file = ""): "member" | "jsx" | undefined {
+  const n = escapeRegExp(name);
+  if (new RegExp(`(?<!\\.)\\.${n}(?![\\w$])`).test(text)) return "member";
+  if (/\.[jt]sx$/.test(file) && new RegExp(`(?:^|[\\s{(<])${n}=[{"'\`]`).test(text)) return "jsx";
+  return undefined;
+}
+
+/** Whether the line declares its own class member called `name` (not a call or a local). */
+export function declaresOwnMember(text: string, name: string): boolean {
+  const n = escapeRegExp(name);
+  return new RegExp(
+    // Leading whitespace is optional: `git grep` hits arrive trimmed.
+    `^\\s*(?:(?:public|private|protected|static|readonly|async|override|get|set)\\s+)*` +
+      `${n}\\s*[?!]?\\s*(?::[^=;]+)?(?:=(?!=)|\\([^)]*\\)\\s*(?::[^{;]+)?\\{)`,
+  ).test(text);
+}
+
+export interface FilteredHits {
+  kept: CallerHit[];
+  dropped: number;
+}
+
+/**
+ * Keep only the hits that can reach a class member called `name`: member access and JSX
+ * attributes. A file that declares its own member of that name is another class's; its
+ * declaration and its `this.name` uses are dropped too.
+ */
+export function filterMemberHits(
+  hits: CallerHit[],
+  name: string,
+  options: { jsx?: boolean } = {},
+): FilteredHits {
+  const own = new Set(hits.filter((h) => declaresOwnMember(h.text, name)).map((h) => h.file));
+  const self = new RegExp(`\\bthis\\.${escapeRegExp(name)}(?![\\w$])`, "g");
+  // A getter or field is only ever read as `x.name`; a JSX attribute of that name is a prop.
+  const counts = (text: string, file: string): boolean => {
+    const use = memberUse(text, name, file);
+    return use === "member" || (use === "jsx" && options.jsx !== false);
+  };
+  const kept = hits.filter((hit) => {
+    if (!own.has(hit.file)) return counts(hit.text, hit.file);
+    if (declaresOwnMember(hit.text, name)) return false;
+    return counts(hit.text.replace(self, ""), hit.file);
+  });
+  return { kept, dropped: hits.length - kept.length };
+}
+
+/** Whether the file's default export is, or wraps, `name` (`export default connect(…)(Name)`). */
+export function defaultExportMentions(content: string, name: string): boolean {
+  const n = escapeRegExp(name);
+  if (
+    new RegExp(`^export\\s+default\\s+(?:abstract\\s+)?(?:class|function)\\s+${n}\\b`, "m").test(
+      content,
+    )
+  )
+    return true;
+  if (new RegExp(`export\\s*\\{[^}]*\\b${n}\\s+as\\s+default\\b`).test(content)) return true;
+  const at = content.search(/^export\s+default\b/m);
+  if (at === -1) return false;
+  const rest = content.slice(at, at + 2_000);
+  const end = rest.search(/;\s*$/m);
+  return new RegExp(`\\b${n}\\b`).test(end === -1 ? rest : rest.slice(0, end + 1));
+}
+
+export interface ImportBinding {
+  spec: string;
+  defaultName?: string;
+  namespace?: string;
+  /** Named bindings as `imported` → `local`; for a re-export, `local` is the exported name. */
+  named: { imported: string; local: string }[];
+  typeOnly: boolean;
+  reexport: boolean;
+}
+
+function namedList(raw: string | undefined): ImportBinding["named"] {
+  if (raw === undefined) return [];
+  return raw
+    .split(",")
+    .map((part) =>
+      part
+        .replace(/\/\/.*$/gm, "")
+        .replace(/^\s*type\s+/, "")
+        .trim(),
+    )
+    .filter((part) => part !== "")
+    .map((part) => {
+      const [imported = part, local = imported] = part.split(/\s+as\s+/).map((s) => s.trim());
+      return { imported, local };
+    });
+}
+
+/** The static imports and re-exports of a module, from a regex over its source. */
+export function parseImports(content: string): ImportBinding[] {
+  const out: ImportBinding[] = [];
+  const imports =
+    /\bimport\s+(type\s+)?(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\{([^}]*)\}\s*)?(?:\*\s*as\s+([\w$]+)\s*)?from\s*["']([^"']+)["']/g;
+  for (const m of content.matchAll(imports)) {
+    const defaultName = m[2] === "type" ? undefined : m[2];
+    out.push({
+      spec: m[5] ?? "",
+      defaultName,
+      namespace: m[4],
+      named: namedList(m[3]),
+      typeOnly: m[1] !== undefined,
+      reexport: false,
+    });
+  }
+  for (const m of content.matchAll(/\bexport\s+(type\s+)?\{([^}]*)\}\s*from\s*["']([^"']+)["']/g)) {
+    out.push({
+      spec: m[3] ?? "",
+      named: namedList(m[2]),
+      typeOnly: m[1] !== undefined,
+      reexport: true,
+    });
+  }
+  return out;
+}
+
+const withoutExtension = (file: string): string =>
+  file.replace(/\\/g, "/").replace(/\.(?:[cm]?[jt]sx?|mts|cts)$/, "");
+
+/**
+ * Whether `spec`, imported from `importer`, names the module `target`. Relative specs are
+ * resolved; `@/x` and `~/x` aliases match any target path ending in `/x`.
+ */
+export function importTargets(importer: string, spec: string, target: string): boolean {
+  const goal = withoutExtension(target);
+  const candidates: string[] = [];
+  if (spec.startsWith(".")) {
+    candidates.push(
+      withoutExtension(path.posix.normalize(path.posix.join(path.posix.dirname(importer), spec))),
+    );
+    return candidates.some((c) => c === goal || `${c}/index` === goal);
+  }
+  const alias = /^[@~]\/(.+)$/.exec(spec)?.[1];
+  if (alias === undefined) return false;
+  const aliased = withoutExtension(alias);
+  return goal.endsWith(`/${aliased}`) || goal.endsWith(`/${aliased}/index`);
+}
+
+/** Names a barrel exports `local` under: `export { local }`, `export { local as X }`. */
+export function exportedNames(content: string, local: string): string[] {
+  const names = new Set<string>();
+  for (const m of content.matchAll(/\bexport\s*(?:default\s*)?\{([^}]*)\}(?!\s*from)/g)) {
+    for (const binding of namedList(m[1])) {
+      if (binding.imported === local) names.add(binding.local);
+    }
+  }
+  return [...names];
+}
+
+/** Fields of `this` a line assigns: `this.x = …`, `this.x += …`, `this.x++`, `--this.x`. */
+export function assignedFields(text: string): string[] {
+  const found = new Set<string>();
+  const assign = /\bthis\.([A-Za-z_$#][\w$]*)\s*(?:[-+*/%&|^]|\*\*|\?\?|\|\||&&|<<|>>>?)?=(?!=)/g;
+  for (const m of text.matchAll(assign)) if (m[1] !== undefined) found.add(m[1]);
+  for (const m of text.matchAll(/\bthis\.([A-Za-z_$#][\w$]*)\s*(?:\+\+|--)/g))
+    if (m[1] !== undefined) found.add(m[1]);
+  for (const m of text.matchAll(/(?:\+\+|--)\s*this\.([A-Za-z_$#][\w$]*)/g))
+    if (m[1] !== undefined) found.add(m[1]);
+  return [...found];
+}
+
+/** 1-based lines of `content` that read `this.<field>` other than to assign it. */
+export function stateReaders(content: string, field: string): number[] {
+  const f = escapeRegExp(field);
+  const write = new RegExp(
+    `\\bthis\\.${f}\\s*(?:(?:[-+*/%&|^]|\\*\\*|\\?\\?|\\|\\||&&|<<|>>>?)?=(?!=)|\\+\\+|--)|(?:\\+\\+|--)\\s*this\\.${f}(?![\\w$])`,
+    "g",
+  );
+  const read = new RegExp(`\\bthis\\.${f}(?![\\w$])`);
+  const lines: number[] = [];
+  content.split(/\r?\n/).forEach((text, i) => {
+    if (/^\s*(?:\/\/|\/\*|\*)/.test(text)) return;
+    if (read.test(text.replace(write, ""))) lines.push(i + 1);
+  });
+  return lines;
+}
+
+const GETTER = (name: string): RegExp =>
+  new RegExp(
+    `^\\s+(?:(?:public|protected|static|override)\\s+)*get\\s+${escapeRegExp(name)}\\s*\\(`,
+  );
+
 function symbolLabel(symbol: TouchedSymbol): string {
   const name = symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`;
   const where = `${symbol.file}:${String(symbol.line)}${symbol.side === "base" ? " (base)" : ""}`;
@@ -824,50 +1019,14 @@ async function callersCheck(
   let withCallers = 0;
   const quiet: string[] = [];
   const references: Record<string, CallerHit[]> = {};
-  const outside = async (name: string): Promise<CallerHit[]> =>
-    // Comment-only lines mention a name without calling it.
-    (await findReferences(dir, headSha, name)).filter(
-      (hit) => !inDiff.has(hit.file) && !/^(?:\/\/|\/\*|\*)/.test(hit.text),
-    );
-  const classReach = new Map<string, number>();
-  for (const symbol of ordered) {
-    if (symbol.className !== undefined) {
-      // A member is reached through its class. If nothing outside the diff names
-      // the class, a word search for the member only finds unrelated same-named ones.
-      let count = classReach.get(symbol.className);
-      if (count === undefined) {
-        count = (await outside(symbol.className)).length;
-        classReach.set(symbol.className, count);
-      }
-      if (count === 0) {
-        quiet.push(`${symbol.className}.${symbol.name}`);
-        continue;
-      }
-    }
-    if (GENERIC_NAMES.has(symbol.name) || symbol.name.length < 3) {
-      details.push(
-        `${symbolLabel(symbol)}: name too generic to search; review its callers by hand`,
-      );
-      continue;
-    }
-    // A removed symbol's callers live on the head; the head is what must still work.
-    const hits = await outside(symbol.name);
-    references[
-      symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`
-    ] = hits;
-    if (hits.length === 0) {
-      quiet.push(
-        symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`,
-      );
-      continue;
-    }
-    withCallers++;
+  const repo = new RepoReader(dir, headSha, inDiff);
+  const listHits = (label: string, hits: CallerHit[], limit: number, note = ""): void => {
     const code = hits.filter((hit) => !isTestFile(hit.file));
     const tests = hits.filter((hit) => isTestFile(hit.file));
-    const limit = symbol.kind === "type" ? Math.min(5, options.maxHits) : options.maxHits;
     details.push(
-      `${symbolLabel(symbol)}: ${String(code.length)} references in ${String(new Set(code.map((h) => h.file)).size)} files` +
-        (tests.length > 0 ? `, ${String(tests.length)} in tests` : ""),
+      `${label}: ${String(code.length)} references in ${String(new Set(code.map((h) => h.file)).size)} files` +
+        (tests.length > 0 ? `, ${String(tests.length)} in tests` : "") +
+        note,
     );
     for (const hit of code.slice(0, limit)) {
       details.push(`    ${hit.file}:${String(hit.line)}: ${truncate(hit.text)}`);
@@ -877,7 +1036,117 @@ async function callersCheck(
     if (tests.length > 0) {
       details.push(`    tests: ${[...new Set(tests.map((h) => h.file))].slice(0, 5).join(", ")}`);
     }
+  };
+
+  // The class or component a consumer outside the diff reaches: by its name, and, when it
+  // is its file's default export, through every module importing that file and every
+  // barrel (controls/api.ts, util/api.ts) re-exporting it. Each of them can notice a change
+  // to any of its members.
+  const reach = new Map<string, Consumers>();
+  const consumersOf = async (name: string, file: string): Promise<Consumers> => {
+    const key = `${file}#${name}`;
+    let found = reach.get(key);
+    if (found === undefined) {
+      const direct = (await repo.outside(name)).filter((hit) => !isTestFile(hit.file));
+      const content = await repo.read(file);
+      const modules =
+        content !== undefined && defaultExportMentions(content, name)
+          ? await moduleConsumers(repo, file)
+          : undefined;
+      found = { name, file, direct, modules };
+      reach.set(key, found);
+    }
+    return found;
+  };
+  const enclosing = new Map<string, { consumers: Consumers; members: string[] }>();
+
+  for (const symbol of ordered) {
+    const label =
+      symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`;
+    if (symbol.className !== undefined) {
+      // A member is reached through its class. If nothing outside the diff reaches the
+      // class, a search for the member only finds unrelated same-named ones.
+      const consumers = await consumersOf(symbol.className, symbol.file);
+      const entry = enclosing.get(consumers.file + consumers.name) ?? { consumers, members: [] };
+      entry.members.push(symbol.name);
+      enclosing.set(consumers.file + consumers.name, entry);
+      if (consumerCount(consumers) === 0) {
+        quiet.push(label);
+        continue;
+      }
+    } else if (symbol.kind !== "type" && symbol.side === "head") {
+      const consumers = await consumersOf(symbol.name, symbol.file);
+      if (consumers.modules !== undefined) {
+        const entry = enclosing.get(consumers.file + consumers.name) ?? {
+          consumers,
+          members: [],
+        };
+        enclosing.set(consumers.file + consumers.name, entry);
+      }
+    }
+    if (GENERIC_NAMES.has(symbol.name) || symbol.name.length < 3) {
+      details.push(
+        `${symbolLabel(symbol)}: name too generic to search; review its callers by hand`,
+      );
+      continue;
+    }
+    // A removed symbol's callers live on the head; the head is what must still work.
+    let hits = await repo.outside(symbol.name);
+    let note = "";
+    if (symbol.className !== undefined) {
+      // Members are reached as `x.name`, `this.name` or a JSX attribute, never as a bare
+      // word: those are locals, imports and same-named members of other classes.
+      const filtered = filterMemberHits(hits, symbol.name);
+      hits = filtered.kept;
+      if (filtered.dropped > 0) {
+        note = ` (${String(filtered.dropped)} bare-name or other-class hits left out)`;
+      }
+    }
+    references[label] = hits;
+    if (hits.length === 0) {
+      quiet.push(label);
+      continue;
+    }
+    withCallers++;
+    listHits(
+      symbolLabel(symbol),
+      hits,
+      symbol.kind === "type" ? Math.min(5, options.maxHits) : options.maxHits,
+      note,
+    );
   }
+
+  const consumerData: Record<string, unknown> = {};
+  for (const { consumers, members } of enclosing.values()) {
+    const count = consumerCount(consumers);
+    consumerData[consumers.name] = consumers;
+    if (count === 0) continue;
+    withCallers++;
+    const via = members.length > 0 ? `encloses the touched ${members.join(", ")}` : "touched";
+    details.push(
+      `consumers of ${consumers.name} (${consumers.file}, ${via}): every one can notice the change`,
+    );
+    details.push(
+      `    by name: ${String(consumers.direct.length)} references in ` +
+        `${String(new Set(consumers.direct.map((h) => h.file)).size)} files`,
+    );
+    const modules = consumers.modules;
+    if (modules !== undefined) {
+      const importers = modules.importers.filter((i) => !isTestFile(i.file));
+      details.push(
+        `    default export imported by ${String(importers.length)} files: ` +
+          truncate(importers.map((i) => `${i.file} (as ${i.local})`).join(", "), 600),
+      );
+      for (const re of modules.reexports) {
+        const code = re.consumers.filter((f) => !isTestFile(f));
+        details.push(
+          `    re-exported as ${re.name} by ${re.barrel}; imported from there or vortex-api by ` +
+            `${String(code.length)} files: ${truncate(code.join(", "), 600)}`,
+        );
+      }
+    }
+  }
+
   if (quiet.length > 0) details.push(`no references outside the diff: ${quiet.join(", ")}`);
   return {
     id: "callers",
@@ -885,10 +1154,228 @@ async function callersCheck(
     status: withCallers > 0 ? "warn" : "pass",
     summary:
       withCallers > 0
-        ? `${String(withCallers)} of ${String(symbols.size)} touched symbols are referenced outside the diff; review each caller`
+        ? `${String(withCallers)} entries reach the ${String(symbols.size)} touched symbols from outside the diff; review each caller`
         : `${String(symbols.size)} touched symbols, none referenced outside the diff`,
     details,
-    data: { references },
+    data: { references, consumers: consumerData },
+  };
+}
+
+interface Consumers {
+  name: string;
+  file: string;
+  direct: CallerHit[];
+  modules?: ModuleConsumers;
+}
+
+const consumerCount = (c: Consumers): number =>
+  c.direct.length +
+  (c.modules?.importers.length ?? 0) +
+  (c.modules?.reexports.reduce((sum, r) => sum + r.consumers.length, 0) ?? 0);
+
+export interface ModuleConsumers {
+  /** Files outside the diff importing the module's default export, with the local name. */
+  importers: { file: string; local: string }[];
+  /** Barrels re-exporting it, and the files outside the diff importing it from them. */
+  reexports: { barrel: string; name: string; consumers: string[] }[];
+}
+
+/** Reads a commit's files through git, cached, and searches them. */
+class RepoReader {
+  private contents = new Map<string, string | undefined>();
+
+  constructor(
+    readonly dir: string,
+    readonly commit: string,
+    readonly inDiff: Set<string>,
+  ) {}
+
+  async read(file: string): Promise<string | undefined> {
+    if (!this.contents.has(file)) {
+      this.contents.set(
+        file,
+        await git(this.dir, ["show", `${this.commit}:${file}`]).catch(() => undefined),
+      );
+    }
+    return this.contents.get(file);
+  }
+
+  /** Word hits outside the diff, comment-only lines left out. */
+  async outside(name: string): Promise<CallerHit[]> {
+    return (await findReferences(this.dir, this.commit, name)).filter(
+      (hit) => !this.inDiff.has(hit.file) && !/^(?:\/\/|\/\*|\*)/.test(hit.text),
+    );
+  }
+
+  /** Files outside the diff matching `git grep` arguments (`-e` patterns and flags). */
+  async files(args: string[]): Promise<string[]> {
+    let out: string;
+    try {
+      out = await git(this.dir, ["grep", "-l", "-I", ...args, this.commit, "--", ...CALLER_ROOTS]);
+    } catch (err) {
+      if ((err as { code?: number }).code === 1) return [];
+      throw err;
+    }
+    const prefix = `${this.commit}:`;
+    return out
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => (line.startsWith(prefix) ? line.slice(prefix.length) : line))
+      .filter((file) => !this.inDiff.has(file));
+  }
+}
+
+/** Where a module's default export is imported, directly or through a re-exporting barrel. */
+async function moduleConsumers(repo: RepoReader, file: string): Promise<ModuleConsumers> {
+  const base = path.posix.basename(withoutExtension(file));
+  const stem = base === "index" ? path.posix.basename(path.posix.dirname(file)) : base;
+  const ere = stem.replace(/[.[\]()*+?{}|^$\\]/g, "\\$&");
+  const candidates = await repo.files(["-E", "-e", `["'][^"']*/${ere}(\\.[a-z]+)?["']`]);
+  const result: ModuleConsumers = { importers: [], reexports: [] };
+  const barrels: { barrel: string; name: string }[] = [];
+  for (const candidate of candidates) {
+    const content = await repo.read(candidate);
+    if (content === undefined) continue;
+    for (const binding of parseImports(content)) {
+      if (binding.typeOnly || !importTargets(candidate, binding.spec, file)) continue;
+      const locals = [
+        ...(binding.reexport ? [] : [binding.defaultName]),
+        ...binding.named.filter((n) => n.imported === "default").map((n) => n.local),
+      ].filter((n): n is string => n !== undefined);
+      for (const local of locals) {
+        if (binding.reexport) {
+          barrels.push({ barrel: candidate, name: local });
+          continue;
+        }
+        result.importers.push({ file: candidate, local });
+        for (const name of exportedNames(content, local)) {
+          barrels.push({ barrel: candidate, name });
+        }
+      }
+    }
+  }
+  if (barrels.length === 0) return result;
+  // Only files that name an API module at all can import through one; reading just those
+  // keeps this to a few git calls on a large tree.
+  const apiImporters = new Set(await repo.files(["-F", "-e", "vortex-api", "-e", "/api"]));
+  for (const { barrel, name } of barrels) {
+    const namespace = path.posix.basename(path.posix.dirname(barrel));
+    const named = (await repo.files(["-w", "-F", "-e", name])).filter((f) => apiImporters.has(f));
+    // util/api.ts and friends are also reached as a namespace: `util.name(…)`.
+    const namespaced =
+      namespace === "controls" ? [] : await repo.files(["-F", "-e", `${namespace}.${name}`]);
+    const consumers = new Set<string>(namespaced.filter((f) => f !== barrel));
+    for (const candidate of named) {
+      if (candidate === barrel || consumers.has(candidate)) continue;
+      const content = await repo.read(candidate);
+      if (content === undefined) continue;
+      const fromBarrel = parseImports(content).some(
+        (b) =>
+          !b.typeOnly &&
+          (/^(?:@nexusmods\/)?vortex-api$/.test(b.spec) ||
+            importTargets(candidate, b.spec, barrel)) &&
+          b.named.some((n) => n.imported === name),
+      );
+      if (fromBarrel) consumers.add(candidate);
+    }
+    result.reexports.push({ barrel, name, consumers: [...consumers].toSorted() });
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Readers of changed class state
+// ---------------------------------------------------------------------------
+
+/**
+ * Class fields whose assignments the diff adds or removes (`this.mStep = …`), and every
+ * other line of the head file that reads them, by enclosing member. A reader that is a
+ * getter exposes the field, so its uses outside the diff are listed too.
+ */
+async function stateCheck(
+  dir: string,
+  files: FileDiff[],
+  headSha: string,
+  options: { maxHits: number },
+): Promise<CheckResult> {
+  const inDiff = new Set(
+    files.flatMap((f) => [f.oldPath, f.newPath]).filter((p) => p !== undefined),
+  );
+  const repo = new RepoReader(dir, headSha, inDiff);
+  const details: string[] = [];
+  const data: Record<string, unknown> = {};
+  let fieldCount = 0;
+  let readerCount = 0;
+  for (const file of files) {
+    if (file.binary || isTestFile(file.path) || file.newPath === undefined) continue;
+    if (!CODE_FILE.test(file.newPath)) continue;
+    const fields = new Set(
+      [...file.added, ...file.removed].flatMap((line) => assignedFields(line.text)),
+    );
+    if (fields.size === 0) continue;
+    const content = await repo.read(file.newPath);
+    if (content === undefined) continue;
+    const changed = new Set(file.added.map((l) => l.line));
+    const lines = content.split(/\r?\n/);
+    for (const field of fields) {
+      fieldCount++;
+      const readers = stateReaders(content, field).filter((line) => !changed.has(line));
+      const byMember = new Map<string, { symbol?: TouchedSymbol; lines: number[] }>();
+      for (const line of readers) {
+        const [symbol] = touchedSymbols(content, [line], file.newPath, "head");
+        const key =
+          symbol === undefined
+            ? "(top level)"
+            : symbol.className === undefined
+              ? `${symbol.name} (constructor or top level)`
+              : `${symbol.className}.${symbol.name}`;
+        const entry = byMember.get(key) ?? { symbol, lines: [] };
+        entry.lines.push(line);
+        byMember.set(key, entry);
+      }
+      data[`${file.newPath}#${field}`] = [...byMember.entries()].map(([member, e]) => ({
+        member,
+        lines: e.lines,
+      }));
+      if (byMember.size === 0) {
+        details.push(`${file.newPath}: this.${field} is not read outside the changed lines`);
+        continue;
+      }
+      readerCount += readers.length;
+      details.push(
+        `${file.newPath}: this.${field} is assigned by the diff and read by ${String(byMember.size)} members`,
+      );
+      for (const [member, entry] of byMember) {
+        const where = entry.lines.slice(0, 6).map(String).join(", ");
+        const first = lines[(entry.lines[0] ?? 1) - 1] ?? "";
+        details.push(`    ${member} (line ${where}): ${truncate(first.trim(), 100)}`);
+        const symbol = entry.symbol;
+        if (symbol?.className === undefined) continue;
+        if (!GETTER(symbol.name).test(lines[symbol.line - 1] ?? "")) continue;
+        const uses = filterMemberHits(await repo.outside(symbol.name), symbol.name, {
+          jsx: false,
+        }).kept.filter((hit) => !isTestFile(hit.file));
+        details.push(`      getter ${symbol.name}: ${String(uses.length)} uses outside the diff`);
+        for (const hit of uses.slice(0, options.maxHits)) {
+          details.push(`        ${hit.file}:${String(hit.line)}: ${truncate(hit.text)}`);
+        }
+        if (uses.length > options.maxHits)
+          details.push(`        … ${String(uses.length - options.maxHits)} more`);
+      }
+    }
+  }
+  return {
+    id: "state",
+    title: "Readers of changed state",
+    status: readerCount > 0 ? "warn" : "pass",
+    summary:
+      fieldCount === 0
+        ? "the diff assigns no class fields"
+        : readerCount > 0
+          ? `${String(fieldCount)} class fields the diff assigns are read on ${String(readerCount)} other lines; check each reader still holds`
+          : `${String(fieldCount)} class fields the diff assigns, not read elsewhere`,
+    details,
+    data,
   };
 }
 
@@ -941,6 +1428,34 @@ function nearestPackageDir(checkout: string, file: string): string {
   return root;
 }
 
+/**
+ * A `--test` path as a checkout-relative path. It may be absolute, relative to the
+ * checkout root, or relative to `--project-dir` (where vitest runs, so the form vitest
+ * itself prints); the first that exists wins. Nothing existing is an error, not a
+ * silently empty test run.
+ */
+export function resolveTestPath(checkout: string, test: string, projectDir?: string): string {
+  const root = path.resolve(checkout);
+  const tried = path.isAbsolute(test)
+    ? [path.resolve(test)]
+    : [
+        path.resolve(root, test),
+        ...(projectDir === undefined ? [] : [path.resolve(root, projectDir, test)]),
+      ];
+  const found = tried.find((candidate) => fs.existsSync(candidate));
+  if (found === undefined) {
+    throw new PreflightError(
+      `--test ${test} does not exist; tried ${tried.join(" and ")}. Give it relative to the ` +
+        "checkout root or to --project-dir.",
+    );
+  }
+  const relative = path.relative(root, found);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new PreflightError(`--test ${test} is outside the checkout ${root}.`);
+  }
+  return relative.replace(/\\/g, "/");
+}
+
 const ANSI_COLOUR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 
 function tail(output: string, lines = 25): string[] {
@@ -980,12 +1495,17 @@ async function revertCheck(
   const toRevert = options.revert?.map((p) => p.replace(/\\/g, "/")) ?? nonTest;
   if (toRevert.length === 0) return revertResult("skip", "the diff changes only tests");
 
-  const tests =
-    options.tests.length > 0
-      ? options.tests.map((t) => path.relative(dir, path.resolve(dir, t)).replace(/\\/g, "/"))
-      : files
-          .filter((f) => f.newPath !== undefined && isTestFile(f.newPath))
-          .map((f) => f.newPath ?? "");
+  let tests: string[];
+  try {
+    tests =
+      options.tests.length > 0
+        ? options.tests.map((t) => resolveTestPath(dir, t, options.projectDir))
+        : files
+            .filter((f) => f.newPath !== undefined && isTestFile(f.newPath))
+            .map((f) => f.newPath ?? "");
+  } catch (err) {
+    return revertResult("fail", (err as Error).message);
+  }
   if (tests.length === 0) {
     return revertResult(
       "fail",
@@ -1024,10 +1544,14 @@ async function revertCheck(
     let output = "";
     for (const [cwd, group] of groups) {
       const where = path.relative(dir, cwd) || ".";
-      options.onProgress?.(`[pr-preflight] ${label}: vitest run ${group.join(" ")} (in ${where})`);
+      options.onProgress?.(
+        `[pr-preflight] ${label}: vitest run ${group.join(" ")} (in ${where}; paths relative to it)`,
+      );
       const run = await options.runner(cwd, group);
       output += run.output;
-      details.push(`${label}: exit ${String(run.code)} in ${where}: ${group.join(" ")}`);
+      details.push(
+        `${label}: exit ${String(run.code)} in ${where} (paths relative to it): ${group.join(" ")}`,
+      );
       if (run.code !== 0) {
         passed = false;
         details.push(...tail(run.output));
@@ -1234,6 +1758,7 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   checks.push(
     await callersCheck(dir, files, mergeBase, headSha, { maxHits: options.maxHits ?? 15 }),
   );
+  checks.push(await stateCheck(dir, files, headSha, { maxHits: options.maxHits ?? 15 }));
 
   if (options.skipRevert === true) {
     checks.push({

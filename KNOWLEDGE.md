@@ -384,16 +384,24 @@ a collection install". Every dispatch (per-mod deploy progress, install steps) n
 re-runs thousands of rows' connected cells. The Mods page also stays mounted while
 hidden (`invisible`, not unmounted), so it slows other pages too, Plugins included.
 
-Measured with `ai:test:large-library`, 3,000 mods, unpatched vs patched master:
+Measured in **production** builds (`--production`), 4,000 mods, unpatched against patched
+master (Nexus-Mods/Vortex#24281), 3 runs a side, with `ai:test:large-library` and the probes now
+in `ai:test:mods-scroll`:
 
-- rows rendered: 3000 → 24;
-- filter clear: 11.0 s → 0.37 s;
-- deploy on the Mods page: 63 s → 31 s;
-- 20 sequential installs: 221 s → 33 s (longest freeze 2.4 s → 0.45 s).
+- rows rendered in full, with 21 on screen: 4,000 → 27;
+- clearing the name filter blocked the UI for 14.2–19.3 s → 0.31–0.50 s;
+- deploy: 28.9–31.7 s → 15.2–16.9 s on the Mods page, and 28.5–32.3 s → 15.2–16.9 s from
+  Settings. The Mods page was **not** slower than Settings: the hidden Mods page stays mounted,
+  so the fix halves deploy on every page;
+- 20 sequential installs: 43.6–55.4 s → 32.8–33.5 s (longest task 450–709 ms → 359–375 ms);
+- a 40-tick wheel flick: longest task 434–533 ms → 134–146 ms.
 
-The stock 2.7.0 installer, same check: deploy on the Mods page took 403 s against 38 s
-from Settings (10.7×), in line with the reported 12 min against 2 min. At 10 installs the
-freeze budget did not trip on stock; use `--installs 20` or more to see that effect.
+Earlier figures here (deploy 63 → 31 s, installs 221 → 33 s, rows 3,000 → 24, filter clear
+11.0 → 0.37 s) came from development builds, whose React is several times slower at rendering.
+Don't quote them. A single run of the stock 2.7.0 installer took 403 s to deploy from the Mods
+page against 38 s from Settings (10.7×, like the reported 12 min against 2 min). Production
+builds of master did not reproduce a Mods-against-Settings difference, so compare against the
+classic layout instead (`ai:test:large-library` does).
 
 The classic layout, whose pane scrolls itself, was never affected; use it as the
 in-build control. The fix roots the observer at the element that actually scrolls
@@ -420,6 +428,21 @@ Traps found while measuring:
 - tsx compiles named functions with an `__name` helper that the page does not have.
   Pass `page.evaluate` source text, not a function, from harness scripts.
 
+### A row stays rendered forever once it has been on screen
+
+`VisibilityProxy` ignores a "not visible" callback that arrives within 1 s of the row becoming
+visible (the `now - this.mVisibleTime > 1000` guard). An IntersectionObserver reports only
+changes, so for a row scrolled past quickly it never reports again, and the row stays rendered
+in full. Scrolling therefore undoes the virtualisation a bit at a time. Nothing errors.
+
+Production build with the sticky-header fix (#24281), 4,000 mods, after one wheel scroll through
+the list: 1,109 rows rendered, clearing the filter blocked 4.95 s again, and scrolling was
+blocked for 122 s of the 131 s it took. The classic layout, never affected by the sticky header,
+does worse: 2,175 rows, 7.8 s to clear the filter. Forty wheel ticks alone leave 417 rows
+rendered, so "it drops back to about 36" is not true either. Present in 2.6 through master of
+September 2026. `ai:test:mods-scroll` reports it as a warning, and fails on it with
+`--max-accumulated <n>`.
+
 ### After a completed collection, Vortex stops running its checks
 
 `InstallDriver.startInstall` suppresses the `plugins-changed`, `mod-installed`,
@@ -431,6 +454,43 @@ until restart. Nothing is logged: the test runner drops suppressed events withou
 This is present in 2.6 through master of September 2026, and fixed by
 Nexus-Mods/Vortex#24282. It is reproduced by `ai:test:bethesda`, and visible with
 `check_probe_counts`, whose `plugins-changed` count stops rising.
+
+### A Bethesda collection without a plugin list skips the end of its postprocessing
+
+For a gamebryo game, postprocessing calls the collection parser, which reads
+`collection.plugins.find(…)` for every plugin its members installed
+(`util/gameSupport/gamebryo.tsx`, around line 212). Vortex's exporter always writes that list.
+A hand-made collection.json without it makes the parser throw. The error is swallowed, so plugin
+enabling and `collection-postprocess-complete` are skipped. The review's Done still enables and
+the install looks complete. `offlineCollection.ts` writes the list, and `installOfflineCollection`
+reports `postprocessed` from the event.
+
+### A collection installed from a file has no revision
+
+`start-install <archive>` installs the collection mod with `archiveId: null`. The install driver
+reads revision id, slug and `revisionInfo` (including `gameVersions`) from that download's
+`modInfo`, so with no download the game-version prompt and anything revision-based can't be
+reached. Nothing says so. Register the archive as a download first (`addLocalDownload`, then
+`start-install-download`), which is what Vortex does itself for a downloaded collection.
+`addOfflineCollection` does this. With `nexus.revisionInfo.modFiles` present on the download, the
+driver takes `revisionInfo` from it instead of asking Nexus.
+
+### The collection InstallDriver is not reachable from an extension
+
+The driver is a module variable of the collections extension. `registerAPI` exposes only
+`getActiveCollectionInstallSession` (the same object as `state.session.collections.activeSession`),
+not its `step`. The step alone decides which dialog shows, and `start` auto-continues on the next
+driver update, so a test can't tell "waiting at Install Now" from "about to begin" by state.
+Vortex does pass the driver as the `driver` prop to its always-mounted collection dialogs, and
+`collection_install_state` reads it from React's fiber tree. That is a private shape. The tool
+says `found: false` when a build stops passing the prop.
+
+### A seeded API key makes every local install wait a minute
+
+With an API key, Vortex looks locally installed archives up on Nexus. For a fixture archive QA
+saw that lookup end only at its 60 s timeout, so each sandbox install took a minute longer and
+looked hung, with nothing in the UI. `up` used to seed `harness/.env`'s key into
+sandbox profiles. Sandbox runs now leave it out unless `--with-api-key` is given.
 
 ### Measuring a slow Vortex without measuring the harness
 
@@ -586,6 +646,29 @@ marker file last over the staging-directory-then-rename pattern.
 In Windows PowerShell 5.1, piping a here-string into `git commit -F -` fails with "did not match
 any file(s)", so it looks like a pathspec error. Write the message to a file and pass
 `git commit -F <file>`.
+
+### A commit message file written by PowerShell starts with a BOM
+
+Windows PowerShell 5.1's `Set-Content -Encoding utf8` and `Out-File -Encoding utf8` write a
+byte-order mark, and `git commit -F <file>` keeps it as the first bytes of the subject. Use
+`[IO.File]::WriteAllText($path, $msg)`, which writes UTF-8 without a BOM.
+
+### JSON saved from PowerShell starts with a BOM too
+
+The same byte-order mark breaks JSON read back by Node: `JSON.parse` fails with "Unexpected
+token", so a `vortex-e2e --compare` baseline or a `call --args-file` saved with `Out-File
+-Encoding utf8` or `Set-Content -Encoding utf8` looks corrupt. Every JSON file the kit reads back
+goes through `readJsonFile` in `harness/src/jsonFile.ts`, which strips the mark. Write new readers
+the same way.
+
+### A scratch script outside the repo can't import the kit by path
+
+Two separate failures. tsx treats a `.ts` file with no ESM `package.json` above it as CommonJS,
+so top-level `await` fails; name it `.mts`. And on Windows an absolute path in an import,
+`C:\dev\…`, is parsed as a URL with scheme `c:`; use `file:///C:/dev/…`. Bare names such as
+`fflate` still don't resolve from outside the repo. `vortex-ai script <file.mts>` runs it with the
+kit's tsx and passes the URL of `harness/src/kit.ts`, which re-exports what scripts need, in
+`VORTEX_AI_KIT`.
 
 ### `oxfmt` with a PowerShell array fails
 

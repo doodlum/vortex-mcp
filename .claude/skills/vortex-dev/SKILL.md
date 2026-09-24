@@ -85,6 +85,16 @@ For an upstream pull request, use `pnpm run ai -- pr-checks <pr>` before changin
 code. It reports the exact head and failed workflow steps, including whether the
 tests passed and only artifact post-processing failed.
 
+`pnpm run ai:preflight` lists what the change can reach before review does: member uses
+of touched class members, every consumer of the enclosing class or component (default
+imports, `controls/api.ts` and `util/api.ts` re-exports, extensions importing from
+`vortex-api`), and the readers of any class field whose assignment changed. Give `--test`
+paths from the checkout root or from `--project-dir`.
+
+Sandbox runs (`--sandbox`, `--bethesda-sandbox`) don't seed an API key, so local installs
+don't wait on Nexus lookups; `--with-api-key` if a test needs one. For a one-off script
+against the kit, `vortex-ai script <file.mts>` (see harness/AGENTS.md).
+
 ## Before calling a PR ready
 
 Follow "Before a Vortex pull request is ready" in `harness/WORKFLOWS.md`:

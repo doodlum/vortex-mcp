@@ -13,6 +13,19 @@ export function sandboxConfig(config: HarnessConfig): HarnessConfig {
 }
 
 /**
+ * A sandbox run is local-only: leave harness/.env's API key out unless asked for.
+ *
+ * With a key seeded, Vortex looks every locally installed archive up on Nexus. For the
+ * sandbox's archives that lookup finds nothing and only ends at its 60 s timeout, so each
+ * install looks hung. The key also changes the snapshot, so a run with and one without it
+ * keep separate baselines; pass the same choice to every command.
+ */
+export function localOnlyConfig(config: HarnessConfig, keepApiKey: boolean): HarnessConfig {
+  if (keepApiKey || config.apiKey === undefined || config.apiKey.trim() === "") return config;
+  return { ...config, apiKey: undefined, apiKeyWithheld: true };
+}
+
+/**
  * Empty a disposable game's deployed files when its working profile is reset.
  *
  * A fresh profile knows about no deployment, but the game directory kept the last run's

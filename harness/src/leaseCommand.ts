@@ -28,6 +28,8 @@ export interface RunUnderLeaseOptions {
   cwd?: string;
   /** Run through the shell (default on Windows, where pnpm and friends are .cmd files). */
   shell?: boolean;
+  /** Extra environment for the command, on top of this process's and VORTEX_AI_OWNER. */
+  env?: NodeJS.ProcessEnv;
   onWaiting?: (error: LeaseHeldError) => void;
   onReclaim?: (state: LeaseState) => void;
 }
@@ -69,7 +71,7 @@ export async function runUnderLease(options: RunUnderLeaseOptions): Promise<numb
           cwd: options.cwd,
           stdio: "inherit",
           shell,
-          env: { ...process.env, VORTEX_AI_OWNER: options.owner },
+          env: { ...process.env, ...options.env, VORTEX_AI_OWNER: options.owner },
         },
       );
       child.once("error", reject);

@@ -61,6 +61,15 @@ fixtures and cover that capability with tests. Do not leave a successful manual
 experiment as the only way to reproduce a result. Preserve compatibility with
 released Vortex; process control and CDP belong in the harness.
 
+For exploring before that, `vortex-ai script <file.mts>` runs a scratch script against the kit
+under the instance lease, and `vortex-ai eval --expr "<js>"` inspects a harness renderer (see
+"Scratch scripts and renderer diagnostics" in AGENTS.md). Their results are leads; the check
+that settles a question is the one added to the kit.
+
+Timing a change that affects rendering: compare against an in-build control that the change
+does not touch. For the Mods table that is the classic layout. Another page is no control, since
+the Mods page stays mounted while hidden (KNOWLEDGE.md).
+
 ## Before a Vortex pull request is ready
 
 A draft PR is not done until each of these is true and stated in its description:
@@ -153,7 +162,7 @@ vertical clipping; run the same height at different widths to expose wrapping.
 Record the actual window and renderer sizes because the OS may clamp requests.
 
 ```powershell
-pnpm run ai -- responsive --screenshots --viewports 1024x720,1280x720,1280x1000,1920x1080
+pnpm run ai -- responsive --screenshots --viewports "1024x720,1280x720,1280x1000,1920x1080"
 ```
 
 Run a sweep in each relevant state, using a distinct `--label` for artifacts:
@@ -162,7 +171,7 @@ Run a sweep in each relevant state, using a distinct `--label` for artifacts:
 | --------------------------------- | ------------------------------------------------ |
 | Empty list / first run            | Setup guidance and primary action remain visible |
 | Populated or virtualized list     | Filtering, scrolling, selection, row actions     |
-| Thousands of mods                 | `ai:test:large-library`: rendered rows, freezes  |
+| Thousands of mods                 | `ai:test:large-library`, `ai:test:mods-scroll`   |
 | Long names or localized text      | Wrapping, truncation, accessible names           |
 | Selection / expanded details      | Actions stay reachable; focus remains useful     |
 | Modal / stacked modal / installer | Dialog scope, scrollable body, footer actions    |

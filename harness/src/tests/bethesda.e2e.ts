@@ -11,7 +11,10 @@
  * B. The same, straight after an offline collection has installed and its review screen
  *    was closed with Done. Up to at least 2.8 / master of September 2026, Vortex never
  *    released the check suppression a collection install takes, so B fails there
- *    (Nexus-Mods/Vortex#24282).
+ *    (Nexus-Mods/Vortex#24282). The collection's own finalize path is checked on the way:
+ *    `collection-postprocess-complete` fired and its plugin list was applied.
+ * C. A collection whose revision lists only a game version nobody has: the game-version
+ *    prompt must appear, and Continue must complete the install.
  *
  * Check runs are counted by the extension's probe (check_probe_counts), so a check that
  * never runs is told apart from one that ran and found nothing. Needs a source build:
@@ -28,7 +31,11 @@ import { claimInstanceLease } from "../instance";
 import { deployMods } from "../deployment";
 import { installLocalMod } from "../localMod";
 import { VortexMcpClient } from "../mcpClient";
-import { installOfflineCollection, writeOfflineCollection } from "../offlineCollection";
+import {
+  MISMATCHED_GAME_VERSION,
+  installOfflineCollection,
+  writeOfflineCollection,
+} from "../offlineCollection";
 
 const config = loadConfig();
 // Drives the running instance: refuse while another owner holds it.
@@ -101,22 +108,48 @@ if (!a.flagged || !a.notified) {
   failures.push(`A: a plugin with a missing master was not reported (${JSON.stringify(a)})`);
 }
 
+const enabled = async (plugin: string): Promise<boolean | undefined> =>
+  (
+    await mcp.call<{ enabled?: boolean } | null>("vortex_query", {
+      path: ["loadOrder", plugin.toLowerCase()],
+    })
+  )?.enabled;
+
 const stamp = String(Date.now());
+// The collection lists Alpha enabled and Beta disabled. Only Vortex's gamebryo collection
+// postprocessing applies that list, so the plugins' states show it ran to the end.
+const [alpha, beta] = [`Alpha${stamp}.esp`, `Beta${stamp}.esp`];
 const collection = writeOfflineCollection(
   path.join(config.cacheDir, `bethesda-collection-${stamp}.zip`),
   {
     name: `Bethesda check ${stamp}`,
     gameId: "fallout4",
-    members: ["Alpha", "Beta"].map((name) => ({
-      name: `${name}${stamp}`,
-      files: {
-        [`${name}${stamp}.esp`]: pluginBytes({ name: `${name}.esp`, masters: ["Fallout4.esm"] }),
-      },
+    members: [alpha, beta].map((plugin) => ({
+      name: plugin.replace(/\.esp$/, ""),
+      files: { [plugin]: pluginBytes({ name: plugin, masters: ["Fallout4.esm"] }) },
+      plugins: [{ name: plugin, enabled: plugin === alpha }],
     })),
   },
 );
-result.collection = await installOfflineCollection(mcp, collection);
+const installed = await installOfflineCollection(mcp, collection);
+result.collection = installed;
 await new Promise((resolve) => setTimeout(resolve, 3_000));
+const finalized = {
+  postprocessed: installed.postprocessed,
+  alphaEnabled: await enabled(alpha),
+  betaEnabled: await enabled(beta),
+};
+result.finalized = finalized;
+if (
+  finalized.postprocessed !== true ||
+  finalized.alphaEnabled !== true ||
+  finalized.betaEnabled === true
+) {
+  failures.push(
+    `the collection's postprocessing did not finish: ${JSON.stringify(finalized)} (expected ` +
+      "collection-postprocess-complete, Alpha enabled and Beta disabled as the manifest lists)",
+  );
+}
 
 const b = await missingMasterPlugin("B");
 result.scenarioB = b;
@@ -124,6 +157,34 @@ if (b.checkRuns === 0 || !b.flagged) {
   failures.push(
     `B: after a completed collection the Missing Masters check ran ${String(b.checkRuns)} times ` +
       `and ${b.flagged ? "flagged" : "did not flag"} ${b.plugin} — Vortex is still suppressing its checks`,
+  );
+}
+
+// C. A revision whose game versions exclude the installed one: the driver must ask, and
+// Continue must install it. Only reachable because the archive is installed as a download.
+const gvStamp = String(Date.now());
+const gvPlugin = `Gv${gvStamp}.esp`;
+const gvCollection = writeOfflineCollection(
+  path.join(config.cacheDir, `bethesda-gv-${gvStamp}.zip`),
+  {
+    name: `Game version check ${gvStamp}`,
+    gameId: "fallout4",
+    members: [
+      {
+        name: `Gv${gvStamp}`,
+        files: { [gvPlugin]: pluginBytes({ name: gvPlugin, masters: ["Fallout4.esm"] }) },
+      },
+    ],
+  },
+);
+const c = await installOfflineCollection(mcp, gvCollection, {
+  gameVersions: [MISMATCHED_GAME_VERSION],
+  gameVersionAnswer: "continue",
+});
+result.scenarioC = c;
+if (c.gameVersionPrompt === undefined || c.outcome !== "complete" || c.postprocessed !== true) {
+  failures.push(
+    `C: the game-version prompt or the install after Continue failed (${JSON.stringify(c)})`,
   );
 }
 

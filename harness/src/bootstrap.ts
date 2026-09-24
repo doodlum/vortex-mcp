@@ -24,6 +24,7 @@ import path from "node:path";
 
 import { ConfigError, MCP_EXTENSION_ID, type HarnessConfig } from "./config";
 import { ensureGameManaged, type EnsureGameResult } from "./gameSetup";
+import { readJsonFile } from "./jsonFile";
 import {
   ensureExtensionBuilt,
   installMcpExtension,
@@ -111,7 +112,7 @@ export function readMarker(dir: string): SnapshotMarker | undefined {
   const file = path.join(dir, MARKER_FILE);
   if (!fs.existsSync(file)) return undefined;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as SnapshotMarker;
+    return readJsonFile<SnapshotMarker>(file);
   } catch {
     return undefined;
   }
@@ -194,7 +195,12 @@ export async function bootstrap(
   const report = options.onProgress ?? ((): void => undefined);
   const configuredKey = config.apiKey?.trim();
   const apiKey = configuredKey !== undefined && configuredKey !== "" ? configuredKey : ANONYMOUS;
-  if (apiKey === ANONYMOUS)
+  if (config.apiKeyWithheld === true) {
+    report(
+      "sandbox: not seeding the harness/.env API key, which makes each local install wait " +
+        "on a Nexus lookup; pass --with-api-key to seed it",
+    );
+  } else if (apiKey === ANONYMOUS)
     report("no API key configured; cached OAuth is restored automatically when available");
 
   fs.mkdirSync(config.cacheDir, { recursive: true });

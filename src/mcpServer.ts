@@ -16,6 +16,7 @@ import * as ui from "./uiAutomation";
 import * as perf from "./perfTrace";
 import { probeCounts } from "./checkProbe";
 import { authStatus } from "./authStatus";
+import * as collectionState from "./collectionState";
 
 type IExtensionApi = types.IExtensionApi;
 
@@ -361,6 +362,41 @@ function registerModInventoryTools(server: McpServer, api: IExtensionApi): void 
     async ({ gameId }) => ({
       content: [jsonText(control.collectionStatus(api, gameId))],
     }),
+  );
+
+  server.registerTool(
+    "collection_install_state",
+    {
+      description:
+        "Where a collection install is right now. `driver` is the collections extension's " +
+        "InstallDriver, read from the `driver` prop Vortex passes its collection dialogs: `step` " +
+        "(prepare, changelog, query = Install Now shown, start = auto-continues on the next update, " +
+        "disclaimer, installing, review = review screen), installDone, postprocessing, the " +
+        "collection id. That is a private shape: when a Vortex build stops passing the prop, " +
+        "driver.found is false with a reason. `session` summarises the public install session " +
+        "(state.session.collections.activeSession: members by status and type, the ones still " +
+        "outstanding). `dialogs` are the open modals, each tagged with the step it belongs to " +
+        "(query, game-version-prompt, review) where recognised. Read-only; cheap enough to poll.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      // Older Vortex builds have no session.collections at all.
+      const collections = (api.getState().session as unknown as Record<string, unknown>)
+        ?.collections as { activeSession?: unknown; lastActiveSessionId?: unknown } | undefined;
+      return {
+        content: [
+          jsonText({
+            driver: collectionState.readDriver(),
+            session: collectionState.summariseSession(collections?.activeSession),
+            lastActiveSessionId: collections?.lastActiveSessionId ?? null,
+            dialogs: ui.activeDialogs().map((text) => ({
+              step: collectionState.classifyDialog(text) ?? null,
+              text: text.slice(0, 300),
+            })),
+          }),
+        ],
+      };
+    },
   );
 
   server.registerTool(

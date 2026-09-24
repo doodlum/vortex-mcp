@@ -6,13 +6,23 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  assignedFields,
   commentText,
   computeSize,
+  declaresOwnMember,
+  defaultExportMentions,
+  exportedNames,
+  filterMemberHits,
+  importTargets,
   lintPullRequest,
   measurementsInComments,
+  memberUse,
+  parseImports,
   parseUnifiedDiff,
+  resolveTestPath,
   runPreflight,
   sizeCheck,
+  stateReaders,
   touchedSymbols,
   type FileDiff,
   type PullRequestText,
@@ -189,6 +199,192 @@ describe("touched symbols", () => {
   });
 });
 
+describe("member uses", () => {
+  it("counts member access and JSX attributes, not bare words or spreads", () => {
+    expect(memberUse("driver.renderRow(x)", "renderRow")).toBe("member");
+    expect(memberUse("this.renderRow", "renderRow")).toBe("member");
+    expect(memberUse("a?.renderRow()", "renderRow")).toBe("member");
+    expect(memberUse("items.map(renderRow)", "renderRow")).toBeUndefined();
+    expect(memberUse("const x = { ...renderRow };", "renderRow")).toBeUndefined();
+    expect(memberUse("<Table renderRow={x} />", "renderRow", "a.tsx")).toBe("jsx");
+    expect(memberUse("<Table renderRow={x} />", "renderRow", "a.ts")).toBeUndefined();
+    expect(memberUse("const renderRow = {", "renderRow", "a.tsx")).toBeUndefined();
+  });
+
+  it("recognises a class declaring its own member, not calls or locals", () => {
+    expect(declaresOwnMember("  private renderRow = (): Node => {", "renderRow")).toBe(true);
+    expect(declaresOwnMember("  renderRow(item: Item) {", "renderRow")).toBe(true);
+    expect(declaresOwnMember("  public get step() {", "step")).toBe(true);
+    expect(declaresOwnMember("    onScroll?.(event);", "onScroll")).toBe(false);
+    expect(declaresOwnMember("    onScroll(event);", "onScroll")).toBe(false);
+    expect(declaresOwnMember("const renderRow = () => 1;", "renderRow")).toBe(false);
+    // git grep hits arrive trimmed
+    expect(declaresOwnMember("private renderRow = () => 1;", "renderRow")).toBe(true);
+  });
+
+  it("drops another class's own member and its this.uses", () => {
+    const hit = (file: string, text: string) => ({ file, line: 1, text });
+    const { kept, dropped } = filterMemberHits(
+      [
+        hit("other.tsx", "  private renderRow = () => 1;"),
+        hit("other.tsx", "return this.renderRow();"),
+        hit("other.tsx", "return table.renderRow();"),
+        hit("local.ts", "items.map(renderRow);"),
+        hit("use.ts", "table.renderRow(1);"),
+      ],
+      "renderRow",
+    );
+    expect(kept.map((h) => `${h.file}: ${h.text}`)).toEqual([
+      "other.tsx: return table.renderRow();",
+      "use.ts: table.renderRow(1);",
+    ]);
+    expect(dropped).toBe(3);
+    // A getter is read as `x.step`; `<Steps step={…}>` is some component's prop.
+    const jsx = [hit("a.tsx", "<Steps step={n} />"), hit("b.ts", "if (driver.step) {")];
+    expect(filterMemberHits(jsx, "step").kept).toHaveLength(2);
+    expect(filterMemberHits(jsx, "step", { jsx: false }).kept.map((h) => h.file)).toEqual(["b.ts"]);
+  });
+});
+
+describe("module consumers", () => {
+  it("finds a default export that wraps a class, across lines", () => {
+    const wrapped =
+      'class A {}\n\nexport default translate(["x"])(\n  connect(m)(\n    A,\n  ),\n);\n';
+    expect(defaultExportMentions(wrapped, "A")).toBe(true);
+    expect(defaultExportMentions("export default class A {}", "A")).toBe(true);
+    expect(defaultExportMentions("export { A as default };", "A")).toBe(true);
+    expect(defaultExportMentions("export default B;\nconst A = 1;\nfoo(A);", "A")).toBe(false);
+  });
+
+  it("parses default, named, type and re-export bindings", () => {
+    const imports = parseImports(
+      [
+        'import Table, { type Row, makeRow as mk } from "./Table";',
+        'import type { Other } from "./Other";',
+        "import {\n  ComponentEx,\n  Table as T,\n} from 'vortex-api';",
+        'import * as ns from "./ns";',
+        'export { default as Widget, helper } from "./Widget";',
+      ].join("\n"),
+    );
+    expect(imports).toEqual([
+      {
+        spec: "./Table",
+        defaultName: "Table",
+        namespace: undefined,
+        named: [
+          { imported: "Row", local: "Row" },
+          { imported: "makeRow", local: "mk" },
+        ],
+        typeOnly: false,
+        reexport: false,
+      },
+      {
+        spec: "./Other",
+        defaultName: undefined,
+        namespace: undefined,
+        named: [{ imported: "Other", local: "Other" }],
+        typeOnly: true,
+        reexport: false,
+      },
+      {
+        spec: "vortex-api",
+        defaultName: undefined,
+        namespace: undefined,
+        named: [
+          { imported: "ComponentEx", local: "ComponentEx" },
+          { imported: "Table", local: "T" },
+        ],
+        typeOnly: false,
+        reexport: false,
+      },
+      {
+        spec: "./ns",
+        defaultName: undefined,
+        namespace: "ns",
+        named: [],
+        typeOnly: false,
+        reexport: false,
+      },
+      {
+        spec: "./Widget",
+        named: [
+          { imported: "default", local: "Widget" },
+          { imported: "helper", local: "helper" },
+        ],
+        typeOnly: false,
+        reexport: true,
+      },
+    ]);
+  });
+
+  it("resolves relative and alias specs to the module", () => {
+    const target = "src/renderer/src/controls/Table.tsx";
+    expect(importTargets("src/renderer/src/views/A.tsx", "../controls/Table", target)).toBe(true);
+    expect(importTargets("src/renderer/src/views/A.tsx", "@/controls/Table", target)).toBe(true);
+    expect(importTargets("src/renderer/src/views/A.tsx", "../ui/Table", target)).toBe(false);
+    expect(importTargets("src/renderer/src/views/A.tsx", "react", target)).toBe(false);
+    expect(importTargets("src/a/b.ts", "../util", "src/util/index.ts")).toBe(true);
+  });
+
+  it("reads the names a barrel exports a binding under", () => {
+    const barrel =
+      'import Table from "./Table";\n\nexport {\n  Spinner,\n  Table,\n  Table as Grid,\n};\n';
+    expect(exportedNames(barrel, "Table")).toEqual(["Table", "Grid"]);
+    expect(exportedNames('export { Table } from "./x";', "Table")).toEqual([]);
+  });
+});
+
+describe("state readers", () => {
+  it("finds the fields a line assigns", () => {
+    expect(assignedFields('this.mStep = "start";')).toEqual(["mStep"]);
+    expect(assignedFields("this.mCount += 1; this.mOther++; --this.mLast;").toSorted()).toEqual([
+      "mCount",
+      "mLast",
+      "mOther",
+    ]);
+    expect(assignedFields('if (this.mStep === "start") {')).toEqual([]);
+  });
+
+  it("lists reads, not writes or comments", () => {
+    const content = [
+      "class A {",
+      "  get step() {",
+      "    return this.mStep;",
+      "  }",
+      "  go() {",
+      '    this.mStep = "x";',
+      "    // this.mStep is read here",
+      '    if (this.mStep === "y") this.mStepCount++;',
+      "    this.mStep++;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(stateReaders(content, "mStep")).toEqual([3, 8]);
+  });
+});
+
+describe("--test paths", () => {
+  it("accepts paths from the checkout root or from --project-dir, and rejects others", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-paths-"));
+    try {
+      fs.mkdirSync(path.join(root, "src", "renderer", "src"), { recursive: true });
+      fs.writeFileSync(path.join(root, "src", "renderer", "src", "a.test.ts"), "");
+      expect(resolveTestPath(root, "src/renderer/src/a.test.ts")).toBe(
+        "src/renderer/src/a.test.ts",
+      );
+      expect(resolveTestPath(root, "src/a.test.ts", "src/renderer")).toBe(
+        "src/renderer/src/a.test.ts",
+      );
+      expect(resolveTestPath(root, path.join(root, "src/renderer/src/a.test.ts"))).toBe(
+        "src/renderer/src/a.test.ts",
+      );
+      expect(() => resolveTestPath(root, "src/a.test.ts")).toThrow(/does not exist; tried/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("measurements in comments", () => {
   it("extracts comments without mistaking URLs for them", () => {
     expect(commentText('const u = "https://example.test/5ms";')).toBeUndefined();
@@ -302,7 +498,7 @@ function write(root: string, rel: string, content: string | Buffer): void {
   fs.writeFileSync(path.join(root, rel), content);
 }
 
-describe("runPreflight on a git checkout", () => {
+describe("runPreflight on a git checkout", { timeout: 60_000 }, () => {
   let repo: string;
 
   beforeEach(() => {
@@ -442,6 +638,31 @@ describe("runPreflight on a git checkout", () => {
     expect(fs.readFileSync(path.join(repo, "src/caller.ts"), "utf8")).toBe("changed\n");
   });
 
+  it("resolves --test from --project-dir and says where paths are relative to", async () => {
+    write(repo, "pkg/package.json", "{}\n");
+    write(repo, "pkg/src/x.test.ts", "x\n");
+    run(repo, "add", "-A");
+    run(repo, "commit", "-q", "-m", "test: pkg");
+    const seen: string[][] = [];
+    const report = await runPreflight({
+      checkout: repo,
+      base: "master",
+      tests: ["src/x.test.ts"],
+      projectDir: "pkg",
+      runner: fixAwareRunner(seen),
+    });
+    const revert = report.checks.find((c) => c.id === "revert");
+    expect(seen[0]?.slice(0, 2)).toEqual(["pkg", "src/x.test.ts"]);
+    expect(revert?.details.join("\n")).toContain("in pkg (paths relative to it): src/x.test.ts");
+    const missing = await runPreflight({
+      checkout: repo,
+      base: "master",
+      tests: ["nowhere.test.ts"],
+      runner: () => Promise.reject(new Error("must not run")),
+    });
+    expect(missing.checks.find((c) => c.id === "revert")?.summary).toContain("does not exist");
+  });
+
   it("lints the PR through an injected fetcher", async () => {
     const report = await runPreflight({
       checkout: repo,
@@ -452,5 +673,115 @@ describe("runPreflight on a git checkout", () => {
     });
     expect(report.checks.find((c) => c.id === "description")?.status).toBe("fail");
     expect(report.passed).toBe(false);
+  });
+});
+
+describe("callers of a class member and readers of its state", { timeout: 60_000 }, () => {
+  let repo: string;
+  const TABLE = (body: string, start: string) => `import React from "react";
+
+class SuperTable extends React.Component {
+  private mStep = "prepare";
+
+  public get step() {
+    return this.mStep;
+  }
+
+  public renderRow(id: string) {
+    ${body}
+  }
+
+  public canContinue() {
+    return this.mStep === "review";
+  }
+
+  public begin() {
+    this.mStep = "${start}";
+  }
+}
+
+export default translate(["common"])(
+  SuperTable,
+);
+`;
+
+  beforeEach(() => {
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-members-"));
+    run(repo, "init", "-q", "-b", "master");
+    run(repo, "config", "user.email", "test@example.test");
+    run(repo, "config", "user.name", "Test");
+    run(repo, "config", "core.autocrlf", "false");
+    write(repo, "src/controls/Table.tsx", TABLE("return id;", "start"));
+    write(repo, "src/controls/api.ts", 'import Table from "./Table";\n\nexport {\n  Table,\n};\n');
+    write(repo, "src/views/ModList.tsx", 'import SuperTable from "../controls/Table";\n');
+    write(repo, "src/views/Alias.tsx", 'import Grid from "@/controls/Table";\n');
+    write(repo, "src/views/Types.ts", 'import type { IRow } from "../controls/Table";\n');
+    write(repo, "src/views/Use.ts", 'export const cell = grid.renderRow("a");\n');
+    write(
+      repo,
+      "extensions/ext/src/view.tsx",
+      'import {\n  ComponentEx,\n  Table,\n} from "@nexusmods/vortex-api";\n\nexport const V = () => <Table renderRow={x} />;\n',
+    );
+    write(
+      repo,
+      "extensions/other/src/other.tsx",
+      [
+        "class Other {",
+        "  private renderRow = () => 1;",
+        "  public go() {",
+        "    return this.renderRow();",
+        "  }",
+        "}",
+        "const renderRow = () => 2;",
+        "[1].map(renderRow);",
+        "export const now = driver.step;",
+        "",
+      ].join("\n"),
+    );
+    run(repo, "add", ".");
+    run(repo, "commit", "-q", "-m", "base");
+    run(repo, "checkout", "-q", "-b", "fix");
+    write(repo, "src/controls/Table.tsx", TABLE("return `${id}`;", "installing"));
+    run(repo, "add", "-A");
+    run(repo, "commit", "-q", "-m", "fix: rows");
+  });
+
+  afterEach(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("searches members as members and lists the default export's consumers", async () => {
+    const report = await runPreflight({ checkout: repo, base: "master", skipRevert: true });
+    const text = report.checks.find((c) => c.id === "callers")?.details.join("\n") ?? "";
+    expect(text).toContain(
+      "SuperTable.renderRow [method] src/controls/Table.tsx:10: 2 references in 2 files " +
+        "(4 bare-name or other-class hits left out)",
+    );
+    expect(text).toContain("src/views/Use.ts:1:");
+    expect(text).toContain("extensions/ext/src/view.tsx:6:");
+    expect(text).not.toContain("other.tsx");
+    expect(text).toContain(
+      "consumers of SuperTable (src/controls/Table.tsx, encloses the touched renderRow, begin)",
+    );
+    expect(text).toContain(
+      "default export imported by 3 files: src/controls/api.ts (as Table), " +
+        "src/views/Alias.tsx (as Grid), src/views/ModList.tsx (as SuperTable)",
+    );
+    expect(text).toContain(
+      "re-exported as Table by src/controls/api.ts; imported from there or vortex-api by 1 files: " +
+        "extensions/ext/src/view.tsx",
+    );
+  });
+
+  it("lists the readers of a field whose assignment changed, and the getter's uses", async () => {
+    const report = await runPreflight({ checkout: repo, base: "master", skipRevert: true });
+    const state = report.checks.find((c) => c.id === "state");
+    expect(state?.status).toBe("warn");
+    const text = state?.details.join("\n") ?? "";
+    expect(text).toContain("this.mStep is assigned by the diff and read by 2 members");
+    expect(text).toContain("SuperTable.step (line 7): return this.mStep;");
+    expect(text).toContain('SuperTable.canContinue (line 15): return this.mStep === "review";');
+    expect(text).toContain("getter step: 1 uses outside the diff");
+    expect(text).toContain("extensions/other/src/other.tsx:9: export const now = driver.step;");
   });
 });

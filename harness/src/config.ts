@@ -95,6 +95,11 @@ export interface HarnessConfig {
    * or VORTEX_AI_OWNER; unset means "anonymous".
    */
   owner?: string;
+  /**
+   * True when an API key is configured but deliberately not used: sandbox runs are
+   * local-only, and a seeded key makes every local install wait on Nexus lookups.
+   */
+  apiKeyWithheld?: boolean;
 }
 
 function envFlag(name: string): boolean {

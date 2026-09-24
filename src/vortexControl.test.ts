@@ -1301,6 +1301,36 @@ describe("vortexControl: dispatchAction", () => {
     expect(secondPoll.entries.map((e) => e.args)).toEqual([["third"]]);
   });
 
+  it("onEvent subscribes to a plain event once, with JSON-safe args", async () => {
+    const api = fakeApi();
+    (api as unknown as { ext: Record<string, unknown> }).ext = {};
+    const on = (api as unknown as { events: { on: ReturnType<typeof vi.fn> } }).events.on;
+
+    const first = (await dispatchAction(api, "onEvent", [
+      "collection-postprocess-complete",
+      "__CALLBACK__",
+    ])) as { listenerId: string };
+    const again = (await dispatchAction(api, "onEvent", [
+      "collection-postprocess-complete",
+      "__CALLBACK__",
+    ])) as { listenerId: string };
+
+    expect(again.listenerId).toBe(first.listenerId);
+    expect(on).toHaveBeenCalledTimes(1);
+    expect(on).toHaveBeenCalledWith("collection-postprocess-complete", expect.any(Function));
+
+    const handler = on.mock.calls[0]?.[1] as (...args: unknown[]) => void;
+    const cyclic: Record<string, unknown> = { id: "m1", cb: () => undefined };
+    cyclic.self = cyclic;
+    handler("fallout4", cyclic);
+    expect(pollListener(first.listenerId).entries.map((e) => e.args)).toEqual([
+      ["fallout4", { id: "m1", self: "[circular]" }],
+    ]);
+    await expect(dispatchAction(api, "onEvent", ["__CALLBACK__"])).rejects.toThrow(
+      /needs the event name/,
+    );
+  });
+
   it("throws a clear error when a listener apiMethod is dispatched without the __CALLBACK__ sentinel", async () => {
     const onStateChange = vi.fn();
     const api = fakeApi();

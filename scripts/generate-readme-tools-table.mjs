@@ -24,6 +24,7 @@ const ACCESS_TIER = {
   automation_status: "read",
   nexus_auth_status: "read",
   collection_status: "read",
+  collection_install_state: "read",
   ui_snapshot: "read",
   ui_wait_for: "read",
   ui_get_viewport: "read",

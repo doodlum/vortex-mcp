@@ -284,3 +284,20 @@ export function formatReport(report: ResponsiveReport): string {
   if (report.reportFile) lines.push(`\nJSON report: ${report.reportFile}`);
   return lines.join("\n");
 }
+
+/**
+ * `--viewports` as one comma-separated string. Unquoted in PowerShell, `a,b` is an array.
+ * Through pnpm's pnpm.ps1 shim it arrives as one space-separated argument ("a b"); called
+ * directly it can arrive as separate arguments, the rest as positionals. Both are rejoined.
+ */
+export function viewportList(
+  value: string | boolean | undefined,
+  positional: string[],
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const extra = positional.filter((p) => /^\d+x\d+(?:[\s,]+\d+x\d+)*$/.test(p.trim()));
+  return [value, ...extra]
+    .flatMap((part) => part.trim().split(/[\s,]+/))
+    .filter((part) => part !== "")
+    .join(",");
+}

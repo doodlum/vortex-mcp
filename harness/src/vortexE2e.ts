@@ -34,6 +34,7 @@ import {
   type HoldResult,
   type LeaseEnv,
 } from "./lease";
+import { readJsonFile } from "./jsonFile";
 import { git, gitOk, parseUnifiedDiff, sha256 } from "./prPreflight";
 import { childEnv } from "./source";
 
@@ -929,7 +930,7 @@ function readJson(file: string): PlaywrightJsonReport {
   if (!fs.existsSync(file)) {
     throw new VortexE2eError(`Playwright wrote no JSON report to ${file}.`);
   }
-  return JSON.parse(fs.readFileSync(file, "utf8")) as PlaywrightJsonReport;
+  return readJsonFile<PlaywrightJsonReport>(file);
 }
 
 function baseEnv(): NodeJS.ProcessEnv {
@@ -963,9 +964,7 @@ export async function runVortexE2e(options: VortexE2eOptions): Promise<VortexE2e
     return path.relative(e2eDir, inE2e).replace(/\\/g, "/");
   });
   const baseline =
-    options.compare === undefined
-      ? undefined
-      : (JSON.parse(fs.readFileSync(options.compare, "utf8")) as VortexE2eReport);
+    options.compare === undefined ? undefined : readJsonFile<VortexE2eReport>(options.compare);
   const notes: string[] = [];
 
   const leases: HoldResult[] = [];

@@ -40,6 +40,7 @@
     "ai:test:collection-scale": "tsx harness/src/tests/collection-scale.e2e.ts",
     "ai:test:plugins-page": "tsx harness/src/tests/plugins-page.e2e.ts",
     "ai:test:download-churn": "tsx harness/src/tests/download-churn.e2e.ts",
+    "ai:test:mods-scroll": "tsx harness/src/tests/mods-scroll.e2e.ts",
     "install-plugin": "node scripts/install-local.mjs",
     "docs:tools": "node scripts/generate-readme-tools-table.mjs",
     "docs:tools:check": "node scripts/generate-readme-tools-table.mjs --check"

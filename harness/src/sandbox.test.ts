@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { HarnessConfig } from "./config";
-import { resetDisposableGameData } from "./sandbox";
+import { localOnlyConfig, resetDisposableGameData } from "./sandbox";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -49,5 +49,20 @@ describe("resetDisposableGameData", () => {
     expect(fs.readdirSync(data).sort()).toEqual(
       ["Fallout4.esm", "textures", "vortex.deployment.json"].sort(),
     );
+  });
+});
+
+describe("local-only sandbox runs", () => {
+  const base = { apiKey: "key-from-env", cacheDir: "c" } as HarnessConfig;
+
+  it("leave the configured API key out, and say so", () => {
+    expect(localOnlyConfig(base, false)).toMatchObject({ apiKey: undefined, apiKeyWithheld: true });
+    expect(base.apiKey).toBe("key-from-env");
+  });
+
+  it("keep it when asked, and change nothing without one", () => {
+    expect(localOnlyConfig(base, true)).toBe(base);
+    const none = { ...base, apiKey: undefined };
+    expect(localOnlyConfig(none, false)).toBe(none);
   });
 });

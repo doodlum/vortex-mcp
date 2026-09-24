@@ -23,6 +23,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { readJsonFile } from "./jsonFile";
+
 export interface PreloadRecord {
   pid: number;
   paths: Record<string, string>;
@@ -118,7 +120,7 @@ export async function verifyPreload(
     if (fs.existsSync(recordFile)) {
       let record: PreloadRecord;
       try {
-        record = JSON.parse(fs.readFileSync(recordFile, "utf8")) as PreloadRecord;
+        record = readJsonFile<PreloadRecord>(recordFile);
       } catch {
         await new Promise((resolve) => setTimeout(resolve, 50));
         continue;

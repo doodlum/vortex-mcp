@@ -25,6 +25,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 
 import { ConfigError } from "./config";
+import { parseJson } from "./jsonFile";
 
 export const ANONYMOUS_OWNER = "anonymous";
 export const INSTANCE_RESOURCE = "instance";
@@ -158,7 +159,7 @@ function readFile(file: string): Lease | undefined {
     return undefined;
   }
   try {
-    const lease = JSON.parse(raw) as Lease;
+    const lease = parseJson<Lease>(raw);
     lease.holders ??= [];
     lease.instancePids ??= [];
     return lease;

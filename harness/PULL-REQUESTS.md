@@ -148,7 +148,8 @@ Assume it is wrong until your own testing shows otherwise. Read the checkout's A
 CODESTYLE.md and docs/testing.md, and vortex-mcp's harness/AGENTS.md, KNOWLEDGE.md and
 harness/PULL-REQUESTS.md. Checkout: <dir>. Do not commit, push, edit the PR, or edit
 vortex-mcp. Hold the instance lease for every Vortex, E2E or verify run, as owner <qa-name>:
-`pnpm run ai -- lease acquire --owner <qa-name> --purpose "QA <pr>" --ttl 120` before the first
+`pnpm run ai -- lease acquire --owner <qa-name> --purpose "QA <pr>" --ttl 120 --checkout <dir>`
+(the checkout lock stops anyone switching your checkout between your commands) before the first
 (re-run it to renew), `--owner <qa-name>` on every kit command (`up`, `down`, `vortex-e2e`),
 `pnpm run ai -- lease run --owner <qa-name> -- pnpm run verify` for verify, and
 `pnpm run ai -- lease release --owner <qa-name>` when done. If a command says another owner holds
@@ -197,6 +198,10 @@ durable file, `<scratchpad>/reviews/<pr>-round<n>.md`, and point the next brief 
 Agents' task output files are transcripts. They can be empty, and they are not meant to be read
 back. Findings that only exist in the orchestrator's context are lost to the next agent.
 
+**When to repeat QA.** A follow-up that changes production code gets a full QA pass again. A
+follow-up that only adds or changes tests gets preflight, including its negative control, and
+the scoped suites instead. The orchestrator checks that the diff really touches only test files.
+
 **Run the slow gates last.** Run the full `pnpm run verify` and the E2E baseline only on a head
 that has passed QA and review with nothing blocking. A gate run on an earlier head goes stale as
 soon as the fixes land.
@@ -223,7 +228,8 @@ catch it.
    helper doesn't prove anything. Run the negative control and record it. (#24281, #24282.)
 4. **Fakes must enforce the real rule.** A stand-in that records calls without the constraint the
    real code applies passes broken orderings. (#24282: re-runs must be emitted after the hold is
-   released.)
+   released.) A fake `IntersectionObserver` must report only changes, as the real one does. (visibility-proxy fix: a
+   fake that re-reported on every call would have hidden the dropped-hide bug.)
 5. **Release what you acquire on every exit path.** Early `return false`, a user Cancel, a throw
    and a pause. (#24282: the game-version Cancel leaked the suppression.)
 6. **Evidence must exercise the claimed mechanism.** If a simpler part of the fix alone would
@@ -240,4 +246,16 @@ catch it.
 11. **Make a performance fix fail without its wiring.** When the fix doesn't change behaviour, a
     "fails on the base" test is impossible. Count the work instead: wrap the input in a counting
     `Proxy` and assert reads, dispatches or calls per item, so the test fails on the base and
-    with only the wiring reverted. (#24283: reads per rule 779 against 38.)
+    with only the wiring reverted. (#24283: reads per rule 779 against 38.) A connected class
+    component such as `SuperTable` can be tested without a store: mock the `ComponentEx`
+    wrappers (`connect`, `extend`, `translate`) as identity functions and make `setState` commit
+    synchronously. (#24284: `controls/table/calculatedValues.test.ts`.)
+12. **Reviewers verify their own claims too.** Before saying a change "forces a render" or "throws",
+    trace the guard that decides it. (#24284: `updateState`'s deep `_.isEqual` meant the unguarded
+    copy cost O(n) but never rendered.)
+13. **Check that related PRs combine.** When two open PRs touch the same code or behaviour, merge
+    them without committing (`git merge --no-commit --no-ff <other>`, run the scoped suites, then
+    `git merge --abort`), and say in each PR how they interact, including any conflict
+    resolution. Also give new test files names that won't collide.
+    (#24282 with the game-version Cancel fix: the merge was clean and the double release became a
+    no-op. #24281 with #24284: both touch `Table.tsx`.)
