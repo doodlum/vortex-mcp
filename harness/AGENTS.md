@@ -109,9 +109,28 @@ can reuse it. Vortex manages OAuth refresh; credential presence does not prove
 that Nexus still accepts an account. A revoked login requires repeating this
 setup phase. The extension writes `oauth-<target>.json` only in harness mode;
 it updates the cache on token rotation and records logout so old snapshots
-cannot silently sign back in. Blank profiles inherit credentials, not old mod
+cannot silently sign back in. Only a real logout (Log out, or Nexus refusing
+the session) writes that `null` tombstone. Stock Vortex's startup migration
+`forceLogoutForOauth_1_9` also clears the login on a source build's second
+launch (the build reports version 1.0.0); the extension marks that migration
+applied in harness profiles and, if a forced logout still happens, re-applies
+the cached credentials instead of tombstoning. Blank profiles inherit credentials, not old mod
 lists or game paths. Cache directories contain credentials and must remain private and
 uncommitted. The default cache is gitignored.
+
+A new `--cache-dir` (or `VORTEX_AI_CACHE_DIR`) starts without a login. Reuse the
+machine's existing one instead of logging in again or copying files by hand:
+
+```powershell
+pnpm run ai -- login-import --cache-dir D:\other-cache           # from harness/.cache
+pnpm run ai -- login-import --cache-dir D:\other-cache --from D:\bench-cache
+```
+
+Target flags (`--installed`, `--dev-dir`) choose which target's login is copied,
+exactly as for `up`. It refuses a logged-out source, and refuses to replace an
+existing login without `--force`. Refresh tokens rotate, so the two caches
+diverge afterwards; if one is refused by Nexus, import again from the other or
+repeat `setup --oauth`.
 
 A legacy personal API key may be stored locally as `VORTEX_AI_NEXUS_API_KEY` in
 `harness/.env` if a separate workflow needs it. It is optional for this setup.

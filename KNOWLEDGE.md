@@ -128,6 +128,24 @@ Two consequences worth planning around:
 - **OAuth means a captcha**, which nothing can automate. One interactive login
   is unavoidable.
 
+### A source build's second launch logs you out
+
+`migrate()` in `util/migrate.ts` runs version-gated migrations against the
+_prior_ persisted `app.appVersion`. On a new profile that is `""`, and
+`semver.lt("", ...)` throws "Invalid Version": the log says "migration sequence
+failed" and nothing runs (harmless). That launch persists the build's version,
+and a source build reports `1.0.0` (the package.json pin). So the next launch
+runs `forceLogoutForOauth_1_9` (< 1.9.0), which clears the API key and OAuth
+credentials and sets `ForcedLogout`. Installed releases are unaffected; dev
+mode (`NODE_ENV=development`) skips migrations entirely.
+
+It cost a saved login: the OAuth cache saw the credentials vanish and wrote its
+logout tombstone. The extension now dispatches `COMPLETE_MIGRATION` for that id
+in harness profiles (during `once`, which precedes `migrate()`), and treats a
+clear followed by `SET_FORCED_LOGOUT(true)` in the same dispatch run as
+automated: it re-applies the cached credentials and resets the flag. A user's
+Log out and `refuseLogin` never set `ForcedLogout`, so they still tombstone.
+
 ### Keep the login by copying the directory, not the token
 
 The credential lives in the instance's working directory, so a reset loses it

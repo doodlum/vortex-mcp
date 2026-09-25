@@ -27,7 +27,12 @@ import { runDoctor, formatDoctorReport } from "./doctor";
 import { parseJson, stripBom } from "./jsonFile";
 import { RendererEvalRefused, evalInRenderer } from "./rendererEval";
 import { watchAndReload } from "./hotReload";
-import { attachedLeaseResources, ensureExtensionBuilt, stopStaleInstance } from "./instance";
+import {
+  attachedLeaseResources,
+  authCacheFile,
+  ensureExtensionBuilt,
+  stopStaleInstance,
+} from "./instance";
 import { VortexMcpClient } from "./mcpClient";
 import { formatReport, runResponsiveSweep, viewportList } from "./responsive";
 import { captureScreenshot } from "./cdp";
@@ -61,6 +66,7 @@ import {
   type ReleaseResult,
 } from "./lease";
 import { runUnderLease } from "./leaseCommand";
+import { importLogin } from "./loginImport";
 import {
   VortexE2eError,
   e2eExitCode,
@@ -146,6 +152,9 @@ Initial account setup (only for Nexus collections)
     --no-wait            Return with login pending; finish with save-login
   auth-status            Print presence booleans only; never print credentials
   save-login             Verify OAuth, stop cleanly, capture the current baseline
+  login-import --from <cache-dir>
+                         Reuse the saved login of another cache dir (default: the
+                         harness cache) in --cache-dir; --force replaces one
 
 Instance lifecycle
   doctor                 Report prerequisites and actionable fixes
@@ -698,6 +707,15 @@ async function main(): Promise<number> {
       await purgeGame(mcp, { allowForeignPurge: true, onProgress: (m) => log(`  ${m}`) });
       log("");
       log(`Purged ${config.gameId}; the game directory is back to unmodded.`);
+      return 0;
+    }
+
+    case "login-import": {
+      const from =
+        typeof flags.from === "string" ? flags.from : path.join(REPO_ROOT, "harness", ".cache");
+      const source = importLogin(from, authCacheFile(config), flags.force === true);
+      log(`Saved login imported from ${source} into ${config.cacheDir}.`);
+      log("Takes effect on the next start (`up --fresh` or a restart).");
       return 0;
     }
 
