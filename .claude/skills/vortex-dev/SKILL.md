@@ -42,11 +42,12 @@ pnpm run ai:watch         # reload on rebuild, in a second shell
 
 Then make the change in `.vortex-src/`, rebuild, and the running app picks it up.
 
-| Change               | Rebuild                              | Picked up by                      |
-| -------------------- | ------------------------------------ | --------------------------------- |
-| Renderer (React, UI) | `pnpm nx run @vortex/renderer:build` | `ai:watch` → renderer reload      |
-| Main process         | `node src/main/build.mjs`            | full restart (`ai:down && ai:up`) |
-| This extension       | `pnpm run build` (in this repo)      | `ai:watch` → renderer reload      |
+| Change               | Rebuild                                              | Picked up by                      |
+| -------------------- | ---------------------------------------------------- | --------------------------------- |
+| Renderer (React, UI) | `pnpm nx run @vortex/renderer:build`                 | `ai:watch` → renderer reload      |
+| Main process         | `node src/main/build.mjs`                            | full restart (`ai:down && ai:up`) |
+| Release-parity build | `pnpm run ai -- build --checkout <dir> --production` | full restart; `up --production`   |
+| This extension       | `pnpm run build` (in this repo)                      | `ai:watch` → renderer reload      |
 
 Nothing in the renderer can reload main — `watch` says so explicitly rather than
 reloading and appearing to do nothing.
@@ -91,12 +92,22 @@ imports, `controls/api.ts` and `util/api.ts` re-exports, extensions importing fr
 `vortex-api`), the readers of any class field whose assignment changed, and every dispatch of
 an action whose reducer handler changed. Callers count when they are outside the diff's hunks,
 even in a changed file. Give `--test` paths from the checkout root or from `--project-dir`.
+A changed private helper is followed to the exported code calling it ("via private testRef");
+`test-utils/` counts as test code. To show a test fails with only the wiring reverted, when the
+wiring is a call site in a file that also defines the new code, use `--revert-hunk <file>:<line>`.
+
+`build --production` runs the checkout's pinned pnpm with NODE_ENV=production for the build only,
+under the checkout's lock, and puts back `etc/vortex.api.md` and `etc/Dependency Report.md` if
+the build rewrote them. Don't set NODE_ENV in the shell: the sandbox refuses
+`Remove-Item Env:NODE_ENV` (`$env:NODE_ENV=$null` works).
 
 Sandbox runs (`--sandbox`, `--bethesda-sandbox`) don't seed an API key, so local installs
 don't wait on Nexus lookups (the key is kept out of Vortex's environment too);
 `--with-api-key` if a test needs one. Running Vortex from a checkout locks that checkout for
 the run, so another agent's rebuild of it is refused. For a one-off script
-against the kit, `vortex-ai script <file.mts>` (see harness/AGENTS.md).
+against the kit, `vortex-ai script <file.mts>` (see harness/AGENTS.md); `--owner` may come
+before or after the file. A session's leases: `lease acquire --owner <you> --checkout <dir>`
+takes the instance and the checkout together, and `lease release --owner <you>` releases both.
 
 ## Before calling a PR ready
 

@@ -3,7 +3,8 @@ import type { Page } from "@playwright/test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { captureScreenshot, realWheel } from "./cdp";
+import vm from "node:vm";
+import { NAME_SHIM, captureScreenshot, realWheel } from "./cdp";
 import type { HarnessConfig } from "./config";
 
 describe("realWheel", () => {
@@ -47,4 +48,24 @@ it("captures the native viewport without a CSS-pixel clip at non-default zoom", 
   } finally {
     fs.rmSync(artifactDir, { recursive: true, force: true });
   }
+});
+
+describe("the __name shim", () => {
+  // What tsx (esbuild keepNames) makes of `() => { const inner = () => 1; ... }`.
+  const compiled =
+    '(() => { const inner = __name(() => 1, "inner"); return inner.name + inner(); })()';
+
+  it("lets a tsx-compiled function run in a page that has no __name", () => {
+    const page = vm.createContext({});
+    expect(() => vm.runInContext(compiled, page)).toThrow(/__name is not defined/);
+    vm.runInContext(NAME_SHIM, page);
+    expect(vm.runInContext(compiled, page)).toBe("inner1");
+  });
+
+  it("leaves a page's own __name alone", () => {
+    const page = vm.createContext({ __name: (t: unknown) => t, marker: 1 });
+    const own = vm.runInContext("__name", page) as unknown;
+    vm.runInContext(NAME_SHIM, page);
+    expect(vm.runInContext("__name", page)).toBe(own);
+  });
 });

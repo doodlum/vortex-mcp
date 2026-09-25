@@ -7,6 +7,11 @@
  * near the edge of the scroll area, whether a noShrink column keeps its width, and how
  * well the conflict editor virtualises. `ai:test:mods-scroll` runs them as a scenario.
  *
+ * Later QA added three more, each written by hand at least twice before: how many rows one
+ * update gave a new data object and re-rendered (`measureRowIdentity`), blocking measured
+ * until the page shows an action's result (`measureAfter`), and a dialog's content frame by
+ * frame while it fades (`recordDialogFade`).
+ *
  * Page code is sent as source text: tsx compiles named functions with an `__name` helper
  * the page does not have (KNOWLEDGE.md). The page-side builders are exported so the unit
  * tests can run them against a DOM.
@@ -440,5 +445,572 @@ export async function typeConflictFilter(page: Page, text: string): Promise<void
       input.dispatchEvent(new Event("input", { bubbles: true }));
     })()`);
     await sleep(page, 400);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Row identity: which rows one update gave a new data object, and which re-rendered
+// ---------------------------------------------------------------------------
+
+/**
+ * Page source that instruments every mounted SuperTable (or only `tableIds`) and the TableRow
+ * component, and resets the counters in `window.__vxRowId`:
+ *
+ *   - each table instance's `updateState`: per commit of `calculatedValues`, how many rows got a
+ *     new object (`changedRefs`), how many of those hold no different value at all (`spurious`,
+ *     JSON-compared per column), rows added and removed, and which columns differed (`keyHist`);
+ *   - TableRow's prototype `shouldComponentUpdate` and `render`, per table: calls, how many
+ *     calls got a new `data` object, how many of those were equal by value, how many returned
+ *     true, and renders.
+ *
+ * Found through React's fiber tree (`__reactFiber$…` on `#table-<id>` and `tr[data-rowid]`),
+ * which is a private shape: `installed.tables` is empty or `rowPrototype` false when a build
+ * no longer matches. An in-place mutation of an existing row object is invisible here (the
+ * reference is unchanged); TableRow's `dataChanged` still counts a new `data` prop.
+ * Harvested from the QA of Nexus-Mods/Vortex#24284.
+ */
+export function rowIdentityInstallSource(tableIds?: string[]): string {
+  return `(() => {
+    const w = window;
+    const store = { commits: [], scu: {}, renders: {} };
+    w.__vxRowId = store;
+    const wanted = ${JSON.stringify(tableIds ?? null)};
+    const fiberOf = (el) => {
+      const key = Object.keys(el).find((k) => k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance"));
+      return key ? el[key] : null;
+    };
+    const same = (a, b) => {
+      try { return JSON.stringify(a) === JSON.stringify(b); } catch (e) { return a === b; }
+    };
+    const selector = wanted === null
+      ? '[id^="table-"]'
+      : wanted.map((id) => '[id="table-' + String(id).replace(/"/g, '\\\\"') + '"]').join(",");
+    const tables = [];
+    for (const el of Array.from(document.querySelectorAll(selector))) {
+      let f = fiberOf(el);
+      let guard = 0;
+      while (f && guard++ < 200) {
+        const sn = f.stateNode;
+        if (sn && sn.state && typeof sn.state === "object" && "calculatedValues" in sn.state &&
+            sn.props && sn.props.tableId !== undefined && typeof sn.updateState === "function") {
+          if (!tables.includes(sn.props.tableId)) tables.push(sn.props.tableId);
+          if (sn.__vxOrigUpdateState === undefined) {
+            sn.__vxOrigUpdateState = sn.updateState;
+            sn.updateState = function (ns, cb) {
+              const rec = window.__vxRowId;
+              const old = this.state.calculatedValues;
+              const next = ns && ns.calculatedValues;
+              if (rec && old && next && old !== next) {
+                let changedRefs = 0, spurious = 0, added = 0, removed = 0;
+                const spuriousSample = [];
+                const keyHist = {};
+                for (const rowId of Object.keys(next)) {
+                  if (old[rowId] === undefined) { added++; continue; }
+                  if (old[rowId] === next[rowId]) continue;
+                  changedRefs++;
+                  const a = old[rowId] || {}, b = next[rowId] || {};
+                  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+                  const diff = [...keys].filter((k) => (k in a) !== (k in b) || !same(a[k], b[k]));
+                  for (const k of diff) keyHist[k] = (keyHist[k] || 0) + 1;
+                  if (diff.length === 0) {
+                    spurious++;
+                    if (spuriousSample.length < 3) spuriousSample.push(rowId);
+                  }
+                }
+                for (const rowId of Object.keys(old)) if (next[rowId] === undefined) removed++;
+                rec.commits.push({ table: String(this.props.tableId), t: Math.round(performance.now()),
+                  rows: Object.keys(next).length, changedRefs, spurious, added, removed, spuriousSample, keyHist });
+              }
+              return this.__vxOrigUpdateState.call(this, ns, cb);
+            };
+          }
+          break;
+        }
+        f = f.return;
+      }
+    }
+    let rowPrototype = false;
+    for (const tr of Array.from(document.querySelectorAll("tr[data-rowid]"))) {
+      let f = fiberOf(tr);
+      let proto = null;
+      let guard = 0;
+      while (f && guard++ < 50) {
+        const sn = f.stateNode;
+        if (sn && sn.props && sn.props.rawData !== undefined && sn.props.tableId !== undefined &&
+            typeof sn.shouldComponentUpdate === "function" && typeof sn.render === "function") {
+          proto = Object.getPrototypeOf(sn);
+          break;
+        }
+        f = f.return;
+      }
+      if (proto === null) continue;
+      rowPrototype = true;
+      if (!proto.__vxRowWrapped) {
+        const scu = proto.shouldComponentUpdate, render = proto.render;
+        proto.__vxOrigSCU = scu;
+        proto.__vxOrigRender = render;
+        proto.shouldComponentUpdate = function (np, ns) {
+          const result = scu.call(this, np, ns);
+          const rec = window.__vxRowId;
+          if (rec) {
+            const id = String(this.props.tableId);
+            const s = (rec.scu[id] = rec.scu[id] || { calls: 0, dataChanged: 0, dataChangedNoValueDiff: 0, rendered: 0 });
+            s.calls++;
+            if (this.props.data !== np.data) {
+              s.dataChanged++;
+              if (same(this.props.data, np.data)) s.dataChangedNoValueDiff++;
+            }
+            if (result) s.rendered++;
+          }
+          return result;
+        };
+        proto.render = function () {
+          const rec = window.__vxRowId;
+          if (rec) {
+            const id = String(this.props.tableId);
+            rec.renders[id] = (rec.renders[id] || 0) + 1;
+          }
+          return render.call(this);
+        };
+        proto.__vxRowWrapped = true;
+      }
+      break;
+    }
+    return { tables, rowPrototype };
+  })()`;
+}
+
+/** Page source: undo `rowIdentityInstallSource`'s wrappers. */
+export const ROW_IDENTITY_RESTORE = `(() => {
+  const fiberOf = (el) => {
+    const key = Object.keys(el).find((k) => k.startsWith("__reactFiber") || k.startsWith("__reactInternalInstance"));
+    return key ? el[key] : null;
+  };
+  let restored = 0;
+  const seen = new Set();
+  for (const el of Array.from(document.querySelectorAll('[id^="table-"], tr[data-rowid]'))) {
+    let f = fiberOf(el);
+    let guard = 0;
+    while (f && guard++ < 200) {
+      const sn = f.stateNode;
+      if (sn && typeof sn === "object" && !seen.has(sn)) {
+        seen.add(sn);
+        if (sn.__vxOrigUpdateState !== undefined) {
+          sn.updateState = sn.__vxOrigUpdateState;
+          delete sn.__vxOrigUpdateState;
+          restored++;
+        }
+        const proto = Object.getPrototypeOf(sn);
+        if (proto && proto.__vxRowWrapped) {
+          proto.shouldComponentUpdate = proto.__vxOrigSCU;
+          proto.render = proto.__vxOrigRender;
+          delete proto.__vxRowWrapped;
+          restored++;
+        }
+      }
+      f = f.return;
+    }
+  }
+  window.__vxRowId = undefined;
+  return restored;
+})()`;
+
+export interface RowIdentityCommit {
+  table: string;
+  /** performance.now() in the page when the commit happened. */
+  t: number;
+  rows: number;
+  /** Rows whose calculated-values object is new in this commit. */
+  changedRefs: number;
+  /** Of those, rows whose values are all unchanged: a new object for nothing. */
+  spurious: number;
+  added: number;
+  removed: number;
+  spuriousSample: string[];
+  /** Columns that differed, by how many rows. */
+  keyHist: Record<string, number>;
+}
+
+export interface RowIdentityRaw {
+  commits: RowIdentityCommit[];
+  scu: Record<
+    string,
+    { calls: number; dataChanged: number; dataChangedNoValueDiff: number; rendered: number }
+  >;
+  renders: Record<string, number>;
+}
+
+export interface RowIdentityTable {
+  commits: number;
+  changedRefs: number;
+  spurious: number;
+  added: number;
+  removed: number;
+  /** TableRow shouldComponentUpdate calls, and how many got a new `data` object. */
+  rowUpdates: number;
+  rowDataChanged: number;
+  rowDataChangedNoValueDiff: number;
+  /** TableRow renders: rows that actually re-rendered. */
+  rowRenders: number;
+  keyHist: Record<string, number>;
+}
+
+/** Per table totals of what `rowIdentityInstallSource` recorded. */
+export function summariseRowIdentity(raw: RowIdentityRaw): Record<string, RowIdentityTable> {
+  const out: Record<string, RowIdentityTable> = {};
+  const entry = (id: string): RowIdentityTable =>
+    (out[id] ??= {
+      commits: 0,
+      changedRefs: 0,
+      spurious: 0,
+      added: 0,
+      removed: 0,
+      rowUpdates: 0,
+      rowDataChanged: 0,
+      rowDataChangedNoValueDiff: 0,
+      rowRenders: 0,
+      keyHist: {},
+    });
+  for (const commit of raw.commits) {
+    const e = entry(commit.table);
+    e.commits++;
+    e.changedRefs += commit.changedRefs;
+    e.spurious += commit.spurious;
+    e.added += commit.added;
+    e.removed += commit.removed;
+    for (const [key, n] of Object.entries(commit.keyHist)) {
+      e.keyHist[key] = (e.keyHist[key] ?? 0) + n;
+    }
+  }
+  for (const [id, s] of Object.entries(raw.scu)) {
+    const e = entry(id);
+    e.rowUpdates += s.calls;
+    e.rowDataChanged += s.dataChanged;
+    e.rowDataChangedNoValueDiff += s.dataChangedNoValueDiff;
+  }
+  for (const [id, n] of Object.entries(raw.renders)) entry(id).rowRenders += n;
+  return out;
+}
+
+export interface RowIdentityResult<T> extends AfterResult<T> {
+  installed: { tables: string[]; rowPrototype: boolean };
+  byTable: Record<string, RowIdentityTable>;
+  commits: RowIdentityCommit[];
+}
+
+/**
+ * Run one action and report, per table, how many rows it gave a new data object and how many
+ * re-rendered, measured until `condition` (a page expression) holds and `afterMs` (default 3 s)
+ * more. The instrumentation is removed afterwards, whatever happens.
+ */
+export async function measureRowIdentity<T>(
+  page: Page,
+  action: () => Promise<T>,
+  condition: string,
+  options: MeasureAfterOptions & { tables?: string[] } = {},
+): Promise<RowIdentityResult<T>> {
+  const installed = (await page.evaluate(rowIdentityInstallSource(options.tables))) as {
+    tables: string[];
+    rowPrototype: boolean;
+  };
+  try {
+    const after = await measureAfter(page, action, condition, {
+      ...options,
+      afterMs: options.afterMs ?? 3_000,
+    });
+    const raw = (await page.evaluate("window.__vxRowId")) as RowIdentityRaw;
+    return { ...after, installed, byTable: summariseRowIdentity(raw), commits: raw.commits };
+  } finally {
+    await page.evaluate(ROW_IDENTITY_RESTORE).catch(() => undefined);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Measure an action until the page shows its result
+// ---------------------------------------------------------------------------
+
+/**
+ * Page source: start watching for `condition` (a page expression) and recording long tasks, in
+ * `window.__vxAfter`. The condition is checked on every DOM mutation and every 50 ms, so its
+ * time is when the page first showed the result, not when a poller next looked.
+ */
+export function measureAfterInstallSource(condition: string): string {
+  return `(() => {
+    const w = window;
+    if (w.__vxAfter && typeof w.__vxAfter.stop === "function") w.__vxAfter.stop();
+    const check = () => {
+      try { return !!(${condition}); } catch (e) { return false; }
+    };
+    const state = { start: performance.now(), metAt: null, tasks: [], checks: 0, initiallyTrue: check() };
+    const tick = () => {
+      if (state.metAt !== null) return;
+      state.checks++;
+      if (check()) state.metAt = performance.now();
+    };
+    let observer = null;
+    try {
+      observer = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) state.tasks.push([e.startTime, e.duration]);
+      });
+      observer.observe({ type: "longtask" });
+    } catch (e) {
+      observer = null;
+    }
+    const mutations = new MutationObserver(tick);
+    mutations.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
+    const timer = setInterval(tick, 50);
+    state.stop = () => { clearInterval(timer); mutations.disconnect(); if (observer) observer.disconnect(); };
+    w.__vxAfter = state;
+    return { initiallyTrue: state.initiallyTrue, longTasks: observer !== null };
+  })()`;
+}
+
+/** Page source: stop watching and return what was recorded. */
+export const MEASURE_AFTER_READ = `(() => {
+  const s = window.__vxAfter;
+  if (!s) return null;
+  s.stop();
+  window.__vxAfter = undefined;
+  return { start: s.start, metAt: s.metAt, tasks: s.tasks, checks: s.checks, end: performance.now() };
+})()`;
+
+export interface AfterRaw {
+  start: number;
+  metAt: number | null;
+  /** [startTime, duration] of each long task. */
+  tasks: Array<[number, number]>;
+  checks: number;
+  end: number;
+}
+
+export interface BlockedSummary {
+  longTasks: number;
+  blockedMs: number;
+  longestMs: number;
+}
+
+export interface AfterSummary {
+  conditionMet: boolean;
+  /** From the start of the action to the page first showing the result; null if it never did. */
+  conditionMs: number | null;
+  /** Long tasks that started before the result showed: the cost of getting it on screen. */
+  untilCondition: BlockedSummary;
+  /** Every long task in the window, the `afterMs` tail included. */
+  total: BlockedSummary & { windowMs: number };
+}
+
+const blockedSummary = (tasks: Array<[number, number]>): BlockedSummary => ({
+  longTasks: tasks.length,
+  blockedMs: Math.round(tasks.reduce((sum, [, d]) => sum + d, 0)),
+  longestMs: Math.round(Math.max(0, ...tasks.map(([, d]) => d))),
+});
+
+export function summariseAfter(raw: AfterRaw): AfterSummary {
+  const until = raw.metAt ?? raw.end;
+  return {
+    conditionMet: raw.metAt !== null,
+    conditionMs: raw.metAt === null ? null : Math.round(raw.metAt - raw.start),
+    untilCondition: blockedSummary(raw.tasks.filter(([start]) => start < until)),
+    total: { ...blockedSummary(raw.tasks), windowMs: Math.round(raw.end - raw.start) },
+  };
+}
+
+export interface MeasureAfterOptions {
+  /** Give up waiting for the condition after this long. Default 180 s. */
+  timeoutMs?: number;
+  /** Keep recording for this long after the condition holds. Default 0. */
+  afterMs?: number;
+  /** Measure even when the condition already holds before the action. Default false: throw. */
+  allowInitiallyTrue?: boolean;
+}
+
+export interface AfterResult<T> extends AfterSummary {
+  result: T;
+  /** How long the action itself took to resolve, from this process. */
+  actionMs: number;
+  /** The page recorded no long tasks (PerformanceObserver "longtask" is unsupported). */
+  longTasksUnavailable?: true;
+}
+
+/**
+ * Run `action` (anything: an MCP call, a click, a page script) and measure the renderer until
+ * `condition`, a page expression, first holds: when the table shows the change, rather than
+ * "until idle". Reports the time to the result and the long tasks up to it, and those in an
+ * optional `afterMs` tail. Throws when the condition already holds before the action, since it
+ * then cannot show this action's result, unless `allowInitiallyTrue`.
+ */
+export async function measureAfter<T>(
+  page: Page,
+  action: () => Promise<T>,
+  condition: string,
+  options: MeasureAfterOptions = {},
+): Promise<AfterResult<T>> {
+  const install = (await page.evaluate(measureAfterInstallSource(condition))) as {
+    initiallyTrue: boolean;
+    longTasks: boolean;
+  };
+  if (install.initiallyTrue && options.allowInitiallyTrue !== true) {
+    await page.evaluate(MEASURE_AFTER_READ).catch(() => undefined);
+    throw new Error(
+      "measureAfter: the condition already holds before the action, so it cannot show the " +
+        `action's result: ${condition.slice(0, 200)}`,
+    );
+  }
+  let raw: AfterRaw | null = null;
+  try {
+    const started = Date.now();
+    const result = await action();
+    const actionMs = Date.now() - started;
+    const deadline = started + (options.timeoutMs ?? 180_000);
+    while (Date.now() < deadline) {
+      if ((await page.evaluate("!!window.__vxAfter && window.__vxAfter.metAt !== null")) === true) {
+        break;
+      }
+      await sleep(page, 50);
+    }
+    if ((options.afterMs ?? 0) > 0) await sleep(page, options.afterMs ?? 0);
+    raw = (await page.evaluate(MEASURE_AFTER_READ)) as AfterRaw;
+    return {
+      result,
+      actionMs,
+      ...summariseAfter(raw),
+      ...(install.longTasks ? {} : { longTasksUnavailable: true as const }),
+    };
+  } finally {
+    if (raw === null) await page.evaluate(MEASURE_AFTER_READ).catch(() => undefined);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A dialog's content, frame by frame, while it opens or closes
+// ---------------------------------------------------------------------------
+
+export interface DialogMatch {
+  /** CSS selector of the dialog container. Default `.modal`. */
+  selector?: string;
+  /** Only a container whose text matches (a string: case-insensitive substring). */
+  text?: RegExp | string;
+}
+
+export interface DialogFrameState {
+  className: string;
+  title: string | null;
+  /** The container's text, first 300 characters. */
+  text: string;
+  /** Footer buttons (all buttons when there is no `.modal-footer`), with disabled marked. */
+  buttons: Array<{ text: string; disabled: boolean }>;
+}
+
+export interface DialogFrame {
+  /** Milliseconds since recording started. */
+  ms: number;
+  /** Null: no matching dialog in the DOM. */
+  state: DialogFrameState | null;
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Page source: record the matching dialog on every DOM mutation into `window.__vxDialogRec`. */
+export function dialogRecorderSource(match: DialogMatch = {}): string {
+  const text =
+    match.text === undefined
+      ? null
+      : typeof match.text === "string"
+        ? { source: escapeRegExp(match.text), flags: "i" }
+        : { source: match.text.source, flags: match.text.flags };
+  return `(() => {
+    const w = window;
+    if (w.__vxDialogRec && typeof w.__vxDialogRec.stop === "function") w.__vxDialogRec.stop();
+    const selector = ${JSON.stringify(match.selector ?? ".modal")};
+    const text = ${JSON.stringify(text)};
+    const pattern = text === null ? null : new RegExp(text.source, text.flags);
+    const t0 = performance.now();
+    const frames = [];
+    let last;
+    const clean = (s) => String(s || "").split(/\\s+/).join(" ").trim();
+    const find = () => Array.from(document.querySelectorAll(selector))
+      .find((el) => pattern === null || pattern.test(el.textContent || ""));
+    const snap = () => {
+      const el = find();
+      let state = null;
+      if (el) {
+        const footer = el.querySelector(".modal-footer");
+        const title = el.querySelector(".modal-title");
+        state = {
+          className: String(el.className || ""),
+          title: title ? clean(title.textContent) : null,
+          text: clean(el.textContent).slice(0, 300),
+          buttons: Array.from((footer || el).querySelectorAll("button"))
+            .map((b) => ({ text: clean(b.textContent), disabled: b.disabled === true })),
+        };
+      }
+      const key = JSON.stringify(state);
+      if (key !== last) {
+        frames.push({ ms: Math.round(performance.now() - t0), state });
+        last = key;
+      }
+    };
+    const observer = new MutationObserver(snap);
+    observer.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+    snap();
+    w.__vxDialogRec = { frames, stop: () => observer.disconnect() };
+    return frames.length;
+  })()`;
+}
+
+/** Page source: stop recording and return the frames. */
+export const DIALOG_RECORDER_READ = `(() => {
+  const r = window.__vxDialogRec;
+  if (!r) return null;
+  r.stop();
+  window.__vxDialogRec = undefined;
+  return r.frames;
+})()`;
+
+export interface DialogRecording<T> {
+  result: T;
+  /** One entry per change of the dialog's class, title, text or buttons, deduplicated. */
+  frames: DialogFrame[];
+  /** Whether the dialog was gone from the DOM when recording stopped. */
+  gone: boolean;
+}
+
+/**
+ * Record a dialog's DOM on every mutation while `run` makes it close (or open, or change), so
+ * what it shows during its fade transition is visible: a stale title, a button that flips, a
+ * list that empties before the fade ends. Recording continues until nothing about the dialog
+ * has changed for `settleMs` (default 500), at most `maxMs` (default 5 s) after `run`.
+ * Harvested from three ad-hoc copies in the QA of Vortex's collection review screen.
+ */
+export async function recordDialogFade<T>(
+  page: Page,
+  match: DialogMatch,
+  run: () => Promise<T>,
+  options: { settleMs?: number; maxMs?: number } = {},
+): Promise<DialogRecording<T>> {
+  await page.evaluate(dialogRecorderSource(match));
+  let frames: DialogFrame[] | null = null;
+  try {
+    const result = await run();
+    const settle = options.settleMs ?? 500;
+    const deadline = Date.now() + (options.maxMs ?? 5_000);
+    let count = -1;
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      const now = (await page.evaluate(
+        "window.__vxDialogRec ? window.__vxDialogRec.frames.length : -1",
+      )) as number;
+      if (now !== count) {
+        count = now;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince >= settle) {
+        break;
+      }
+      await sleep(page, 50);
+    }
+    frames = ((await page.evaluate(DIALOG_RECORDER_READ)) as DialogFrame[] | null) ?? [];
+    return { result, frames, gone: frames.at(-1)?.state === null };
+  } finally {
+    if (frames === null) await page.evaluate(DIALOG_RECORDER_READ).catch(() => undefined);
   }
 }

@@ -25,12 +25,27 @@ export interface FiberLike {
   memoizedProps?: unknown;
 }
 
+interface CollectionLike {
+  id?: unknown;
+  type?: unknown;
+  attributes?: { name?: unknown; customFileName?: unknown };
+}
+
+/** A collection's display name as Vortex renders it: the custom name, else its name. */
+const displayName = (collection: CollectionLike | undefined): string | undefined =>
+  asString(collection?.attributes?.customFileName) ?? asString(collection?.attributes?.name);
+
 /** What an InstallDriver exposes through getters; every field is optional on purpose. */
 export interface DriverLike {
   step?: unknown;
   installDone?: unknown;
   postprocessing?: unknown;
-  collection?: { id?: unknown; attributes?: { name?: unknown } } | undefined;
+  collection?: CollectionLike | undefined;
+  lastCollection?: CollectionLike | undefined;
+  /** Private: the chain `prepare()` queues on; a Bluebird promise with `isPending()`. */
+  mPrepare?: unknown;
+  /** Private, on builds with the game-version Cancel fix: the start attempt in progress. */
+  mStarting?: unknown;
   installingMod?: unknown;
   numRequired?: unknown;
   revisionId?: unknown;
@@ -108,6 +123,19 @@ export interface DriverState {
   installingMod?: string;
   numRequired?: number;
   revisionId?: number;
+  /**
+   * Work queued with `driver.prepare()` has not finished: `start()` and `query()` wait for it
+   * before doing anything. Null when not observable (the chain is not a Bluebird promise).
+   */
+  preparing?: boolean | null;
+  /**
+   * A start attempt is in progress (startInstall has not returned: the revision fetch, the
+   * game-version prompt). Read from the private `mStarting` token, which only builds with the
+   * game-version Cancel fix have; null elsewhere, or before the first start.
+   */
+  starting?: boolean | null;
+  /** The last collection the driver worked on, which the review screen shows after it ends. */
+  lastCollectionId?: string;
 }
 
 const asString = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
@@ -125,16 +153,22 @@ function read<T>(get: () => T): T | undefined {
 /** Read the getters defensively: any of them can throw on a half-set-up driver. */
 export function describeDriver(driver: DriverLike): DriverState {
   const collection = read(() => driver.collection);
+  const prepare = read(() => driver.mPrepare) as { isPending?: () => unknown } | undefined;
+  const pending =
+    typeof prepare?.isPending === "function" ? read(() => prepare.isPending?.()) : undefined;
   return {
     found: true,
     step: asString(read(() => driver.step)),
     installDone: asBoolean(read(() => driver.installDone)),
     postprocessing: asBoolean(read(() => driver.postprocessing)),
     collectionId: asString(collection?.id),
-    collectionName: asString(collection?.attributes?.name),
+    collectionName: displayName(collection),
     installingMod: asString(read(() => driver.installingMod)),
     numRequired: asNumber(read(() => driver.numRequired)),
     revisionId: asNumber(read(() => driver.revisionId)),
+    preparing: typeof pending === "boolean" ? pending : null,
+    starting: "mStarting" in driver ? read(() => driver.mStarting) !== undefined : null,
+    lastCollectionId: asString(read(() => driver.lastCollection)?.id),
   };
 }
 
@@ -223,11 +257,88 @@ export function summariseSession(session: unknown): SessionSummary | null {
   };
 }
 
+export interface DialogCollection {
+  collectionId: string | null;
+  collectionName: string | null;
+  /**
+   * How it was found: the `driver` prop of the component rendering the dialog (its collection,
+   * or its last one once the install ended), a `collection` prop, or the dialog's text naming
+   * an installed collection. Null when none says.
+   */
+  via: "driver" | "collection-prop" | "text" | null;
+}
+
+const isCollection = (value: unknown): value is CollectionLike =>
+  value !== null &&
+  typeof value === "object" &&
+  typeof (value as CollectionLike).id === "string" &&
+  (value as CollectionLike).type === "collection";
+
+/**
+ * Which collection an open dialog belongs to. Walks up from the dialog's element through React's
+ * fiber tree to the first component with a `driver` (an InstallDriver) or a `collection` prop.
+ * Dialogs raised with `showDialog` (the game-version prompt) have neither; for those the
+ * dialog's text is matched against the installed collections' names, longest first.
+ */
+export function dialogCollection(
+  element: object,
+  collections: Array<{ id: string; name: string }> = [],
+  text = "",
+): DialogCollection {
+  let fiber: FiberLike | null | undefined = fiberOf(element);
+  for (let depth = 0; fiber !== undefined && fiber !== null && depth < 300; depth++) {
+    const props = fiber.memoizedProps as { driver?: unknown; collection?: unknown } | null;
+    if (props !== null && typeof props === "object") {
+      if (isDriver(props.driver)) {
+        const driver = props.driver;
+        const collection = read(() => driver.collection) ?? read(() => driver.lastCollection);
+        if (collection !== undefined) {
+          return {
+            collectionId: asString(collection.id) ?? null,
+            collectionName: displayName(collection) ?? null,
+            via: "driver",
+          };
+        }
+      }
+      if (isCollection(props.collection)) {
+        return {
+          collectionId: asString(props.collection.id) ?? null,
+          collectionName: displayName(props.collection) ?? null,
+          via: "collection-prop",
+        };
+      }
+    }
+    fiber = fiber.return;
+  }
+  const named = collections
+    .filter((c) => c.name !== "" && text.includes(c.name))
+    .toSorted((a, b) => b.name.length - a.name.length)[0];
+  return named === undefined
+    ? { collectionId: null, collectionName: null, via: null }
+    : { collectionId: named.id, collectionName: named.name, via: "text" };
+}
+
+/** The installed collections of every game, by id and display name, for `dialogCollection`. */
+export function installedCollections(mods: unknown): Array<{ id: string; name: string }> {
+  const out: Array<{ id: string; name: string }> = [];
+  if (mods === null || typeof mods !== "object") return out;
+  for (const game of Object.values(mods as Record<string, unknown>)) {
+    if (game === null || typeof game !== "object") continue;
+    for (const [id, mod] of Object.entries(game as Record<string, CollectionLike>)) {
+      if (mod?.type !== "collection") continue;
+      out.push({ id, name: displayName(mod) ?? id });
+    }
+  }
+  return out;
+}
+
 /** Which collections dialog (by the step it belongs to) an open dialog's text is. */
 export function classifyDialog(text: string): string | undefined {
   if (/collection installation (complete|incomplete)/i.test(text)) return "review";
   if (/game version mismatch/i.test(text)) return "game-version-prompt";
-  if (/\binstall now\b/i.test(text)) return "query";
+  // Button texts run together ("LaterInstall Now": no word boundary before it), and the text
+  // is cut at 400 characters, which can drop that last button; the heading comes first.
+  if (/install now\b/i.test(text) || /collection added/i.test(text)) return "query";
   if (/changelog/i.test(text)) return "changelog";
   return undefined;
 }

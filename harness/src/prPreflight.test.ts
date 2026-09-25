@@ -15,16 +15,23 @@ import {
   dispatchUse,
   exportedNames,
   filterMemberHits,
+  hunkAt,
   importTargets,
+  isTestFile,
   lintPullRequest,
   measurementsInComments,
   memberUse,
+  parseHunkSpec,
+  parseHunks,
   parseImports,
   parseUnifiedDiff,
+  privateTouched,
   resolveTestPath,
+  revertHunksIn,
   runPreflight,
   sizeCheck,
   stateReaders,
+  symbolsViaPrivate,
   touchedReducers,
   touchedSymbols,
   type FileDiff,
@@ -961,3 +968,168 @@ export function run() {
     });
   },
 );
+
+describe("test code and private helpers", () => {
+  it("treats test-utils directories as test code", () => {
+    expect(isTestFile("src/renderer/src/test-utils/builders.ts")).toBe(true);
+    expect(isTestFile("extensions/gamebryo-plugin-management/test-utils/vortex-api.ts")).toBe(true);
+    expect(isTestFile("src/renderer/src/util/testModReference.ts")).toBe(false);
+    expect(isTestFile("src/renderer/src/test-utilities.ts")).toBe(false);
+  });
+
+  const HELPERS = `function testRef(a: number) {
+  return a === 1;
+}
+
+export function testModReference(mod: number) {
+  return testRef(mod);
+}
+
+export class Holder {
+  check(x: number) {
+    // testRef in a comment is no call
+    return testRef(x);
+  }
+}
+
+function other() {
+  return testRef(2);
+}
+
+export const constant = 1;
+`;
+  const at = (text: string): number => HELPERS.split("\n").findIndex((l) => l.includes(text)) + 1;
+
+  it("follows a changed private function to the exported code that calls it, one level", () => {
+    expect(privateTouched(HELPERS, [at("return a === 1;")])).toEqual(["testRef"]);
+    // Changes inside exported code or a class are reported as themselves, not as helpers.
+    expect(privateTouched(HELPERS, [at("return testRef(mod);"), at("return testRef(x);")])).toEqual(
+      [],
+    );
+    const via = symbolsViaPrivate(HELPERS, ["testRef"], "src/ref.ts", "head");
+    expect(via.map((s) => [s.className, s.name, s.via])).toEqual([
+      [undefined, "testModReference", "testRef"],
+      ["Holder", "check", "testRef"],
+    ]);
+  });
+});
+
+describe("reverting single hunks", () => {
+  const HEAD = "a\nNEW1\nb\nc\nCHANGED\ne\n";
+  const HUNK_DIFF = [
+    "diff --git a/f.ts b/f.ts",
+    "--- a/f.ts",
+    "+++ b/f.ts",
+    "@@ -1,0 +2 @@ a",
+    "+NEW1",
+    "@@ -4 +4,0 @@ c",
+    "-gone",
+    "@@ -5 +5 @@ c",
+    "-d",
+    "+CHANGED",
+    "",
+  ].join("\n");
+
+  it("parses -U0 hunks and finds the one holding a head line", () => {
+    const hunks = parseHunks(HUNK_DIFF);
+    expect(hunks.map((h) => [h.newStart, h.newCount, h.removed, h.added])).toEqual([
+      [2, 1, [], ["NEW1"]],
+      [4, 0, ["gone"], []],
+      [5, 1, ["d"], ["CHANGED"]],
+    ]);
+    expect(hunkAt(hunks, 2)).toBe(hunks[0]);
+    expect(hunkAt(hunks, 5)).toBe(hunks[2]);
+    // A deletion is named by the lines either side of it.
+    expect(hunkAt(hunks, 4)).toBe(hunks[1]);
+    expect(hunkAt(hunks, 1)).toBeUndefined();
+  });
+
+  it("undoes only the chosen hunks, keeping line endings", () => {
+    const hunks = parseHunks(HUNK_DIFF);
+    expect(revertHunksIn(HEAD, [hunks[2]!])).toBe("a\nNEW1\nb\nc\nd\ne\n");
+    expect(revertHunksIn(HEAD, hunks)).toBe("a\nb\nc\ngone\nd\ne\n");
+    expect(revertHunksIn(HEAD.replace(/\n/g, "\r\n"), [hunks[0]!])).toBe(
+      "a\r\nb\r\nc\r\nCHANGED\r\ne\r\n",
+    );
+    expect(parseHunkSpec("src\\lib.ts:12")).toEqual({ file: "src/lib.ts", line: 12 });
+    expect(() => parseHunkSpec("src/lib.ts")).toThrow(/<file>:<line>/);
+  });
+});
+
+describe("--revert-hunk on a git checkout", { timeout: 60_000 }, () => {
+  let repo: string;
+  const BRANCH = [
+    "export function fast(n: number) {",
+    "  return n * 2;",
+    "}",
+    "",
+    "export function compute(n: number) {",
+    "  return n;",
+    "}",
+    "",
+    "export function caller() {",
+    "  return fast(1);",
+    "}",
+    "",
+  ].join("\n");
+
+  beforeEach(() => {
+    repo = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-hunk-"));
+    run(repo, "init", "-q", "-b", "master");
+    run(repo, "config", "user.email", "test@example.test");
+    run(repo, "config", "user.name", "Test");
+    run(repo, "config", "core.autocrlf", "false");
+    write(repo, "package.json", "{}\n");
+    write(
+      repo,
+      "src/lib.ts",
+      "export function compute(n: number) {\n  return n;\n}\n\nexport function caller() {\n  return compute(1);\n}\n",
+    );
+    run(repo, "add", ".");
+    run(repo, "commit", "-q", "-m", "base");
+    run(repo, "checkout", "-q", "-b", "fix");
+    write(repo, "src/lib.ts", BRANCH);
+    write(repo, "src/lib.test.ts", "test\n");
+    run(repo, "add", "-A");
+    run(repo, "commit", "-q", "-m", "fix: use fast");
+  });
+
+  afterEach(() => {
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("reverts just the call site, keeps the new helper, and restores the file", async () => {
+    const seen: string[] = [];
+    const report = await runPreflight({
+      checkout: repo,
+      base: "master",
+      revertHunks: [`src/lib.ts:${String(BRANCH.split("\n").indexOf("  return fast(1);") + 1)}`],
+      runner: async () => {
+        const lib = fs.readFileSync(path.join(repo, "src/lib.ts"), "utf8");
+        seen.push(lib);
+        return { code: lib.includes("return fast(1)") ? 0 : 1, output: "1 failed" };
+      },
+    });
+    const revert = report.checks.find((c) => c.id === "revert");
+    expect(revert?.status).toBe("pass");
+    expect(revert?.details.join("\n")).toContain("src/lib.ts: reverted 1 of 2 hunks");
+    // The reverted run still had the helper: only the wiring was undone.
+    expect(seen[1]).toContain("export function fast");
+    expect(seen[1]).toContain("return compute(1)");
+    expect(fs.readFileSync(path.join(repo, "src/lib.ts"), "utf8")).toBe(BRANCH);
+    expect(run(repo, "status", "--porcelain")).toBe("");
+  });
+
+  it("fails, listing the hunks, for a line no hunk covers", async () => {
+    const report = await runPreflight({
+      checkout: repo,
+      base: "master",
+      revertHunks: ["src/lib.ts:6"],
+      runner: async () => ({ code: 0, output: "" }),
+    });
+    const revert = report.checks.find((c) => c.id === "revert");
+    expect(revert?.status).toBe("fail");
+    expect(revert?.summary).toContain("no hunk of the diff covers");
+    expect(revert?.details.join("\n")).toContain("head lines 10-10");
+  });
+});

@@ -16,6 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { HarnessConfig } from "./config";
+import type { VortexMcpClient } from "./mcpClient";
 
 export interface PluginSpec {
   /** Filename, e.g. "A.esp". */
@@ -187,4 +188,100 @@ export function assertRedirected(
         `real Fallout 4 profile. Restart the instance through \`vortex-ai up --bethesda-sandbox\`.`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// A deterministic load order
+// ---------------------------------------------------------------------------
+
+/** Fallout 4's own plugins, which always load first and in this order. */
+export const FALLOUT4_NATIVES = [
+  "fallout4.esm",
+  "dlcrobot.esm",
+  "dlcworkshop01.esm",
+  "dlccoast.esm",
+  "dlcworkshop02.esm",
+  "dlcworkshop03.esm",
+  "dlcnukaworld.esm",
+  "dlcultrahighresolution.esm",
+];
+
+/** An entry of Vortex's `state.loadOrder`, keyed by lower-case plugin id. */
+export interface LoadOrderEntry {
+  name?: string;
+  enabled?: boolean;
+  loadOrder?: number;
+}
+
+const kindRank = (name: string): number => {
+  const ext = path.extname(name).toLowerCase();
+  return ext === ".esm" ? 0 : ext === ".esl" ? 1 : 2;
+};
+
+/**
+ * A load order that depends only on which plugins exist: the game's natives first, then the
+ * other masters, light plugins and plugins, each by name. Vortex's own order after a deploy
+ * follows the order the files were found, which differs between runs, so the Plugins page's
+ * displayed values (index, load order column) could not be compared across builds.
+ */
+export function deterministicLoadOrder(
+  loadOrder: Record<string, LoadOrderEntry>,
+  natives: string[] = FALLOUT4_NATIVES,
+): string[] {
+  const entries = Object.entries(loadOrder).map(([id, entry]) => ({
+    id,
+    name: entry.name ?? id,
+  }));
+  const native = (id: string): number => natives.indexOf(id.toLowerCase());
+  return entries
+    .toSorted((a, b) => {
+      const na = native(a.id);
+      const nb = native(b.id);
+      if (na !== -1 || nb !== -1) return (na === -1 ? Infinity : na) - (nb === -1 ? Infinity : nb);
+      return (
+        kindRank(a.name) - kindRank(b.name) ||
+        a.name.toLowerCase().localeCompare(b.name.toLowerCase()) ||
+        a.id.localeCompare(b.id)
+      );
+    })
+    .map((e) => e.name);
+}
+
+export interface LoadOrderResult {
+  /** The order applied, by plugin name. */
+  order: string[];
+  /** Whether `state.loadOrder` reads back in exactly that order. */
+  applied: boolean;
+}
+
+/**
+ * Put the active game's plugins in `deterministicLoadOrder`, with LOOT's automatic sorting off
+ * so it stays that way, and check that Vortex's state reads back in that order. Call it after
+ * the deploy that registers the plugins. Enabled states are kept (`SET_PLUGIN_ORDER`).
+ */
+export async function setDeterministicLoadOrder(
+  mcp: VortexMcpClient,
+  natives: string[] = FALLOUT4_NATIVES,
+): Promise<LoadOrderResult> {
+  const read = async (): Promise<Record<string, LoadOrderEntry>> =>
+    (await mcp.call<Record<string, LoadOrderEntry> | null>("vortex_query", {
+      path: ["loadOrder"],
+    })) ?? {};
+  await mcp.call("vortex_dispatch", {
+    action: "type:GAMEBRYO_SET_AUTOSORT_ENABLED",
+    args: [false],
+  });
+  const order = deterministicLoadOrder(await read(), natives);
+  await mcp.call("vortex_dispatch", {
+    action: "type:SET_PLUGIN_ORDER",
+    args: [{ plugins: order, defaultEnable: true }],
+  });
+  const now = await read();
+  const actual = Object.values(now)
+    .toSorted((a, b) => (a.loadOrder ?? 0) - (b.loadOrder ?? 0))
+    .map((e) => e.name ?? "");
+  return {
+    order,
+    applied: actual.length === order.length && actual.every((name, i) => name === order[i]),
+  };
 }

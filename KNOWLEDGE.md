@@ -190,6 +190,16 @@ when that version matches, otherwise it runs the pinned version through
 This prevents a newer global pnpm from silently deciding to replace an existing
 dependency layout in a non-interactive session.
 
+### `vi.resetModules()` trips `@vortex/shared`'s duplicate-module guard
+
+`src/shared/src/errors/base.ts` registers its `VortexError` class on
+`globalThis[Symbol.for("vortex.errors.VortexError")]` and throws "Duplicate @vortex/shared error
+module detected in this process" when a second copy of the module loads with a different class.
+A renderer test that calls `vi.resetModules()` and then `await import(...)` loads it again, so it
+throws at import, which reads like a broken test setup. Test a module's fresh state some other
+way (an exported reset, or a bound set by argument), or delete that global symbol before
+re-importing, and say so in the test.
+
 ### Capturing output makes a slow step look like a hang
 
 `pnpm install` in a Vortex checkout downloads an Electron binary and rebuilds six
@@ -333,6 +343,49 @@ what is compared. `clickInsideDialog` throws (listing each container and its but
 clicks nothing, and when the element `ui_click` reports clicking is not the button it found.
 Pollers pass `{ required: false }`.
 
+### A dialog's text runs its buttons together and stops at 400 characters
+
+`activeDialogs` (and `ui_active_dialogs`) report each modal's `textContent`, cut at 400
+characters. Two consequences, both silent:
+
+- Buttons' labels have no space between them: the collection Install Now dialog ends
+  "…LaterInstall Now", so `/\binstall now\b/` never matches (no word boundary between "r" and
+  "I"). `classifyDialog` tagged that dialog with no step until September 2026.
+- The buttons come last, so a dialog with a long description loses them: a review screen's text
+  never contains "Install optional mods", and `installOfflineCollection`'s optionals modes, which
+  looked for it there, closed the review with No Thanks instead. Match a dialog by its heading
+  (it comes first: "<game> collection added", "Collection installation complete"), and ask for
+  its buttons (`dialogButtons`, or a scoped `ui_snapshot`).
+
+A disabled button is not an absent one: the review's buttons are disabled while it postprocesses
+(its deploy), and `clickInsideDialog` only finds enabled ones, so a single failed click proves
+nothing.
+
+### A full snapshot misses the modal on a big Mods page
+
+`ui_snapshot` stops at its node limit, and a modal is rendered at the end of the DOM. With a
+few hundred mods on the (fully rendered) 2.7 Mods page, the Install Now dialog was open with its
+buttons, but `waitForNode({ name: "Install Now" })` timed out listing only the title bar's and
+sidebar's buttons. Find dialogs with `ui_active_dialogs` and click inside them with
+`clickInsideDialog` (scoped snapshots), as `offlineCollection.ts` now does.
+
+### The modern layout keeps notifications in a popover, with zero-width spaces
+
+The 2.7 modern layout renders no `.notification` toasts: a notification's actions (a collection's
+"Resume") exist only in the Headless UI popover the title bar's Notifications button opens, and
+its entries have no stable class; a snapshot scoped to `.nxm-popover-panel` returns them as
+flat siblings (title, message, buttons). Names are rendered with zero-width spaces between their
+words ("Kit\u200bVerify"), so `text.includes(name)` fails unless they are stripped first.
+`resumeViaNotification` handles both layouts (`buttonInEntry`).
+
+### Disabling one mod gives every Mods-page row a new object
+
+Master 031b81d38, production build, 400 mods, measured with `measureRowIdentity`: disabling one
+mod made two `calculatedValues` commits, the first giving all 400 rows a new object because
+every row's `loadOrder` column changed, and 401 TableRows re-rendered. The page still showed
+the change in about 0.75 s with a 150 ms longest task at that size. Not investigated; it is the
+per-row cost to look at when disabling one mod is slow on a large library.
+
 ### A mod exists in state before it is installed
 
 A mod row appears the moment its install _starts_, not when it finishes. Until
@@ -438,8 +491,10 @@ Traps found while measuring:
 - A long check piped through `Select-String` or `Select -Last` shows nothing until it
   exits, so a hang looks like a slow run. Tee to a file, or watch progress through the
   game directory and `list_notifications`.
-- tsx compiles named functions with an `__name` helper that the page does not have.
-  Pass `page.evaluate` source text, not a function, from harness scripts.
+- tsx compiles every file with esbuild's `keepNames`, hard-coded (no option turns it off), so
+  a named inner function becomes `__name(fn, "name")`, a helper the page does not have, and
+  `page.evaluate(fn)` throws "`__name` is not defined". `attachToRenderer` now defines the
+  helper in the page (`NAME_SHIM`, `cdp.ts`); kit modules still send source text.
 
 ### A row stays rendered forever once it has been on screen
 
@@ -553,7 +608,10 @@ unless NODE_ENV is production and both react and react-dom are production builds
 warns when `src/main/build/renderer.js` is a development bundle: React is then production, but
 Vortex's own development branches still run (main-process file logging, renderer source maps
 and process-warning traces, missing-icon checks). For full release parity build with
-`$env:NODE_ENV='production'; pnpm run build` and clear it afterwards.
+`pnpm run ai -- build --checkout <dir> --production`, which sets NODE_ENV for the build's own
+environment only. Setting it in the shell and clearing it afterwards is what agents got wrong:
+the agent sandbox refuses `Remove-Item Env:NODE_ENV` (use `$env:NODE_ENV=$null`), and a
+NODE_ENV left behind made later builds production without anyone asking.
 
 Which numbers to distrust: any `--production` timing whose `automation_status.nodeEnv` was not
 "production". The #24281 figures above (production every run) and #24283 round-2 QA (a
@@ -757,6 +815,20 @@ so top-level `await` fails; name it `.mts`. And on Windows an absolute path in a
 `fflate` still don't resolve from outside the repo. `vortex-ai script <file.mts>` runs it with the
 kit's tsx and passes the URL of `harness/src/kit.ts`, which re-exports what scripts need, in
 `VORTEX_AI_KIT`.
+
+### A PowerShell array of one pair flattens
+
+`@(@("a", "b"))` is `@("a", "b")`, not an array holding one pair: the outer `@()` unrolls its
+single element. A list of find/replace pairs with one entry is then iterated item by item, and
+each "pair" is one string, so `$pair[0]` and `$pair[1]` are its first two characters. Rewriting
+cross-references in six PR bodies this way replaced `#` with a digit and `b` with `r` and
+corrupted three of them. Write the one-pair case as `@(,@("a", "b"))`, or do text transforms in
+Python, and lint the result after any bulk edit.
+
+### The agent sandbox refuses `Remove-Item Env:`
+
+`Remove-Item Env:NODE_ENV` is blocked there. `$env:NODE_ENV=$null` removes the variable. Better
+not to set it in the shell at all: `vortex-ai build --production` sets it for the build only.
 
 ### `oxfmt` with a PowerShell array fails
 

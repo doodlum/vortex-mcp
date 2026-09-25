@@ -2,15 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   assertRedirected,
   bethesdaSandboxConfig,
+  deterministicLoadOrder,
   ensureBethesdaSandbox,
   pluginBytes,
+  setDeterministicLoadOrder,
 } from "./bethesdaSandbox";
 import type { HarnessConfig } from "./config";
+import type { VortexMcpClient } from "./mcpClient";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -104,5 +107,58 @@ describe("assertRedirected", () => {
     ).toThrow(/Refusing/);
     expect(() => assertRedirected(expected, { documents: null, localAppData: null })).toThrow();
     expect(() => assertRedirected(expected, undefined)).toThrow();
+  });
+});
+
+describe("a deterministic load order", () => {
+  // As Vortex left it after a deploy: discovery order, which differs run to run.
+  const discovered = {
+    "zeta.esp": { name: "Zeta.esp", enabled: true, loadOrder: 0 },
+    "fallout4.esm": { name: "Fallout4.esm", enabled: true, loadOrder: 1 },
+    "alpha.esp": { name: "alpha.esp", enabled: false, loadOrder: 2 },
+    "light.esl": { name: "Light.esl", enabled: true, loadOrder: 3 },
+    "master.esm": { name: "Master.esm", enabled: true, loadOrder: 4 },
+    "dlcrobot.esm": { name: "DLCRobot.esm", enabled: true, loadOrder: 5 },
+  };
+
+  it("puts the natives first, then masters, light plugins and plugins by name", () => {
+    const expected = [
+      "Fallout4.esm",
+      "DLCRobot.esm",
+      "Master.esm",
+      "Light.esl",
+      "alpha.esp",
+      "Zeta.esp",
+    ];
+    expect(deterministicLoadOrder(discovered)).toEqual(expected);
+    // Any other discovery order gives the same.
+    const shuffled = Object.fromEntries(Object.entries(discovered).toReversed());
+    expect(deterministicLoadOrder(shuffled)).toEqual(expected);
+  });
+
+  it("turns autosort off, applies the order and checks that state reads back in it", async () => {
+    let state: Record<string, { name?: string; enabled?: boolean; loadOrder?: number }> = {
+      ...discovered,
+    };
+    const dispatched: unknown[] = [];
+    const call = vi.fn(async (tool: string, args: Record<string, unknown>) => {
+      if (tool === "vortex_query") return state;
+      dispatched.push(args);
+      if (args.action === "type:SET_PLUGIN_ORDER") {
+        // The gamebryo reducer: replace the order, keeping enabled states.
+        const { plugins } = (args.args as [{ plugins: string[] }])[0];
+        state = Object.fromEntries(
+          plugins.map((name, i) => [
+            name.toLowerCase(),
+            { name, enabled: state[name.toLowerCase()]?.enabled ?? true, loadOrder: i },
+          ]),
+        );
+      }
+      return {};
+    });
+    const result = await setDeterministicLoadOrder({ call } as unknown as VortexMcpClient);
+    expect(result.applied).toBe(true);
+    expect(dispatched[0]).toEqual({ action: "type:GAMEBRYO_SET_AUTOSORT_ENABLED", args: [false] });
+    expect(state["alpha.esp"]).toMatchObject({ enabled: false, loadOrder: 4 });
   });
 });

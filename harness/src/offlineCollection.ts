@@ -26,8 +26,16 @@ import path from "node:path";
 
 import { strToU8, zipSync, type Zippable } from "fflate";
 
+import { deployMods } from "./deployment";
 import type { VortexMcpClient } from "./mcpClient";
-import { clickByName, clickInsideDialog, openDialogs, waitForNode } from "./uiDriver";
+import {
+  clickInsideDialog,
+  dialogButtons,
+  findNodes,
+  openDialogs,
+  snapshot,
+  type SnapshotNode,
+} from "./uiDriver";
 
 export interface CollectionPlugin {
   name: string;
@@ -168,6 +176,41 @@ export interface AddedCollection {
   collectionModId: string;
   /** The download the collection was installed from; undefined with `via: "file"`. */
   downloadId?: string;
+  /** The Install Now dialog's text, for `clickInsideDialog`. */
+  dialog?: string;
+}
+
+/**
+ * Wait for the collection's Install Now dialog and return its text. Polled with
+ * `ui_active_dialogs`, not a full snapshot: with a few hundred mods on the Mods page a full
+ * snapshot reaches its node limit before the modal, which is rendered last, so its buttons are
+ * never in it (KNOWLEDGE.md, "the snapshot's node limit").
+ */
+export async function waitForInstallNow(mcp: VortexMcpClient, timeoutMs = 60_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let last: string[] = [];
+  for (;;) {
+    const dialogs = await openDialogs(mcp);
+    if (dialogs !== undefined) {
+      last = dialogs;
+      // Buttons' text runs together ("LaterInstall Now"), so no word boundary before it. And
+      // the text is cut at 400 characters with Install Now last, so a long description drops
+      // it; the heading ("<game> collection added") comes first.
+      const found = dialogs.find(
+        (d) =>
+          (/collection added/i.test(d) || /install now\b/i.test(d)) &&
+          !/collection installation (complete|incomplete)/i.test(d),
+      );
+      if (found !== undefined) return found;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `No Install Now dialog within ${String(timeoutMs)}ms. Open dialogs: ` +
+          `${last.map((d) => d.slice(0, 80)).join(" | ") || "none"}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
 }
 
 /**
@@ -223,8 +266,7 @@ export async function addOfflineCollection(
   if (typeof collectionModId !== "string") {
     throw new Error("Vortex did not return the collection's mod id.");
   }
-  await waitForNode(mcp, { role: "button", name: /^install now$/i }, 60_000);
-  return { collectionModId, downloadId };
+  return { collectionModId, downloadId, dialog: await waitForInstallNow(mcp) };
 }
 
 /**
@@ -292,9 +334,28 @@ export interface CollectionInstallResult {
   gameVersionPrompt?: string;
 }
 
+/**
+ * Points in `installOfflineCollection`, for a caller that timestamps them (collection-scale
+ * marks them in its CPU profile). `review-shown` comes again after an optionals pass.
+ */
+export type CollectionPhase =
+  | "install-now"
+  | "game-version-answered"
+  | "review-shown"
+  | "optionals-install"
+  | "optionals-stand-in"
+  | "review-closing"
+  | "review-closed";
+
 export interface InstallCollectionOptions extends AddCollectionOptions {
-  /** At the review: skip the optional members (No Thanks, default) or install them. */
-  optionals?: "skip" | "install";
+  /**
+   * At the review: skip the optional members (No Thanks, default) or install them. `stand-in`
+   * clicks Install optional mods and then completes that pass without installing anything
+   * (`completeOptionalsWithoutInstall`), because bundled optional installs stall.
+   */
+  optionals?: "skip" | "install" | "stand-in";
+  /** Called at each phase, awaited, before the step it names happens (after, for `-closed`). */
+  onPhase?: (phase: CollectionPhase, detail?: string) => void | Promise<void>;
   /** Answer to the game-version prompt, when `gameVersions` makes it appear. Default continue. */
   gameVersionAnswer?: "continue" | "cancel";
   /** Close an "incomplete" review with Close instead of failing. */
@@ -315,11 +376,15 @@ export async function installOfflineCollection(
   const timeoutMs = options.timeoutMs ?? 300_000;
   const events = await watchEvent(mcp, "collection-postprocess-complete");
   const added = await addOfflineCollection(mcp, archive, options);
-  await clickByName(mcp, { role: "button", name: /^install now$/i });
+  await options.onPhase?.("install-now");
+  await clickInsideDialog(mcp, added.dialog ?? (await waitForInstallNow(mcp)), /^install now$/i);
 
   let gameVersionPrompt: string | undefined;
   if (options.gameVersions !== undefined) {
     gameVersionPrompt = await answerGameVersionPrompt(mcp, options.gameVersionAnswer ?? "continue");
+    if (gameVersionPrompt !== undefined) {
+      await options.onPhase?.("game-version-answered", options.gameVersionAnswer ?? "continue");
+    }
     if (gameVersionPrompt === undefined) {
       throw new Error(
         'gameVersions was set but no "Game version mismatch" prompt appeared. The installed ' +
@@ -336,7 +401,7 @@ export async function installOfflineCollection(
     }
   }
 
-  const review = await closeReview(mcp, options, timeoutMs);
+  const review = await closeReview(mcp, added.collectionModId, options, timeoutMs);
   let postprocessed: boolean | undefined;
   if (events !== undefined) {
     // Emitted before the review's buttons enable; give a straggler a moment.
@@ -352,6 +417,7 @@ export async function installOfflineCollection(
 
 async function closeReview(
   mcp: VortexMcpClient,
+  collectionModId: string,
   options: InstallCollectionOptions,
   timeoutMs: number,
 ): Promise<{ closedWith: string; outcome: "complete" | "incomplete" }> {
@@ -360,6 +426,10 @@ async function closeReview(
   let installedOptionals = false;
   const deadline = Date.now() + timeoutMs;
   let lastDialogs: string[] = [];
+  let shown = false;
+  let closing = false;
+  // Polls of the review without an Install optional mods button, while optionals are wanted.
+  let withoutOptionals = 0;
   for (;;) {
     // A large collection blocks the renderer for seconds at a time while it resolves and
     // postprocesses its members, and the MCP server lives in the renderer: a request can
@@ -368,7 +438,13 @@ async function closeReview(
     if (dialogs !== undefined) {
       lastDialogs = dialogs;
       const review = dialogs.find((d) => /collection installation (complete|incomplete)/i.test(d));
-      if (review !== undefined) {
+      if (review === undefined) {
+        shown = false;
+      } else {
+        if (!shown) {
+          shown = true;
+          await options.onPhase?.("review-shown");
+        }
         const outcome = /incomplete/i.test(review) ? "incomplete" : "complete";
         if (outcome === "incomplete" && options.allowIncomplete !== true) {
           throw new Error(
@@ -376,22 +452,55 @@ async function closeReview(
           );
         }
         // Scoped to the dialog: a page-wide lookup finds more than one "Done".
-        const wantsOptionals =
-          options.optionals === "install" &&
+        // Optionals are wanted until the review, ready (a close button enabled), has shown no
+        // Install optional mods button for three polls. The buttons are looked at, not the
+        // dialog's text, which is cut at 400 characters before them; and a button disabled
+        // while the review postprocesses is not an absent one.
+        let wantOptionals =
+          (options.optionals === "install" || options.optionals === "stand-in") &&
           !installedOptionals &&
-          /install optional mods/i.test(review);
-        const clicked = await clickInsideDialog(
-          mcp,
-          review,
-          wantsOptionals ? /^install optional mods$/i : closeButton,
-          // Polled: the review's buttons render a moment after its text.
-          { required: false },
-        ).catch(() => undefined);
+          withoutOptionals < 3;
+        let clicked: string | undefined;
+        let wantsOptionals = false;
+        if (wantOptionals) {
+          const buttons = await dialogButtons(mcp, review).catch(() => undefined);
+          const offer = buttons?.find((b) => /^install optional mods$/i.test(b.name));
+          const ready = buttons?.some((b) => closeButton.test(b.name) && !b.disabled) === true;
+          if (offer !== undefined && !offer.disabled) {
+            clicked = await clickInsideDialog(mcp, review, /^install optional mods$/i, {
+              required: false,
+            }).catch(() => undefined);
+            wantsOptionals = clicked !== undefined;
+            if (wantsOptionals) await options.onPhase?.("optionals-install");
+          } else if (offer === undefined && ready && ++withoutOptionals >= 3) {
+            wantOptionals = false;
+          }
+        }
+        if (!wantOptionals) {
+          if (!closing) {
+            closing = true;
+            await options.onPhase?.("review-closing");
+          }
+          clicked = await clickInsideDialog(
+            mcp,
+            review,
+            closeButton,
+            // Polled: the review's buttons render a moment after its text.
+            { required: false },
+          ).catch(() => undefined);
+        }
         if (clicked !== undefined && wantsOptionals) {
           // The optional members install, then the review comes back.
           installedOptionals = true;
+          shown = false;
+          closing = false;
+          if (options.optionals === "stand-in") {
+            await options.onPhase?.("optionals-stand-in");
+            await completeOptionalsWithoutInstall(mcp, collectionModId);
+          }
           await new Promise((resolve) => setTimeout(resolve, 2_000));
         } else if (clicked !== undefined) {
+          await options.onPhase?.("review-closed", clicked);
           return { closedWith: clicked, outcome };
         }
       }
@@ -495,4 +604,310 @@ export async function updateOfflineCollection(
   const removeMs = Date.now() - started;
   const install = await installOfflineCollection(mcp, archive, options);
   return { removeMs, install };
+}
+
+// ---------------------------------------------------------------------------
+// Driving a collection without its Nexus-only paths
+// ---------------------------------------------------------------------------
+
+interface CollectionRule {
+  type?: string;
+  ignored?: boolean;
+  reference?: { tag?: string; description?: string; logicalFileName?: string };
+}
+
+interface StateMod {
+  id?: string;
+  type?: string;
+  state?: string;
+  rules?: CollectionRule[];
+  attributes?: { name?: string; referenceTag?: string; referenceTags?: string[] };
+}
+
+/** The mod a tag belongs to: its referenceTag or one of its referenceTags. */
+export function modWithTag(mods: Record<string, StateMod>, tag: string): string | undefined {
+  return Object.entries(mods).find(
+    ([, mod]) =>
+      mod?.attributes?.referenceTag === tag || (mod?.attributes?.referenceTags ?? []).includes(tag),
+  )?.[0];
+}
+
+/** Mod ids for optional members that stand in for installed ones; stable per tag. */
+export const standInModId = (tag: string): string =>
+  `vortex-mcp-optional-${tag.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+
+/**
+ * The records `completeOptionalsWithoutInstall` adds: one installed mod per optional
+ * (`recommends`) rule of the collection that no installed mod carries the tag of.
+ */
+export function standInOptionals(
+  collection: StateMod,
+  mods: Record<string, StateMod>,
+): Array<{ id: string; tag: string; name: string }> {
+  const out: Array<{ id: string; tag: string; name: string }> = [];
+  for (const rule of collection.rules ?? []) {
+    const tag = rule.reference?.tag;
+    if (rule.type !== "recommends" || tag === undefined) continue;
+    if (modWithTag(mods, tag) !== undefined || out.some((o) => o.tag === tag)) continue;
+    const name = rule.reference?.description ?? rule.reference?.logicalFileName ?? tag;
+    out.push({ id: standInModId(tag), tag, name });
+  }
+  return out;
+}
+
+export interface OptionalsStandIn {
+  /** Mods added for the optional members, installed and enabled. */
+  added: string[];
+  /** Session entries of optional members marked installed. */
+  marked: number;
+  sessionId?: string;
+}
+
+/**
+ * Complete a collection's optionals pass without installing anything, after "Install optional
+ * mods" was clicked. Bundled optional members that are then really installed have stalled in QA
+ * until Vortex's stall watchdog fired (5 min); this stands in for that install, the way QA of the
+ * review screen did:
+ *
+ *   1. adds an installed, enabled mod carrying each optional rule's tag, for every optional
+ *      member no installed mod has (with an empty staging folder);
+ *   2. marks the install session's optional entries installed
+ *      (`COLLECTION_UPDATE_MOD_STATUS`);
+ *   3. emits `did-install-dependencies` with recommendations true, as the optionals pass does
+ *      when it ends (unless `emit: false`).
+ *
+ * InstallDriver then returns to the review screen by itself. What is skipped is the install
+ * itself: no archive is extracted and no member's own files exist. Use it to test what happens
+ * around the optionals pass (the review's re-entry, its fade, its lists), never the install.
+ */
+export async function completeOptionalsWithoutInstall(
+  mcp: VortexMcpClient,
+  collectionModId: string,
+  options: { emit?: boolean } = {},
+): Promise<OptionalsStandIn> {
+  const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });
+  if (!gameId) throw new Error("Manage a game before completing a collection's optionals.");
+  const mods =
+    (await mcp.call<Record<string, StateMod> | null>("vortex_query", {
+      path: ["persistent", "mods", gameId],
+    })) ?? {};
+  const collection = mods[collectionModId];
+  if (collection === undefined) throw new Error(`No collection mod ${collectionModId}.`);
+  const standIns = standInOptionals(collection, mods);
+  if (standIns.length > 0) {
+    const staging = await mcp.call<string>("vortex_query", {
+      selector: "installPathForGame",
+      args: [gameId],
+    });
+    for (const s of standIns) fs.mkdirSync(path.join(staging, s.id), { recursive: true });
+    const installTime = new Date().toISOString();
+    await mcp.call("vortex_dispatch", {
+      action: "addMods",
+      args: [
+        gameId,
+        standIns.map((s) => ({
+          id: s.id,
+          state: "installed",
+          type: "",
+          installationPath: s.id,
+          attributes: {
+            name: s.name,
+            version: "1.0.0",
+            installTime,
+            referenceTag: s.tag,
+            referenceTags: [s.tag],
+          },
+        })),
+      ],
+    });
+    const profile = await mcp.call<{ id: string }>("vortex_query", { selector: "activeProfile" });
+    await mcp.call("set_mods_enabled", {
+      modIds: standIns.map((s) => s.id),
+      enabled: true,
+      profileId: profile.id,
+      expectedActiveProfileId: profile.id,
+    });
+  }
+  const session = await mcp.call<{
+    sessionId?: string;
+    mods?: Record<string, { type?: string; status?: string }>;
+  } | null>("vortex_query", { path: ["session", "collections", "activeSession"] });
+  let marked = 0;
+  for (const [ruleId, entry] of Object.entries(session?.mods ?? {})) {
+    if (entry?.type !== "recommends" || entry.status === "installed") continue;
+    await mcp.call("vortex_dispatch", {
+      action: "type:COLLECTION_UPDATE_MOD_STATUS",
+      args: [{ sessionId: session?.sessionId, ruleId, status: "installed" }],
+    });
+    marked++;
+  }
+  if (options.emit !== false) {
+    await mcp.call("vortex_dispatch", {
+      action: "did-install-dependencies",
+      args: [gameId, collectionModId, true],
+    });
+  }
+  return { added: standIns.map((s) => s.id), marked, sessionId: session?.sessionId };
+}
+
+export interface ResumeResult {
+  /** The "Collection incomplete" notification's id. */
+  notificationId: string;
+  /** Its message: the collection's name. */
+  message?: string;
+}
+
+/**
+ * Start (or resume) a collection's install from its "Collection incomplete" notification, the
+ * only path to `InstallDriver.start` that works offline. `resume-collection` and the Premium
+ * restart need a Nexus login, and Install Now goes through `query` instead.
+ *
+ * It enables the collection mod and deploys, so the dependency check reports its unfulfilled
+ * rules and the collections extension raises the notification, then clicks that notification's
+ * Resume. Limits: Vortex raises that notification once per collection per session (a module
+ * `reported` set), so a second call for the same collection needs a restart; and it deploys,
+ * so sandboxes only.
+ */
+export async function resumeViaNotification(
+  mcp: VortexMcpClient,
+  collectionModId: string,
+  options: { timeoutMs?: number } = {},
+): Promise<ResumeResult> {
+  const gameId = await mcp.call<string | null>("vortex_query", { selector: "activeGameId" });
+  if (!gameId) throw new Error("Manage a game before resuming a collection.");
+  const profileId = await mcp.call<string>("vortex_query", { selector: "activeProfileId" });
+  await mcp.call("vortex_dispatch", {
+    action: "setModEnabled",
+    args: [profileId, collectionModId, true],
+  });
+  await deployMods(mcp, gameId);
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+  let notification: { id: string; message?: string } | undefined;
+  for (;;) {
+    const list =
+      await mcp.call<Array<{ id: string; title?: string; message?: string }>>("list_notifications");
+    notification = list.find((n) => n.id.includes(collectionModId));
+    if (notification !== undefined) break;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `No "Collection incomplete" notification for ${collectionModId} after deploying. Vortex ` +
+          "raises it once per collection per session, and only while a required member is " +
+          `missing. Notifications: ${list.map((n) => n.id).join(", ") || "none"}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const found = notification;
+  const wanted = ["Collection incomplete", ...(found.message === undefined ? [] : [found.message])];
+  let opened = false;
+  const clickDeadline = Date.now() + 15_000;
+  for (;;) {
+    // Classic layout: each notification is a `.notification` toast.
+    for (let index = 0; index < 20; index++) {
+      const snap = await snapshot(mcp, ".notification", index).catch(() => undefined);
+      if (snap === undefined || snap.nodeCount === 0) break;
+      const resume = buttonInEntry(snap.tree, wanted, /^resume$/i);
+      if (resume !== undefined) {
+        await mcp.call("ui_click", { ref: resume.ref });
+        return { notificationId: found.id, message: found.message };
+      }
+    }
+    // Modern layout: they live in a popover the title bar's Notifications button opens.
+    const panel = await snapshot(mcp, ".nxm-popover-panel", 0).catch(() => undefined);
+    const resume = panel === undefined ? undefined : buttonInEntry(panel.tree, wanted, /^resume$/i);
+    if (resume !== undefined) {
+      await mcp.call("ui_click", { ref: resume.ref });
+      // The entry is dismissed; close the popover if it stayed open.
+      await mcp.call("ui_press_key", { key: "Escape" }).catch(() => undefined);
+      return { notificationId: found.id, message: found.message };
+    }
+    if (!opened) {
+      opened = await openNotificationCenter(mcp);
+      if (opened) continue;
+    }
+    if (Date.now() > clickDeadline) {
+      throw new Error(
+        `The notification ${found.id} is listed but no Resume button for it is on screen ` +
+          "(neither a .notification toast nor the Notifications popover).",
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+/** Click the title bar's Notifications button (modern layout); false when there is none. */
+async function openNotificationCenter(mcp: VortexMcpClient): Promise<boolean> {
+  const snap = await snapshot(mcp).catch(() => undefined);
+  const button =
+    snap === undefined
+      ? undefined
+      : findNodes(snap, { role: "button", name: /^notifications$/i })[0];
+  if (button === undefined) return false;
+  await mcp.call("ui_click", { ref: button.ref });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  return true;
+}
+
+/** Text for matching: Vortex puts zero-width spaces between a name's words. */
+const normal = (text: string): string =>
+  text
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const subtreeText = (node: SnapshotNode): string =>
+  normal([node.name ?? "", node.text ?? "", ...(node.children ?? []).map(subtreeText)].join(" "));
+
+const buttonIn = (node: SnapshotNode, button: RegExp): SnapshotNode | undefined =>
+  findNodes({ tree: [node] } as unknown as Parameters<typeof findNodes>[0], {
+    role: "button",
+    name: button,
+  })[0];
+
+/**
+ * One notification's button (its own Resume, when several offer one): in the smallest subtree
+ * whose text holds every one of `texts`, or, where a scoped snapshot has flattened the entries
+ * into siblings (it keeps only named nodes), the first such button after the sibling holding
+ * the last of `texts`, all of them having appeared by then. Zero-width spaces are ignored.
+ */
+export function buttonInEntry(
+  nodes: SnapshotNode[],
+  texts: string[],
+  button: RegExp,
+): SnapshotNode | undefined {
+  const wanted = texts.map(normal);
+  for (const node of nodes) {
+    const deeper = buttonInEntry(node.children ?? [], texts, button);
+    if (deeper !== undefined) return deeper;
+    const text = subtreeText(node);
+    if (!wanted.every((t) => text.includes(t))) continue;
+    const found = buttonIn(node, button);
+    if (found !== undefined) return found;
+  }
+  const last = wanted.at(-1);
+  if (last === undefined) return undefined;
+  const siblings = nodes.map(subtreeText);
+  for (let i = 0; i < nodes.length; i++) {
+    if (!(siblings[i] ?? "").includes(last)) continue;
+    const upTo = siblings.slice(0, i + 1).join(" ");
+    if (!wanted.every((t) => upTo.includes(t))) continue;
+    for (let j = i; j < nodes.length; j++) {
+      const found = buttonIn(nodes[j]!, button);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+/** Open review screens that `collection_install_state` attributes to this collection. */
+export async function reviewDialogsFor(
+  mcp: VortexMcpClient,
+  collectionModId: string,
+): Promise<number> {
+  const state = await mcp.call<{
+    dialogs?: Array<{ step?: string | null; collectionId?: string | null }>;
+  }>("collection_install_state");
+  return (state.dialogs ?? []).filter(
+    (d) => d.step === "review" && d.collectionId === collectionModId,
+  ).length;
 }

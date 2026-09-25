@@ -144,10 +144,89 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
 }
 
 // ---------------------------------------------------------------------------
+// Hunks, for reverting part of a file
+// ---------------------------------------------------------------------------
+
+export interface Hunk {
+  /** 1-based first line on each side; for an empty side, the line before the change. */
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  removed: string[];
+  added: string[];
+}
+
+/** Hunks of a single file's `git diff -U0`. */
+export function parseHunks(diff: string): Hunk[] {
+  const hunks: Hunk[] = [];
+  let current: Hunk | undefined;
+  for (const raw of diff.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (header !== null) {
+      current = {
+        oldStart: Number(header[1]),
+        oldCount: header[2] === undefined ? 1 : Number(header[2]),
+        newStart: Number(header[3]),
+        newCount: header[4] === undefined ? 1 : Number(header[4]),
+        removed: [],
+        added: [],
+      };
+      hunks.push(current);
+      continue;
+    }
+    if (current === undefined || line.startsWith("\\")) continue;
+    if (line.startsWith("-") && !line.startsWith("--- ")) current.removed.push(line.slice(1));
+    else if (line.startsWith("+") && !line.startsWith("+++ ")) current.added.push(line.slice(1));
+  }
+  return hunks;
+}
+
+/**
+ * The hunk covering a head-side (1-based) line. A pure deletion has no head lines, so it is
+ * named by the line before or after it, when no other hunk holds that line.
+ */
+export function hunkAt(hunks: Hunk[], line: number): Hunk | undefined {
+  return (
+    hunks.find((h) => h.newCount > 0 && line >= h.newStart && line < h.newStart + h.newCount) ??
+    hunks.find((h) => h.newCount === 0 && (line === h.newStart || line === h.newStart + 1))
+  );
+}
+
+/** The head file's text with the given hunks undone, keeping its line endings. */
+export function revertHunksIn(head: string, hunks: Hunk[]): string {
+  const eol = head.includes("\r\n") ? "\r\n" : "\n";
+  const lines = head.split(/\r?\n/);
+  for (const hunk of hunks.toSorted((a, b) => b.newStart - a.newStart)) {
+    const at = hunk.newCount === 0 ? hunk.newStart : hunk.newStart - 1;
+    lines.splice(at, hunk.newCount, ...hunk.removed);
+  }
+  return lines.join(eol);
+}
+
+/** `--revert-hunk <file>:<line>`: a checkout-relative path and a head-side line. */
+export function parseHunkSpec(spec: string): { file: string; line: number } {
+  const match = /^(.+):(\d+)$/.exec(spec.trim());
+  if (match?.[1] === undefined || match[2] === undefined) {
+    throw new PreflightError(
+      `--revert-hunk ${spec}: expected <file>:<line>, a head-side line inside the hunk.`,
+    );
+  }
+  return { file: match[1].replace(/\\/g, "/"), line: Number(match[2]) };
+}
+
+// ---------------------------------------------------------------------------
 // Classification and size
 // ---------------------------------------------------------------------------
 
-const TEST_FILE = /(?:^|\/)(?:__tests__|__mocks__|__fixtures__)\/|\.(?:test|spec)\.[cm]?[jt]sx?$/;
+/**
+ * Test code: `*.test.*`/`*.spec.*`, and anything under `__tests__`, `__mocks__`, `__fixtures__`
+ * or a `test-utils` directory (Vortex's `src/renderer/src/test-utils/` harnesses and builders,
+ * an extension's own `test-utils/`), which only tests import.
+ */
+const TEST_FILE =
+  /(?:^|\/)(?:__tests__|__mocks__|__fixtures__|test-utils)\/|\.(?:test|spec)\.[cm]?[jt]sx?$/;
 
 export function isTestFile(file: string): boolean {
   return TEST_FILE.test(file.replace(/\\/g, "/"));
@@ -242,6 +321,11 @@ export interface TouchedSymbol {
   line: number;
   side: "head" | "base";
   className?: string;
+  /**
+   * The private (unexported) function the diff actually changed, when this symbol is listed
+   * because it calls that function: its callers are the ones that notice.
+   */
+  via?: string;
 }
 
 interface ParsedLine {
@@ -357,6 +441,109 @@ function exportedByName(content: string, name: string): boolean {
   );
 }
 
+type LineParser = (index: number) => ParsedLine;
+
+function memoParser(source: string[]): LineParser {
+  const parsed = new Map<number, ParsedLine>();
+  return (index) => {
+    let value = parsed.get(index);
+    if (value === undefined) {
+      value = parseLine(source[index] ?? "");
+      parsed.set(index, value);
+    }
+    return value;
+  };
+}
+
+/** The declarations enclosing a (0-based) line, innermost first; empty for a blank line. */
+function enclosingChain(
+  source: string[],
+  parse: LineParser,
+  start: number,
+): { index: number; parsed: ParsedLine }[] {
+  const text = source[start];
+  if (text === undefined || text.trim() === "") return [];
+  const chain: { index: number; parsed: ParsedLine }[] = [];
+  const own = parse(start);
+  let threshold = own.indent;
+  if (own.decl !== undefined || own.memberName !== undefined) {
+    chain.push({ index: start, parsed: own });
+  }
+  // A closing bracket at a declaration's indent still belongs to it.
+  if (/^\s*[}\])]/.test(text)) threshold = own.indent + 1;
+  for (let index = start - 1; index >= 0 && threshold > 0; index--) {
+    const candidate = source[index] ?? "";
+    if (candidate.trim() === "") continue;
+    const info = parse(index);
+    if (info.indent >= threshold) continue;
+    // Comments and decorators at a lower indent don't open blocks.
+    if (/^\s*(?:\/\/|\/\*|\*|@)/.test(candidate)) continue;
+    // `): Type {` or `} else {` continues a block opened higher up at the same indent.
+    if (/^\s*[}\])]/.test(candidate)) {
+      threshold = info.indent + 1;
+      continue;
+    }
+    chain.push({ index, parsed: info });
+    threshold = info.indent;
+  }
+  return chain;
+}
+
+/**
+ * The unexported top-level functions and constants (not classes or types) enclosing the given
+ * (1-based) lines: private helpers such as `testRef` in testModReference.ts, whose changes
+ * reach callers only through the exported functions that call them.
+ */
+export function privateTouched(content: string, lines: number[]): string[] {
+  const source = content.split(/\r?\n/);
+  const parse = memoParser(source);
+  const names = new Set<string>();
+  for (const lineNumber of lines) {
+    const chain = enclosingChain(source, parse, lineNumber - 1);
+    const top = chain.find((element) => element.parsed.indent === 0);
+    if (top === undefined || top.parsed.isClass) continue;
+    // Inside a class member it is the member that is reported (touchedSymbols).
+    const inClass = chain.some((element, i) => {
+      const parent = chain[i + 1];
+      return parent?.parsed.isClass === true && element !== top;
+    });
+    const decl = top.parsed.decl;
+    if (inClass || decl === undefined || decl.kind === "type" || decl.kind === "class") continue;
+    if (decl.exported || exportedByName(content, decl.name)) continue;
+    names.add(decl.name);
+  }
+  return [...names];
+}
+
+/**
+ * One level up from changed private helpers: the exported functions and class members in the
+ * same file that call them, each marked `via` the helper. A caller that is itself private is
+ * not followed further.
+ */
+export function symbolsViaPrivate(
+  content: string,
+  names: string[],
+  file: string,
+  side: "head" | "base",
+): TouchedSymbol[] {
+  const source = content.split(/\r?\n/);
+  const out = new Map<string, TouchedSymbol>();
+  for (const name of names) {
+    const word = new RegExp(`(?<![\\w$])${name.replace(/[$]/g, "\\$")}(?![\\w$])`);
+    const uses: number[] = [];
+    source.forEach((line, i) => {
+      if (!word.test(line) || /^\s*(?:\/\/|\/\*|\*)/.test(line)) return;
+      if (parseLine(line).decl?.name === name) return;
+      uses.push(i + 1);
+    });
+    for (const symbol of touchedSymbols(content, uses, file, side)) {
+      const key = `${symbol.className ?? ""}#${symbol.name}`;
+      if (!out.has(key)) out.set(key, { ...symbol, via: name });
+    }
+  }
+  return [...out.values()];
+}
+
 /**
  * The exported or class-member declarations enclosing the given (1-based) lines.
  *
@@ -379,44 +566,11 @@ export function touchedSymbols(
   side: "head" | "base",
 ): TouchedSymbol[] {
   const source = content.split(/\r?\n/);
-  const parsed = new Map<number, ParsedLine>();
-  const parse = (index: number): ParsedLine => {
-    let value = parsed.get(index);
-    if (value === undefined) {
-      value = parseLine(source[index] ?? "");
-      parsed.set(index, value);
-    }
-    return value;
-  };
+  const parse = memoParser(source);
   const found = new Map<string, TouchedSymbol>();
 
   for (const lineNumber of lines) {
-    const start = lineNumber - 1;
-    const text = source[start];
-    if (text === undefined || text.trim() === "") continue;
-
-    const chain: { index: number; parsed: ParsedLine }[] = [];
-    const own = parse(start);
-    let threshold = own.indent;
-    if (own.decl !== undefined || own.memberName !== undefined)
-      chain.push({ index: start, parsed: own });
-    // A closing bracket at a declaration's indent still belongs to it.
-    if (/^\s*[}\])]/.test(text)) threshold = own.indent + 1;
-    for (let index = start - 1; index >= 0 && threshold > 0; index--) {
-      const candidate = source[index] ?? "";
-      if (candidate.trim() === "") continue;
-      const info = parse(index);
-      if (info.indent >= threshold) continue;
-      // Comments and decorators at a lower indent don't open blocks.
-      if (/^\s*(?:\/\/|\/\*|\*|@)/.test(candidate)) continue;
-      // `): Type {` or `} else {` continues a block opened higher up at the same indent.
-      if (/^\s*[}\])]/.test(candidate)) {
-        threshold = info.indent + 1;
-        continue;
-      }
-      chain.push({ index, parsed: info });
-      threshold = info.indent;
-    }
+    const chain = enclosingChain(source, parse, lineNumber - 1);
 
     for (let i = 0; i < chain.length; i++) {
       const element = chain[i];
@@ -995,7 +1149,8 @@ export function callerHits(symbol: TouchedSymbol, hits: CallerHit[]): FilteredHi
 function symbolLabel(symbol: TouchedSymbol): string {
   const name = symbol.className === undefined ? symbol.name : `${symbol.className}.${symbol.name}`;
   const where = `${symbol.file}:${String(symbol.line)}${symbol.side === "base" ? " (base)" : ""}`;
-  return `${name} [${symbol.kind}] ${where}`;
+  const via = symbol.via === undefined ? "" : ` via private ${symbol.via}`;
+  return `${name} [${symbol.kind}]${via} ${where}`;
 }
 
 async function callersCheck(
@@ -1013,12 +1168,11 @@ async function callersCheck(
     if (file.binary || isTestFile(file.path)) continue;
     if (file.newPath !== undefined && CODE_FILE.test(file.newPath) && file.added.length > 0) {
       const content = await git(dir, ["show", `${headSha}:${file.newPath}`]);
-      for (const s of touchedSymbols(
-        content,
-        file.added.map((l) => l.line),
-        file.newPath,
-        "head",
-      )) {
+      const lines = file.added.map((l) => l.line);
+      for (const s of [
+        ...touchedSymbols(content, lines, file.newPath, "head"),
+        ...symbolsViaPrivate(content, privateTouched(content, lines), file.newPath, "head"),
+      ]) {
         symbols.set(
           `${s.className ?? ""}#${s.name}`,
           symbols.get(`${s.className ?? ""}#${s.name}`) ?? s,
@@ -1027,12 +1181,11 @@ async function callersCheck(
     }
     if (file.oldPath !== undefined && CODE_FILE.test(file.oldPath) && file.removed.length > 0) {
       const content = await git(dir, ["show", `${mergeBase}:${file.oldPath}`]);
-      for (const s of touchedSymbols(
-        content,
-        file.removed.map((l) => l.line),
-        file.oldPath,
-        "base",
-      )) {
+      const lines = file.removed.map((l) => l.line);
+      for (const s of [
+        ...touchedSymbols(content, lines, file.oldPath, "base"),
+        ...symbolsViaPrivate(content, privateTouched(content, lines), file.oldPath, "base"),
+      ]) {
         const key = `${s.className ?? ""}#${s.name}`;
         if (!symbols.has(key)) symbols.set(key, s);
       }
@@ -1713,8 +1866,10 @@ const MISSING_IMPORT =
 export interface RevertOptions {
   tests: string[];
   projectDir?: string;
-  /** Paths to revert; default every non-test file in the diff. */
+  /** Paths to revert; default every non-test file in the diff (none when `revertHunks`). */
   revert?: string[];
+  /** Single hunks to revert, each named by a head-side line inside it. */
+  revertHunks?: Array<{ file: string; line: number }>;
   runner: TestRunner;
   onProgress?: (message: string) => void;
 }
@@ -1732,7 +1887,47 @@ async function revertCheck(
   const nonTest = [
     ...new Set(files.filter((f) => !isTestFile(f.path)).flatMap((f) => [f.oldPath, f.newPath])),
   ].filter((p): p is string => p !== undefined);
-  const toRevert = options.revert?.map((p) => p.replace(/\\/g, "/")) ?? nonTest;
+  const hunkSpecs = options.revertHunks ?? [];
+  const whole =
+    options.revert?.map((p) => p.replace(/\\/g, "/")) ?? (hunkSpecs.length > 0 ? [] : nonTest);
+  // Files reverted hunk by hunk: their reverted text is computed from the diff.
+  const partial = new Map<string, { specs: number[]; content?: Buffer }>();
+  for (const spec of hunkSpecs) {
+    if (whole.includes(spec.file)) {
+      return revertResult("fail", `${spec.file} is given to both --revert and --revert-hunk`);
+    }
+    const entry = partial.get(spec.file) ?? { specs: [] };
+    entry.specs.push(spec.line);
+    partial.set(spec.file, entry);
+  }
+  const hunkNotes: string[] = [];
+  for (const [file, entry] of partial) {
+    const diff = await git(dir, ["diff", "--no-color", "-U0", mergeBase, "HEAD", "--", file]);
+    const hunks = parseHunks(diff);
+    const chosen: Hunk[] = [];
+    for (const line of entry.specs) {
+      const hunk = hunkAt(hunks, line);
+      if (hunk === undefined) {
+        return revertResult(
+          "fail",
+          `--revert-hunk ${file}:${String(line)}: no hunk of the diff covers that head line`,
+          hunks.map((h) =>
+            h.newCount === 0
+              ? `hunk: deletion after head line ${String(h.newStart)}`
+              : `hunk: head lines ${String(h.newStart)}-${String(h.newStart + h.newCount - 1)}`,
+          ),
+        );
+      }
+      if (!chosen.includes(hunk)) chosen.push(hunk);
+    }
+    const head = fs.readFileSync(path.join(dir, file), "utf8");
+    entry.content = Buffer.from(revertHunksIn(head, chosen), "utf8");
+    hunkNotes.push(
+      `${file}: reverted ${String(chosen.length)} of ${String(hunks.length)} hunks (head lines ` +
+        `${chosen.map((h) => `${String(h.newStart)}+${String(h.newCount)}`).join(", ")})`,
+    );
+  }
+  const toRevert = [...whole, ...partial.keys()];
   if (toRevert.length === 0) return revertResult("skip", "the diff changes only tests");
 
   let tests: string[];
@@ -1854,7 +2049,10 @@ async function revertCheck(
   let reverted: Awaited<ReturnType<typeof runAll>>;
   try {
     for (const entry of saved) {
-      if (await gitOk(dir, ["cat-file", "-e", `${mergeBase}:${entry.file}`])) {
+      const hunkContent = partial.get(entry.file)?.content;
+      if (hunkContent !== undefined) {
+        fs.writeFileSync(entry.abs, hunkContent);
+      } else if (await gitOk(dir, ["cat-file", "-e", `${mergeBase}:${entry.file}`])) {
         // --filters applies the checkout's line-ending and smudge rules.
         const bytes = await gitBuffer(dir, ["cat-file", "--filters", `${mergeBase}:${entry.file}`]);
         let parent = path.dirname(entry.abs);
@@ -1903,7 +2101,8 @@ async function revertCheck(
 
   const restoredNote = `restored ${String(saved.length)} files byte-identically; git status clean`;
   const details = [
-    `reverted to ${mergeBase.slice(0, 7)}: ${toRevert.join(", ")}`,
+    ...(whole.length > 0 ? [`reverted to ${mergeBase.slice(0, 7)}: ${whole.join(", ")}`] : []),
+    ...hunkNotes,
     ...branch.details,
     ...reverted.details,
     restoredNote,
@@ -1942,6 +2141,8 @@ export interface PreflightOptions {
   tests?: string[];
   projectDir?: string;
   revert?: string[];
+  /** `--revert-hunk <file>:<line>` specs (see parseHunkSpec). */
+  revertHunks?: string[];
   skipRevert?: boolean;
   pr?: string;
   repo?: string;
@@ -2036,6 +2237,7 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
               tests: options.tests ?? [],
               projectDir: options.projectDir,
               revert: options.revert,
+              revertHunks: (options.revertHunks ?? []).map(parseHunkSpec),
               runner: options.runner ?? vitestRunner,
               onProgress: options.onProgress,
             }),

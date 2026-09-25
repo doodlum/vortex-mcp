@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   claimInstanceLease,
   forgetLaunchedPid,
   instanceLeaseResources,
+  launchStdio,
   recordLaunchedPid,
 } from "./instance";
 import {
@@ -195,4 +197,55 @@ describe("the leases a running Vortex needs", () => {
     hold.release();
     expect(readLease(checkoutResource(checkout), env)?.lease.mode).toBe("explicit");
   });
+});
+
+describe("launching detached", () => {
+  it("never hands Vortex this process's stdio", () => {
+    expect(launchStdio(undefined)).toEqual({
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+      windowsHide: false,
+    });
+    expect(launchStdio(7).stdio).toEqual(["ignore", 7, 7]);
+  });
+
+  it("lets a caller reading the launcher's output finish while the launched process runs", async () => {
+    // The launcher spawns a long-lived child the way launchVortex does, then exits. Whoever
+    // reads the launcher's stdout (a shell with `*>`, a tool) must see it close at once.
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "vortex-launch-"));
+    const log = path.join(work, "child.log");
+    const launcher = path.join(work, "launcher.mjs");
+    fs.writeFileSync(
+      launcher,
+      `import { spawn } from "node:child_process";
+import fs from "node:fs";
+const fd = fs.openSync(${JSON.stringify(log)}, "w");
+const shape = ${JSON.stringify(launchStdio(-1))};
+shape.stdio = shape.stdio.map((s) => (s === -1 ? fd : s));
+const child = spawn(process.execPath, ["-e", "console.log('child up'); setTimeout(() => {}, 20000)"], shape);
+fs.closeSync(fd);
+child.unref();
+console.log(String(child.pid));
+`,
+    );
+    const started = Date.now();
+    const parent = spawn(process.execPath, [launcher], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    parent.stdout.on("data", (chunk: Buffer) => (out += chunk.toString()));
+    // "close" fires only when every holder of the pipe's write end has gone.
+    await new Promise<void>((resolve) => parent.stdout.once("close", () => resolve()));
+    const childPid = Number(out.trim());
+    try {
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(() => process.kill(childPid, 0)).not.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(fs.readFileSync(log, "utf8")).toContain("child up");
+    } finally {
+      try {
+        process.kill(childPid);
+      } catch {
+        // already gone
+      }
+    }
+  }, 20_000);
 });

@@ -378,22 +378,28 @@ function registerModInventoryTools(server: McpServer, api: IExtensionApi): void 
         "collection id. That is a private shape: when a Vortex build stops passing the prop, " +
         "driver.found is false with a reason. `session` summarises the public install session " +
         "(state.session.collections.activeSession: members by status and type, the ones still " +
-        "outstanding). `dialogs` are the open modals, each tagged with the step it belongs to " +
-        "(query, game-version-prompt, review) where recognised. Read-only; cheap enough to poll.",
+        "outstanding). driver.preparing: work queued with prepare() is unfinished (start/query " +
+        "wait for it); driver.starting: a start attempt is in progress (builds with the " +
+        "game-version Cancel fix; null where not observable). `dialogs` are the open modals, each " +
+        "tagged with the step it belongs to (query, game-version-prompt, review) where recognised " +
+        "and the collection it belongs to (collectionId, collectionName, via: driver prop, " +
+        "collection prop or text). Read-only; cheap enough to poll.",
       inputSchema: z.object({}),
     },
     async () => {
       // Older Vortex builds have no session.collections at all.
       const collections = (api.getState().session as unknown as Record<string, unknown>)
         ?.collections as { activeSession?: unknown; lastActiveSessionId?: unknown } | undefined;
+      const named = collectionState.installedCollections(api.getState().persistent?.mods);
       return {
         content: [
           jsonText({
             driver: collectionState.readDriver(),
             session: collectionState.summariseSession(collections?.activeSession),
             lastActiveSessionId: collections?.lastActiveSessionId ?? null,
-            dialogs: ui.activeDialogs().map((text) => ({
+            dialogs: ui.activeDialogElements().map(({ text, element }) => ({
               step: collectionState.classifyDialog(text) ?? null,
+              ...collectionState.dialogCollection(element, named, text),
               text: text.slice(0, 300),
             })),
           }),

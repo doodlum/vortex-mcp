@@ -36,6 +36,12 @@ export interface ScaleOptions {
   rules?: number;
   /** Members revision 2 adds. Default 50. */
   extra?: number;
+  /**
+   * Leave the optional members out of the library: each gets a tag no installed mod has and a
+   * bundled file, so the review offers them (Install optional mods / No Thanks) instead of
+   * finding them installed and showing only Done. Default false.
+   */
+  missingOptional?: boolean;
 }
 
 /** Mods the library needs for these options. */
@@ -52,7 +58,19 @@ function every(fraction: number | undefined): number | undefined {
   return Math.max(1, Math.round(1 / Math.min(1, fraction)));
 }
 
-function member(id: string, optional: boolean, glob: boolean): BundledMember {
+/** The tag of an optional member that is not installed (`missingOptional`). */
+export const missingTag = (id: string): string => `vortex-mcp-missing-${id}`;
+
+function member(id: string, optional: boolean, glob: boolean, missing = false): BundledMember {
+  if (optional && missing) {
+    // Not in the library: a tag nothing has, and a file so it can be installed if asked to.
+    return {
+      name: id,
+      files: { [`${id}-optional.txt`]: `${id}\n` },
+      tag: missingTag(id),
+      optional,
+    };
+  }
   return {
     name: id,
     files: {},
@@ -89,7 +107,12 @@ export function scaleMembers(
       else if (i % optionalEvery === 5 % optionalEvery) optional = true;
     }
     members.push(
-      member(ids[i]!, optional, globEvery !== undefined && i % globEvery === 11 % globEvery),
+      member(
+        ids[i]!,
+        optional,
+        globEvery !== undefined && i % globEvery === 11 % globEvery,
+        options.missingOptional === true,
+      ),
     );
   }
   if (revision === 2) {
@@ -99,7 +122,10 @@ export function scaleMembers(
   for (let j = 0; j < (options.duplicates ?? 0); j++) {
     const base = members.find((m) => m.name === ids[(j * 97 + (revision === 2 ? 5 : 0)) % pool]);
     if (base === undefined) continue;
-    members.push(j % 2 === 0 ? { ...base } : { ...base, optional: base.optional !== true });
+    // A duplicate of a missing optional member stays that member; flipping it to required
+    // would make a required member missing, which fails the install.
+    const flip = j % 2 === 1 && !(options.missingOptional === true && base.optional === true);
+    members.push(flip ? { ...base, optional: base.optional !== true } : { ...base });
   }
   return members;
 }

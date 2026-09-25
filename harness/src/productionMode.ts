@@ -88,8 +88,8 @@ export function devBundleWarning(sourceDir: string): string {
     `${sourceDir} was built without NODE_ENV=production (a development bundle). React runs ` +
     `its production build, but Vortex's own development-only branches, inlined at build ` +
     `time, still run (main-process file logging, renderer source-map support and process ` +
-    `warning traces, missing-icon checks). For release parity rebuild with ` +
-    `NODE_ENV=production: in PowerShell, $env:NODE_ENV='production'; pnpm run build; ` +
-    `Remove-Item Env:NODE_ENV (nx caches the two modes separately).`
+    `warning traces, missing-icon checks). For release parity rebuild it with ` +
+    `\`pnpm run ai -- build --checkout ${sourceDir} --production\`, which sets ` +
+    `NODE_ENV=production for the build only (nx caches the two modes separately).`
   );
 }

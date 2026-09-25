@@ -431,10 +431,38 @@ export async function stopStaleInstance(config: HarnessConfig): Promise<boolean>
 export interface LaunchOptions {
   userDataDir: string;
   config: HarnessConfig;
-  /** Pipe Vortex's stdio into this process. Off by default — it is very noisy. */
-  inheritStdio?: boolean;
   /** Progress and warnings, such as a development bundle under --production. */
   onProgress?: (message: string) => void;
+}
+
+/** Where a detached Vortex's own stdout and stderr go: `<instance dir>/vortex-stdio.log`. */
+export function stdioLogFile(userDataDir: string): string {
+  return path.join(userDataDir, "vortex-stdio.log");
+}
+
+function openStdioLog(userDataDir: string): number | undefined {
+  try {
+    fs.mkdirSync(userDataDir, { recursive: true });
+    return fs.openSync(stdioLogFile(userDataDir), "w");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * How Vortex is spawned. Detached, so it outlives the `vortex-ai` process that started it, and
+ * with none of that process's stdio: stdin is ignored and stdout/stderr go to a log file (or
+ * nowhere). A Vortex holding the caller's pipes keeps a shell that captures `up`'s output
+ * (PowerShell `*>`, `| Select-String`, a tool reading stdout) waiting until Vortex exits.
+ * Nothing else Vortex writes is lost that way: its own log is `userData/vortex.log`.
+ */
+export function launchStdio(logFd: number | undefined): {
+  stdio: ["ignore", number | "ignore", number | "ignore"];
+  detached: true;
+  windowsHide: false;
+} {
+  const out = logFd ?? "ignore";
+  return { stdio: ["ignore", out, out], detached: true, windowsHide: false };
 }
 
 /**
@@ -475,19 +503,18 @@ export async function launchVortex(options: LaunchOptions): Promise<VortexInstan
     env.NODE_OPTIONS = [env.NODE_OPTIONS, preload.nodeOptions].filter(Boolean).join(" ");
   }
 
-  const child = spawn(
-    target.executable,
-    [...target.args, `--remote-debugging-port=${String(config.cdpPort)}`],
-    {
-      env,
-      cwd: path.dirname(target.executable),
-      stdio: options.inheritStdio === true ? "inherit" : "ignore",
-      // Detached so the instance survives the CLI process that started it; an
-      // agent drives it over many separate `vortex-ai` invocations.
-      detached: options.inheritStdio !== true,
-      windowsHide: false,
-    },
-  );
+  const logFd = openStdioLog(userDataDir);
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      target.executable,
+      [...target.args, `--remote-debugging-port=${String(config.cdpPort)}`],
+      { env, cwd: path.dirname(target.executable), ...launchStdio(logFd) },
+    );
+  } finally {
+    // The child has its own copy; this process must not keep the log open.
+    if (logFd !== undefined) fs.closeSync(logFd);
+  }
   child.unref();
   recordPid(config, child.pid);
   // A detached instance keeps the lease after this process exits, until `down`.

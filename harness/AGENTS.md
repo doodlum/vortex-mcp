@@ -144,6 +144,11 @@ so the first start after changing this is cold; pass the same choice to every co
 the key in use, `VORTEX_AI_NEXUS_API_KEY` and `NEXUS_API_KEY` are also left out of the
 environment Vortex is launched with.
 
+`up` returns as soon as Vortex answers: Vortex runs detached with none of the caller's stdio
+(stdin ignored, its stdout and stderr in `<cache>/live/vortex-stdio.log`), so a shell capturing
+`up`'s output (`*>`, `| Select-String`, an agent's tool) is not held open until Vortex exits.
+Its own log is still `userData/vortex.log`.
+
 `down` waits for clean shutdown. An unresponsive instance is reported and left
 intact; the harness does not blindly kill a recorded PID and then certify a
 possibly unflushed profile. Close the identified harness window before retrying.
@@ -161,10 +166,10 @@ machine-wide lease (`~/.vortex-ai/leases`, shared by every kit checkout; overrid
 
 ```powershell
 pnpm run ai -- lease status                       # who holds what, live or stale
-pnpm run ai -- lease acquire --owner qa --purpose "PR 24290 QA" --ttl 120
+pnpm run ai -- lease acquire --owner qa --purpose "PR 24290 QA" --ttl 120 --checkout C:\dev\vx-ab
 pnpm run ai -- up --owner qa --sandbox            # joins qa's lease
 pnpm run ai -- down --owner qa
-pnpm run ai -- lease release --owner qa
+pnpm run ai -- lease release --owner qa           # everything qa holds, instance and checkouts
 pnpm run ai -- lease run --owner qa --wait 60 -- pnpm run verify
 ```
 
@@ -179,6 +184,13 @@ pnpm run ai -- lease run --owner qa --wait 60 -- pnpm run verify
 - `lease acquire` takes an explicit lease that lasts `--ttl` minutes (default 60; `0` for
   none) or, with `--pid <n>`, while that process runs. Acquiring again renews it; that is
   the heartbeat. `up`/`down` inside it leave it held.
+- `lease acquire --checkout <dir>` takes the instance lease **and** that checkout's lock, all
+  or nothing: when either is refused, whatever the call newly took is given back. It takes
+  the instance first, so a refused caller has touched nothing. `--checkout-only` takes just
+  the checkout (a fix agent that never starts Vortex).
+- `lease release --owner <name>` releases **every** lease that owner holds, the instance and
+  each checkout, in one call. `--checkout <dir>` releases only that checkout. A checkout a
+  Vortex still runs from stays locked by that Vortex either way (`down` ends it).
 - `lease run [flags] [--] <command...>` holds the lease while the command runs, passes
   `VORTEX_AI_OWNER` to it (so kit commands inside join rather than refuse), releases it
   however the command ends, and exits with its code. Flags go before the command; the
@@ -188,8 +200,9 @@ pnpm run ai -- lease run --owner qa --wait 60 -- pnpm run verify
 - A lease is stale when every process holding it has exited, or when an explicit lease's
   TTL passed; the next acquirer reclaims it and says so. Reclaiming a TTL-expired lease
   whose Vortex still runs means that Vortex gets stopped by the next `up` or `down`.
-- `lease release --force` clears someone else's live lease. Only a human should, after
-  checking its holder is really gone.
+- `lease release --force` (no `--owner`) clears the instance lease whoever holds it;
+  `--owner <name> --force` clears all of that owner's. Only a human should, after checking
+  its holder is really gone.
 - Commands that rewrite a Vortex checkout also lock it (`checkout:<path>`): the
   `pr-preflight` revert check and `vortex-e2e`'s fixture patch. `lease run --checkout <dir>`
   and `lease acquire --checkout <dir>` take the same lock.
@@ -230,9 +243,10 @@ files private.
 ### Scratch scripts and renderer diagnostics
 
 `vortex-ai script <file.mts> [its args...]` runs a scratch script with the kit's tsx, holding
-the instance lease (`--owner`, `--wait <minutes>`), with the command's instance settings in the
-environment (cache dir, ports, token). Everything after the file goes to the script. Outside
-this repo:
+the instance lease, with the command's instance settings in the environment (cache dir, ports,
+token). `--owner <name>` and `--wait <minutes>` are the kit's wherever they appear, before or
+after the file; every other argument after the file goes to the script, and everything after a
+bare `--` does too, `--owner` included. It prints the owner it runs as. Outside this repo:
 
 - name it `.mts`: tsx treats a `.ts` file with no ESM `package.json` above it as CommonJS,
   where top-level `await` fails;
@@ -249,6 +263,12 @@ const mcp = kit.clientFor(kit.loadConfig());
 ```
 
 A script that proves useful becomes a harness module with a test, not a file passed around.
+
+`page.evaluate(() => { … })` with named inner functions works from a script:
+`attachToRenderer` defines esbuild's `__name` helper in the page (`NAME_SHIM` in `cdp.ts`),
+because tsx compiles every file with `keepNames`, hard-coded, and the page otherwise throws
+"`__name` is not defined". Kit modules still send page code as source text, which needs no
+shim and also runs in the unit tests' jsdom.
 
 `vortex-ai eval --expr "<expression>"` (or `eval <file.js>`) evaluates JavaScript in a harness
 instance's renderer over CDP and prints the result as JSON; a promise is awaited, so use an
@@ -390,13 +410,25 @@ How callers are found:
   the files importing that name from the barrel or from `@nexusmods/vortex-api`, and for
   `util`-style barrels to `util.name` uses.
 
+Test code is `*.test.*`, `*.spec.*` and anything under `__tests__`, `__mocks__`, `__fixtures__`
+or `test-utils` (Vortex's `src/renderer/src/test-utils/` builders and harnesses): never reverted,
+never counted as a production caller. A changed **private** function (an unexported top-level
+function or constant, such as `testRef` in testModReference.ts) is followed one level: the
+exported functions and class members of the same file that call it are listed as
+`name [function] via private testRef`, with their callers.
+
 The revert check runs `pnpm exec vitest run` on `--test <path>` (repeatable), or on the
 test files the diff adds or changes, in each test's nearest `package.json` directory
 (`--project-dir <dir>` overrides). A `--test` path may be absolute, relative to the checkout
 root, or relative to `--project-dir`; the first that exists is used, and one that exists in
 neither place fails the check. vitest is then given paths relative to the directory it runs
 in, which the report states. `--revert <path>` (repeatable) reverts only those
-files, which is how to show a test fails when just the wiring is reverted. It is the only
+files, which is how to show a test fails when just the wiring is reverted. `--revert-hunk
+<file>:<line>` (repeatable) reverts only the hunk of that file holding that head-side line (for
+a deletion, the line before or after it), from `git diff -U0`: a call site in a file that also
+defines the new code, which a whole-file revert would turn into a missing export. A line no
+hunk covers fails the check, listing the hunks. Without `--revert`, only the named hunks are
+reverted. It is the only
 check that writes to the checkout. It refuses on uncommitted changes, keeps a backup in
 the temp directory, restores the branch's exact bytes on success, failure, throw and
 Ctrl+C, and then checks hashes and `git status`. `--skip-revert` skips it.
@@ -505,10 +537,20 @@ installs them with no Nexus or account:
   `installOfflineCollection(…, { gameVersions, gameVersionAnswer })` does it for you. This is for
   that prompt only: with a revision id set, the driver also records a pending vote for it.
 - **`installOfflineCollection`** drives Install Now → prompt → review and closes the review. It
-  skips optional members (No Thanks) or, with `optionals: "install"`, clicks Install optional
-  mods first. It fails at once on an "incomplete" review unless `allowIncomplete`. It returns
-  `postprocessed`: whether `collection-postprocess-complete` fired for this collection, seen
-  through the extension's `onEvent` listener.
+  skips optional members (No Thanks) or, with `optionals: "install"`, clicks Install optional mods
+  first; `optionals: "stand-in"` clicks it and then completes that pass without installing
+  (below). It fails at once on an "incomplete" review unless `allowIncomplete`. It returns
+  `closedWith` (the button) and `postprocessed`: whether `collection-postprocess-complete` fired
+  for this collection, seen through the extension's `onEvent` listener. `onPhase(name, detail)`
+  is called at install-now, game-version-answered, review-shown (again after an optionals pass),
+  optionals-install, optionals-stand-in, review-closing and review-closed, for timestamps.
+- **Dialogs are found by their own text and buttons, never a full snapshot.** Install Now is
+  waited for with `ui_active_dialogs` (`waitForInstallNow`) and clicked inside its dialog. With a
+  few hundred mods on the Mods page a full snapshot reaches its node limit before the modal, so
+  its buttons are not in it; and a dialog's text is cut at 400 characters, before the buttons of
+  a review with a description. `dialogButtons(mcp, dialogText)` (`uiDriver.ts`) lists a
+  dialog's buttons with disabled ones marked: a button disabled while the review postprocesses
+  is not an absent one.
 
 - **Rules and references.** `modRules` on the collection writes inter-member rules; a member's
   `fileExpression` overrides its bundle name (a glob, for an already-installed member matched by
@@ -526,7 +568,31 @@ installs them with no Nexus or account:
   scoped snapshot's `rootText`.
 
 Bundled optional members that are then installed have stalled until Vortex's stall watchdog
-fired (5 min) in QA. That is not diagnosed yet; the default skips them.
+fired (5 min) in QA. That is not diagnosed yet; the default skips them. To test what happens
+around an optionals pass (the review leaving and coming back, its fade, its lists) without that
+install, `completeOptionalsWithoutInstall(mcp, collectionModId)` stands in for it after Install
+optional mods was clicked: it adds an installed, enabled mod carrying each missing optional
+rule's tag, marks the session's optional entries installed (`COLLECTION_UPDATE_MOD_STATUS`) and
+emits `did-install-dependencies` with recommendations true. InstallDriver then returns to the
+review by itself (108 ms in the app). No member's files exist: never use it to test the install.
+
+- **Resuming offline.** `resumeViaNotification(mcp, collectionModId)` is the only path to
+  `InstallDriver.start` that works without a login (`resume-collection` and the Premium restart
+  need one; Install Now goes through `query`). After Later at Install Now, it enables the
+  collection mod and deploys, so the dependency check reports the unfulfilled rules and Vortex
+  raises "Collection incomplete", then clicks that notification's Resume: a `.notification`
+  toast in the classic layout, an entry of the title bar's Notifications popover in the modern
+  one (it opens it). Vortex raises that notification once per collection per session, so a
+  second resume of the same collection needs a restart; it deploys, so sandboxes only.
+- `reviewDialogsFor(mcp, collectionModId)` counts the open review screens
+  `collection_install_state` attributes to that collection.
+
+**A deterministic load order.** After a deploy Vortex orders plugins as their files were found,
+which differs between runs, so the Plugins page's displayed values could not be compared across
+builds. `setDeterministicLoadOrder(mcp)` (`bethesdaSandbox.ts`) turns LOOT's autosort off and
+applies `deterministicLoadOrder`: the game's natives first, then masters, light plugins and
+plugins, each by name (`SET_PLUGIN_ORDER`, enabled states kept), and checks that
+`state.loadOrder` reads back in that order. Two fresh runs gave the same 151-plugin order.
 
 `pnpm run ai:test:bethesda` checks Missing Masters on the fake game: a plugin with an absent
 master must be flagged and reported, before and after a completed offline collection.
@@ -549,8 +615,15 @@ session. `collection_install_state` (read tool) reports:
   passing the prop, `driver.found` is false with the reason.
 - `session`: `state.session.collections.activeSession` summarised, with members by status and
   type and the ones outstanding.
+- `driver.preparing`: work queued with `driver.prepare()` is unfinished (`start` and `query`
+  wait for it); from the private Bluebird chain, null when not observable. `driver.starting`: a
+  start attempt is in progress (the revision fetch, the game-version prompt), from the private
+  `mStarting` token that only builds with the game-version Cancel fix have; null elsewhere.
+  `driver.lastCollectionId`: what the review shows after the install ended.
 - `dialogs`: the open modals, tagged with their step (`query`, `game-version-prompt`,
-  `review`).
+  `review`) and the collection each belongs to: `collectionId`, `collectionName` and `via`, which
+  is `driver` (the rendering component's `driver` prop), `collection-prop`, or `text` (a
+  `showDialog` prompt naming an installed collection); null when nothing says.
 
 `vortex-ai call collection_install_state` from a shell. It is cheap enough to poll.
 
@@ -568,8 +641,27 @@ does).
   middleware, persistence diffing, reducers and subscribers; React rendering shows up as
   long tasks.
 - **`profileRenderer(page, run)`** (`profiling.ts`) takes a CDP CPU profile of the
-  renderer. It summarises self time by function and by source file, and saves a
-  `.cpuprofile` that DevTools opens.
+  renderer. It summarises self time by function and by source file, inclusive time (a function
+  and everything it called, once per sample: `inclusive`, and `inclusiveApp` without
+  dependencies, native frames or this kit's extension), and the longest stretch without idle
+  (`longestBusy`, with what it spent it on). It saves a `.cpuprofile` that DevTools opens, and
+  returns the raw `profile` and `pageStartMs`, the page's clock at the profiler's start: a time
+  the page records later minus that is its offset in the profile. `summariseWindows(profile,
+windowsFromMarks(marks, durationMs))` summarises the stretches between marks.
+- **Table and dialog probes** (`tableProbes.ts`), for any SuperTable and any modal:
+  - `measureRowIdentity(page, action, condition, { tables })`: per table, how many rows the
+    action gave a new data object (`changedRefs`), how many of those hold no different value
+    (`spurious`), which columns differed (`keyHist`), how many TableRows got a new `data` prop and
+    how many re-rendered (`rowRenders`). It wraps each SuperTable's `updateState` and TableRow's
+    prototype, found through the fiber tree, and removes them afterwards. An in-place mutation
+    of an existing row object is invisible to it.
+  - `measureAfter(page, action, condition)`: blocked time and the longest task until
+    `condition`, a page expression, first holds (checked on every DOM mutation and every 50 ms),
+    rather than until idle; `untilCondition` and `total` (with an `afterMs` tail). It throws when
+    the condition already holds before the action.
+  - `recordDialogFade(page, { selector, text }, run)`: the dialog's class, title, text and
+    buttons (disabled marked) on every mutation while `run` closes or changes it, until it has
+    been unchanged for `settleMs`; `gone` says whether it left the DOM.
 - **`markLog` / `readSince` / `summariseLog`** (`vortexLog.ts`) read Vortex's own log for
   the span of an operation. They cover persist:diff counts per hive, `level_pivot slow
 Write`, mod sort timings, state backups, memory warnings and renderer crashes. That is
@@ -579,6 +671,16 @@ Write`, mod sort timings, state backups, memory warnings and renderer crashes. T
   instances only. A count that stops rising while its event fires means that event's
   checks are suppressed.
 
+**Build for production with the kit.** `pnpm run ai -- build --checkout <dir> --production`
+runs the checkout's `pnpm run build` with its pinned pnpm (`pnpm dlx pnpm@<packageManager>` when
+the pnpm on PATH differs, parent `npm_*`/`PNPM_*` variables stripped), with NODE_ENV=production
+in the build's own environment only (without `--production`, NODE_ENV is removed from it). It
+holds the checkout's lock, refuses while a Vortex runs from the checkout, puts back
+`etc/vortex.api.md` and `etc/Dependency Report.md` when the build rewrote them, and reports the
+bundle mode afterwards. The caller's environment is never touched, which matters because the
+agent sandbox blocks `Remove-Item Env:NODE_ENV`; to clear a variable by hand there, use
+`$env:NODE_ENV=$null`.
+
 **Measure in production mode.** A source build normally runs with NODE_ENV=development,
 which loads React's development build, several times slower at rendering. Use
 `up --dev-dir <checkout> --production ...` for any timing that should stand for what
@@ -587,8 +689,8 @@ Vortex and fails unless `automation_status` shows `nodeEnv: "production"` and
 `react.build: "production"` (react and react-dom loaded `react*.production*.js`). It warns when
 the checkout is a development bundle (a plain `pnpm run build`): React is then production, but
 Vortex's own development-only branches, inlined at build time, still run. For full release
-parity build with `$env:NODE_ENV='production'; pnpm run build`, then clear it (nx caches the
-two modes separately). Released builds are always in production. Compare A/B builds in the
+parity build it with `build --checkout <dir> --production` (above; nx caches the two modes
+separately). Released builds are always in production. Compare A/B builds in the
 same mode, from the same `--fresh` baseline, and record `automation_status.react` with the
 numbers.
 
@@ -604,7 +706,7 @@ under `harness/.artifacts`:
 | Command                                                   | Needs          | What it measures and fails on                                                                                                                                                                                                                                                 |
 | --------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ai:test:collection-scale -- --members <n>`               | sandbox        | Installs an offline collection of n already-installed mods. Reports wall time, long tasks, CPU hotspots (`.cpuprofile`) and Vortex's step timings (adding member rules, gathering dependencies, updating rules). Fails on a freeze over 10s. Options below.                   |
-| `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle.                                                                                                              |
+| `ai:test:plugins-page -- --plugins <n>`                   | fake Fallout 4 | On the Plugins page with n plugins: rendered rows, and blocking while scrolling, filtering, clearing and toggling a plugin, checking the row follows the toggle. The load order is made deterministic first (below; `--vortex-order` keeps Vortex's).                         |
 | `ai:test:download-churn -- --downloads <n> --seconds <s>` | any            | Throttled downloads from a local server (`downloadServer.ts`). Reports persist:diff per minute and per hive, slow writes, dispatches and long tasks. A measurement; it has no pass/fail.                                                                                      |
 | `ai:test:mods-scroll -- --mods <n> [--conflicts <pairs>]` | sandbox        | The Mods table under real wheel input: rows on arrival, longest frame gap during a flick, blank rows after it settles, dropdown direction and clipping at both edges, noShrink Status width, rows left rendered after a scroll-through, the conflict editor's virtualisation. |
 
@@ -612,17 +714,24 @@ under `harness/.artifacts`:
 always has, so older reports stay comparable. Options add what real collections have
 (`collectionScale.ts`, deterministic, so A and B builds get the same collection):
 
-| Option             | Adds                                                                                                                                            |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--optional <f>`   | a fraction of optional members (e.g. `0.1`); they are skipped at the review                                                                     |
-| `--glob <f>`       | a fraction referenced by a glob `fileExpression` (`Bundled - x?*`)                                                                              |
-| `--duplicates <n>` | duplicate member entries, alternately with the other type                                                                                       |
-| `--rules <n>`      | inter-member `modRules` with tag, literal and glob fileExpression, and unresolvable (logicalFileName) references, duplicates, before-then-after |
-| `--update`         | then revision 2, installed as `collectionUpdate` does (`updateOfflineCollection`): drops 5%, flips optional, adds `--extra <n>` (default 50)    |
+| Option               | Adds                                                                                                                                            |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--optional <f>`     | a fraction of optional members (e.g. `0.1`); they are skipped at the review                                                                     |
+| `--glob <f>`         | a fraction referenced by a glob `fileExpression` (`Bundled - x?*`)                                                                              |
+| `--duplicates <n>`   | duplicate member entries, alternately with the other type                                                                                       |
+| `--rules <n>`        | inter-member `modRules` with tag, literal and glob fileExpression, and unresolvable (logicalFileName) references, duplicates, before-then-after |
+| `--update`           | then revision 2, installed as `collectionUpdate` does (`updateOfflineCollection`): drops 5%, flips optional, adds `--extra <n>` (default 50)    |
+| `--missing-optional` | optional members are not installed beforehand (a tag nothing has, a bundled file), so the review offers them instead of showing only Done       |
+| `--optionals <m>`    | at the review: `skip` (No Thanks, default), `install`, or `stand-in` (Install optional mods, then `completeOptionalsWithoutInstall`)            |
 
 Install and update are reported separately (`phases.install`, `phases.update`): wall time,
 `longestFreezeMs`, long tasks, `updatingRulesMs` and the other steps, and the update's
-`removeMs`. The freeze budget applies to each. Example, the shape QA used for #24283:
+`removeMs`. The freeze budget applies to each. Each phase also records `closedWith` (the button
+that closed the review), `dispatches` (perf_trace's count and time per action type, top 40 by
+each), `marks` (install-now, review-shown, optionals-install, review-closing, review-closed …:
+`performance.mark` in the renderer, and `atMs` from the `.cpuprofile`'s start in the JSON),
+`windows` (the profile between consecutive marks: busy time, the app's functions by inclusive
+time, the longest freeze), and `inclusive`, `inclusiveApp` and `longestBusy` for the whole phase. Example, the shape QA used for #24283:
 `--members 2000 --optional 0.1 --glob 0.04 --duplicates 20 --rules 1000 --update`.
 
 `pnpm run ai:test:large-library` is an opt-in performance check against a running

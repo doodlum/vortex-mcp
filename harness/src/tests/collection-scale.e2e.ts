@@ -24,9 +24,18 @@
  *                      collection mod keeping its members, install revision 2 (drops 5%, flips
  *                      optional members, adds --extra members, changes rules)
  *   --extra <n>        members revision 2 adds (default 50)
+ *   --missing-optional the optional members are not installed beforehand, so the review offers
+ *                      them (Install optional mods / No Thanks) instead of showing only Done
+ *   --optionals <m>    at the review: skip (No Thanks, default), install (really install
+ *                      them), or stand-in (click Install optional mods, then complete that pass
+ *                      without installing: completeOptionalsWithoutInstall)
  *
  * Install and update are reported separately: wall time, longest freeze (the longest
- * main-thread task), long tasks, and Vortex's step timings, updateRules included.
+ * main-thread task), long tasks, Vortex's step timings, updateRules included, the button that
+ * closed the review, every action type's dispatch count and time, and the CPU profile's
+ * functions by self and by inclusive time. Each phase of the install (Install Now, review shown,
+ * review closed, ...) is marked: `performance.mark` in the renderer, and `marks` in the JSON
+ * with their offset in the `.cpuprofile`, which `windows` then summarises one by one.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -42,8 +51,15 @@ import {
   updateOfflineCollection,
   writeOfflineCollection,
   type CollectionInstallResult,
+  type CollectionPhase,
+  type InstallCollectionOptions,
 } from "../offlineCollection";
-import { profileRenderer } from "../profiling";
+import {
+  profileRenderer,
+  summariseWindows,
+  windowsFromMarks,
+  type ProfileMark,
+} from "../profiling";
 import { markLog, readSince, summariseLog, type LogEntry } from "../vortexLog";
 
 const flag = (name: string): string | undefined => {
@@ -64,8 +80,13 @@ const options: ScaleOptions = {
   duplicates: numberFlag("duplicates"),
   rules: numberFlag("rules"),
   extra: numberFlag("extra"),
+  missingOptional: process.argv.includes("--missing-optional"),
 };
 const update = process.argv.includes("--update");
+const optionalsMode = flag("optionals") ?? "skip";
+if (!["skip", "install", "stand-in"].includes(optionalsMode)) {
+  throw new Error("--optionals is skip, install or stand-in.");
+}
 /**
  * The longest the UI may be frozen at a stretch. Master of September 2026, 2,000 members,
  * production React: 21.2s (the 26.5s once noted here was probably development React).
@@ -118,10 +139,30 @@ function between(entries: LogEntry[], from: RegExp, to: RegExp): number | null {
   return Date.parse(entries[end]?.time ?? "") - Date.parse(entries[start]?.time ?? "");
 }
 
+interface TraceSummary {
+  durationMs: number;
+  dispatches: { count: number; totalMs: number };
+  byTime: Array<{ type: string; count: number; totalMs: number; maxMs: number }>;
+  byCount: Array<{ type: string; count: number; totalMs: number; maxMs: number }>;
+  longTasks: { count: number; totalMs: number; maxMs: number };
+  heapMb: { start: number; max: number; end: number } | null;
+}
+
+interface PhaseMark extends ProfileMark {
+  detail?: string;
+  /** Wall-clock time, for lining the mark up with Vortex's log. */
+  time: string;
+}
+
 interface Phase {
   wallMs: number;
   longestFreezeMs: number;
   longTasks: { count: number; totalMs: number; maxMs: number };
+  /** The button that closed the review (Done, No Thanks, Close). */
+  closedWith: string;
+  /** Every action type dispatched during the phase, by count and by time (perf_trace). */
+  dispatches: Pick<TraceSummary, "dispatches" | "byCount" | "byTime">;
+  marks: PhaseMark[];
   steps: {
     addingMemberRulesMs: number | null;
     gatheringDependenciesMs: number | null;
@@ -132,29 +173,54 @@ interface Phase {
   removeMs?: number;
   hotFunctions: unknown[];
   hotFiles: unknown[];
+  /** Functions by inclusive time (callees included), dependencies included and not. */
+  inclusive: unknown[];
+  inclusiveApp: unknown[];
+  longestBusy: unknown;
+  /** The profile between consecutive marks: busy time, inclusive top, longest freeze. */
+  windows: unknown[];
   log: unknown;
   cpuprofile: string | undefined;
 }
 
 async function measure(
   label: string,
-  run: () => Promise<{ install: CollectionInstallResult; removeMs?: number }>,
+  run: (onPhase: InstallCollectionOptions["onPhase"]) => Promise<{
+    install: CollectionInstallResult;
+    removeMs?: number;
+  }>,
 ): Promise<Phase & { collectionModId: string }> {
   const mark = markLog(status.userDataDir ?? path.join(config.cacheDir, "live", "userData"));
   const handle = await attachToRenderer(config);
   await mcp.call("perf_trace_start", {});
   const start = Date.now();
-  const { result, summary, file } = await profileRenderer(handle.page, run, {
-    artifactDir: config.artifactDir,
-    label,
-    top: 10,
-  });
-  const wallMs = Date.now() - start;
-  const trace = await mcp.call<{ longTasks: { count: number; totalMs: number; maxMs: number } }>(
-    "perf_trace_stop",
-    { top: 8 },
+  // Page times of each phase; offsets into the profile once its start is known.
+  const pageMarks: Array<{ name: CollectionPhase; detail?: string; pageMs: number; time: string }> =
+    [];
+  const onPhase = async (name: CollectionPhase, detail?: string): Promise<void> => {
+    const pageMs = (await handle.page
+      .evaluate(
+        `(() => { performance.mark(${JSON.stringify(`vortex-ai:${name}`)}); return performance.now(); })()`,
+      )
+      .catch(() => Number.NaN)) as number;
+    pageMarks.push({ name, detail, pageMs, time: new Date().toISOString() });
+  };
+  const { result, summary, file, profile, pageStartMs } = await profileRenderer(
+    handle.page,
+    () => run(onPhase),
+    { artifactDir: config.artifactDir, label, top: 15 },
   );
+  const wallMs = Date.now() - start;
+  const trace = await mcp.call<TraceSummary>("perf_trace_stop", { top: 40 });
   await handle.close();
+  const marks: PhaseMark[] = pageMarks
+    .filter((m) => Number.isFinite(m.pageMs))
+    .map((m) => ({
+      name: m.name,
+      ...(m.detail === undefined ? {} : { detail: m.detail }),
+      atMs: Math.round(m.pageMs - pageStartMs),
+      time: m.time,
+    }));
   const entries = readSince(mark);
   const processed = entries.find((e) => e.message === "processed instructions")?.data?.duration;
   return {
@@ -176,24 +242,39 @@ async function measure(
       ),
     },
     outcome: result.install.outcome,
+    closedWith: result.install.closedWith,
     postprocessed: result.install.postprocessed,
     ...(result.removeMs === undefined ? {} : { removeMs: result.removeMs }),
+    dispatches: { dispatches: trace.dispatches, byCount: trace.byCount, byTime: trace.byTime },
+    marks,
     hotFunctions: summary.functions,
     hotFiles: summary.files,
+    inclusive: summary.inclusive,
+    inclusiveApp: summary.inclusiveApp,
+    longestBusy: summary.longestBusy,
+    windows: summariseWindows(profile, windowsFromMarks(marks, summary.durationMs)),
     log: summariseLog(entries),
     cpuprofile: file,
   };
 }
 
-// A required member that already exists never fails; optional ones are skipped at the review.
-const installOptions = { timeoutMs: 1_800_000, allowIncomplete: true };
-const install = await measure("collection-scale", async () => ({
-  install: await installOfflineCollection(mcp, archiveFor(1), installOptions),
+// A required member that already exists never fails; optional ones are skipped at the review
+// unless --optionals says otherwise.
+const installOptions: InstallCollectionOptions = {
+  timeoutMs: 1_800_000,
+  allowIncomplete: true,
+  optionals: optionalsMode as InstallCollectionOptions["optionals"],
+};
+const install = await measure("collection-scale", async (onPhase) => ({
+  install: await installOfflineCollection(mcp, archiveFor(1), { ...installOptions, onPhase }),
 }));
 const phases: Record<string, Phase> = { install };
 if (update) {
-  phases.update = await measure("collection-scale-update", () =>
-    updateOfflineCollection(mcp, install.collectionModId, archiveFor(2), installOptions),
+  phases.update = await measure("collection-scale-update", (onPhase) =>
+    updateOfflineCollection(mcp, install.collectionModId, archiveFor(2), {
+      ...installOptions,
+      onPhase,
+    }),
   );
 }
 
@@ -208,7 +289,7 @@ for (const [name, phase] of Object.entries(phases)) {
   if (phase.outcome !== "complete") failures.push(`${name}: the review said ${phase.outcome}`);
 }
 const result = {
-  options: { ...options, update },
+  options: { ...options, update, optionals: optionalsMode },
   members: options.members,
   renderer: { nodeEnv: status.nodeEnv ?? null, react: status.react?.build ?? null },
   // Kept at the top level for comparison with earlier reports (install only).
@@ -229,8 +310,12 @@ const brief = (phase: Phase): Record<string, unknown> => ({
   steps: phase.steps,
   ...(phase.removeMs === undefined ? {} : { removeMs: phase.removeMs }),
   outcome: phase.outcome,
+  closedWith: phase.closedWith,
   postprocessed: phase.postprocessed,
+  dispatches: phase.dispatches.dispatches,
+  marks: phase.marks.map((m) => `${m.name}@${String(m.atMs)}ms`),
   top: phase.hotFunctions.slice(0, 5),
+  topInclusive: phase.inclusiveApp.slice(0, 5),
 });
 console.log(
   JSON.stringify(

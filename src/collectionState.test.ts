@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyDialog,
   describeDriver,
+  dialogCollection,
+  installedCollections,
   fiberOf,
   findDriver,
   readDriver,
@@ -83,6 +85,9 @@ describe("finding the collection InstallDriver", () => {
       installingMod: undefined,
       numRequired: undefined,
       revisionId: undefined,
+      preparing: null,
+      starting: null,
+      lastCollectionId: undefined,
     });
   });
 
@@ -150,6 +155,84 @@ describe("the install session and dialogs", () => {
     expect(classifyDialog("Collection installation complete ... Done")).toBe("review");
     expect(classifyDialog("Game version mismatch  Cancel Continue")).toBe("game-version-prompt");
     expect(classifyDialog("My collection ... Install Now")).toBe("query");
+    // As the DOM's text runs: the buttons' labels without a space between them.
+    expect(classifyDialog("Install this collection to profile: Default LaterInstall Now")).toBe(
+      "query",
+    );
+    // Cut at 400 characters before its buttons.
+    expect(classifyDialog("Fallout 4 collection addedRevision 3Big Pack By someone")).toBe("query");
     expect(classifyDialog("External Changes")).toBeUndefined();
+  });
+});
+
+describe("what the driver is doing between steps", () => {
+  it("reports a prepare() chain still pending and a start attempt in progress", () => {
+    const driver = new FakeDriver("start") as FakeDriver & Record<string, unknown>;
+    // Not observable: no Bluebird chain, and a build without the mStarting token.
+    expect(describeDriver(driver)).toMatchObject({ preparing: null, starting: null });
+    driver.mPrepare = { isPending: () => true };
+    driver.mStarting = {};
+    expect(describeDriver(driver)).toMatchObject({ preparing: true, starting: true });
+    driver.mPrepare = { isPending: () => false };
+    driver.mStarting = undefined;
+    expect(describeDriver(driver)).toMatchObject({ preparing: false, starting: false });
+  });
+});
+
+const withFiber = (fiber: FiberLike): HTMLElement => {
+  const element = document.createElement("div");
+  Object.assign(element, { __reactFiber$abc: fiber });
+  return element;
+};
+
+describe("which collection a dialog belongs to", () => {
+  it("reads the rendering component's driver, falling back to its last collection", () => {
+    const driver = new FakeDriver("review");
+    const component: FiberLike = { memoizedProps: { driver } };
+    const modal = withFiber({ memoizedProps: { className: "modal" }, return: component });
+    expect(dialogCollection(modal)).toEqual({
+      collectionId: "coll-1",
+      collectionName: "My collection",
+      via: "driver",
+    });
+    const ended = Object.assign(new FakeDriver("review"), {
+      lastCollection: { id: "coll-2", attributes: { name: "Earlier" } },
+    });
+    Object.defineProperty(ended, "collection", { get: () => undefined });
+    expect(
+      dialogCollection(withFiber({ memoizedProps: { driver: ended }, return: null })),
+    ).toMatchObject({ collectionId: "coll-2", via: "driver" });
+  });
+
+  it("reads a collection prop, then the dialog's text, and otherwise says it cannot tell", () => {
+    const collection = { id: "c9", type: "collection", attributes: { name: "Nine" } };
+    const byProp = withFiber({ memoizedProps: {}, return: { memoizedProps: { collection } } });
+    expect(dialogCollection(byProp)).toEqual({
+      collectionId: "c9",
+      collectionName: "Nine",
+      via: "collection-prop",
+    });
+    const known = installedCollections({
+      fallout4: {
+        a: { type: "collection", attributes: { name: "Big" } },
+        b: { type: "collection", attributes: { name: "b.zip", customFileName: "Big Pack" } },
+        m: { type: "", attributes: { name: "A mod" } },
+      },
+    });
+    expect(known).toEqual([
+      { id: "a", name: "Big" },
+      { id: "b", name: "Big Pack" },
+    ]);
+    const prompt = document.createElement("div");
+    expect(dialogCollection(prompt, known, "Game version mismatch Big Pack needs 1.2")).toEqual({
+      collectionId: "b",
+      collectionName: "Big Pack",
+      via: "text",
+    });
+    expect(dialogCollection(prompt, known, "External Changes")).toEqual({
+      collectionId: null,
+      collectionName: null,
+      via: null,
+    });
   });
 });

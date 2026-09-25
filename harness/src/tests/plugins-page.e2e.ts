@@ -8,12 +8,15 @@
  * and records renderer blocking for each, plus how many plugin rows are rendered in full.
  *
  *   --plugins <n>   mods with one plugin each (default 2000)
+ *   --vortex-order  keep the load order Vortex gives the plugins after the deploy. By default
+ *                   it is replaced with a deterministic one (natives, then by name), so the
+ *                   rows and their displayed values match between runs and between builds
  */
 import fs from "node:fs";
 import path from "node:path";
 
 import { attachToRenderer } from "../cdp";
-import { bethesdaSandboxPaths, pluginBytes } from "../bethesdaSandbox";
+import { bethesdaSandboxPaths, pluginBytes, setDeterministicLoadOrder } from "../bethesdaSandbox";
 import { loadConfig } from "../config";
 import { claimInstanceLease } from "../instance";
 import { deployMods } from "../deployment";
@@ -55,6 +58,12 @@ await seedLibrary(mcp, {
   }),
 });
 await deployMods(mcp, "fallout4", { timeoutMs: 60 * 60 * 1000 });
+const loadOrder = process.argv.includes("--vortex-order")
+  ? undefined
+  : await setDeterministicLoadOrder(mcp);
+if (loadOrder !== undefined && !loadOrder.applied) {
+  throw new Error("The deterministic load order did not apply; state.loadOrder reads otherwise.");
+}
 
 const handle = await attachToRenderer(config);
 const { page } = handle;
@@ -62,7 +71,13 @@ await mcp.call("vortex_dispatch", { action: "setOpenMainPage", args: ["gamebryo-
 await page.waitForSelector(`#table-${TABLE} tr[data-rowid]`, { timeout: 120_000 });
 await page.waitForTimeout(5_000);
 
-const result: Record<string, unknown> = { plugins: count };
+const result: Record<string, unknown> = {
+  plugins: count,
+  loadOrder:
+    loadOrder === undefined
+      ? "vortex"
+      : { deterministic: true, first: loadOrder.order.slice(0, 5), count: loadOrder.order.length },
+};
 const failures: string[] = [];
 const budget = (what: string, blocked: { blockedMs: number; longestMs: number }): void => {
   if (blocked.longestMs > MAX_ACTION_BLOCKED_MS) {

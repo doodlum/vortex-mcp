@@ -15,6 +15,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { ANONYMOUS, bootstrap, liveDir, readMarker, snapshotDir } from "./bootstrap";
+import { parseArgs, type ParsedArgs } from "./cliArgs";
 import {
   ConfigError,
   REPO_ROOT,
@@ -37,6 +38,7 @@ import {
   pullRequestChecksPassed,
 } from "./prChecks";
 import { PreflightError, formatPreflightReport, runPreflight } from "./prPreflight";
+import { buildCheckout } from "./vortexBuild";
 import { captureLogin } from "./bootstrap";
 import { requireOAuth, waitForOAuth, type AuthStatus } from "./auth";
 import { localOnlyConfig, sandboxConfig } from "./sandbox";
@@ -47,14 +49,16 @@ import { deployMods, needsDeployment, purgeGame } from "./deployment";
 import { runE2e } from "./e2e";
 import {
   INSTANCE_RESOURCE,
-  acquireLease,
+  acquireLeases,
   checkoutResource,
   formatLeaseStates,
   listLeases,
   releaseLease,
+  releaseOwnerLeases,
   resolveOwner,
   waitForLease,
   type LeaseState,
+  type ReleaseResult,
 } from "./lease";
 import { runUnderLease } from "./leaseCommand";
 import {
@@ -72,103 +76,6 @@ import {
   resolveVortexRepo,
   vortexSourceDir,
 } from "./source";
-
-interface ParsedArgs {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-  /** Every value of each string flag, for flags that may repeat (`--test a --test b`). */
-  lists: Record<string, string[]>;
-  /** Everything after a bare `--` (the command for `lease run`). */
-  passthrough: string[];
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  // `pnpm run ai -- status` forwards the `--` separator itself, so the first
-  // argument we see is "--" rather than the command. Dropping a leading bare
-  // separator makes the documented invocation work instead of printing help.
-  const args = argv[0] === "--" ? argv.slice(1) : argv;
-  const [command = "help", ...rest] = args;
-  const positional: string[] = [];
-  const flags: Record<string, string | boolean> = {};
-  const lists: Record<string, string[]> = {};
-  const setValue = (name: string, value: string): void => {
-    flags[name] = value;
-    (lists[name] ??= []).push(value);
-  };
-  const booleanFlags = new Set([
-    "help",
-    "installed",
-    "sandbox",
-    "bethesda-sandbox",
-    "isolate-user-folders",
-    "headless",
-    "production",
-    "oauth",
-    "no-wait",
-    "no-launch",
-    "fresh",
-    "no-game",
-    "rebuild-snapshot",
-    "rebuild-extension",
-    "json",
-    "screenshots",
-    "strict",
-    "build",
-    "update",
-    "no-build",
-    "where",
-    "purge",
-    "keep",
-    "full-page",
-    "allow-incomplete",
-    "skip-revert",
-    "force",
-    "with-api-key",
-  ]);
-
-  const passthrough: string[] = [];
-  for (let i = 0; i < rest.length; i++) {
-    const arg = rest[i];
-    if (arg === undefined) continue;
-    // `script <file> [args...]`: everything after the file is the script's own.
-    if (command === "script" && positional.length === 1) {
-      passthrough.push(...(arg === "--" ? rest.slice(i + 1) : rest.slice(i)));
-      break;
-    }
-    if (arg === "--") {
-      // `pnpm run ai:<script> -- --flag` forwards its separator after the command; only
-      // `lease run` gives it a meaning.
-      if (command !== "lease" || positional[0] !== "run") continue;
-      passthrough.push(...rest.slice(i + 1));
-      break;
-    }
-    if (!arg.startsWith("--")) {
-      // `lease run [flags] <command...>`: the command starts at its first word even without
-      // `--`, which Windows PowerShell 5.1 strips from native command lines.
-      if (command === "lease" && positional.length === 1 && positional[0] === "run") {
-        passthrough.push(...rest.slice(i));
-        break;
-      }
-      positional.push(arg);
-      continue;
-    }
-    const body = arg.slice(2);
-    const eq = body.indexOf("=");
-    const next = rest[i + 1];
-    if (eq !== -1) {
-      setValue(body.slice(0, eq), body.slice(eq + 1));
-    } else if (booleanFlags.has(body)) {
-      flags[body] = true;
-    } else if (next !== undefined && !next.startsWith("--")) {
-      setValue(body, next);
-      i++;
-    } else {
-      throw new ConfigError(`--${body} needs a value. Run help for supported flags.`);
-    }
-  }
-  return { command, positional, flags, lists, passthrough };
-}
 
 function configFrom(flags: ParsedArgs["flags"]): HarnessConfig {
   const overrides: Partial<HarnessConfig> = {};
@@ -266,9 +173,16 @@ Instance lifecycle
                          test files the diff adds or changes)
     --project-dir <dir>  Where to run vitest (default: each test's nearest package.json)
     --revert <path>      Revert only this file; repeatable (default: every non-test file)
+    --revert-hunk <file>:<line>  Revert only the hunk of <file> holding that head line (a call
+                         site in a file that also defines the new code); repeatable
     --skip-revert        Skip the revert check
     --pr <number|url>    Also lint that PR's title and description (--repo as above)
     --json               Machine-readable report; exit code 1 on any failure
+  build                  Build a Vortex checkout with its pinned pnpm under its lock:
+    --checkout <dir>     (default .vortex-src)
+    --production         NODE_ENV=production for the build only (else NODE_ENV unset);
+                         etc/vortex.api.md and etc/Dependency Report.md are put back if
+                         the build rewrote them. Refuses while a Vortex runs from it.
   vortex-e2e             Run Vortex's own E2E suite (packages/e2e, CI=1, one worker, no
                          retries) under the instance lease, with the kit's fixture
                          patches applied for the run and restored byte-identically, and
@@ -283,8 +197,10 @@ Leases (one harness Vortex per machine; several agents may share the kit)
   lease status           Who holds what, live or stale (--json)
   lease acquire          Hold the instance lease: --owner <name> [--purpose <text>]
                          [--ttl <minutes>, default 60; 0 = none] [--pid <n>] [--wait <min>]
-                         [--checkout <dir>: lock that checkout instead]. Re-run to renew.
-  lease release          --owner <name> [--force] [--checkout <dir>]
+                         [--checkout <dir>: that checkout's lock AS WELL, all or nothing;
+                         --checkout-only: just the checkout]. Re-run to renew.
+  lease release          --owner <name>: every lease that owner holds (instance and
+                         checkouts). [--checkout <dir>: only that checkout] [--force]
   lease run [flags] [--] <cmd...>
                          Hold the lease (and --checkout's) while <cmd> runs; exit code
                          propagated. --owner <name> [--wait <minutes>] [--purpose <text>]
@@ -306,8 +222,10 @@ Driving a running instance
     eval <file.js>       renderer over CDP and print the JSON result (refuses any Vortex
                          whose profile is not in this cache). Promises are awaited.
   script <file.mts> [args...]
-                         Run a scratch script with the kit's tsx under the instance lease
-                         (--wait <min>); VORTEX_AI_KIT holds the import URL of harness/src/kit.ts
+                         Run a scratch script with the kit's tsx under the instance lease.
+                         --owner <name> and --wait <min> are the kit's anywhere, even after
+                         the file; every other argument (and all after --) is the script's.
+                         VORTEX_AI_KIT holds the import URL of harness/src/kit.ts
   record                 Save WebM; --ffmpeg <path> --seconds <1-60> --label <name>
   install <archive>      Install local ZIP/7z through Vortex; no account needed
   collection <url>       Install exact Nexus collection/revision using OAuth
@@ -380,6 +298,7 @@ async function main(): Promise<number> {
         tests: [...(lists.test ?? []), ...positional],
         projectDir: text("project-dir"),
         revert: lists.revert,
+        revertHunks: lists["revert-hunk"],
         skipRevert: flags["skip-revert"] === true,
         pr: text("pr"),
         repo: text("repo"),
@@ -395,6 +314,28 @@ async function main(): Promise<number> {
   }
 
   if (command === "lease") return leaseCommand(positional, flags, passthrough);
+
+  if (command === "build") {
+    const checkout = typeof flags.checkout === "string" ? flags.checkout : vortexSourceDir();
+    const report = await buildCheckout({
+      checkout,
+      production: flags.production === true,
+      owner: typeof flags.owner === "string" ? flags.owner : undefined,
+      onProgress: (message) => log(`[build] ${message}`),
+    });
+    log(
+      `[build] exit ${String(report.exitCode)} after ${String(Math.round(report.elapsedMs / 1000))}s; ` +
+        `renderer bundle: ${report.bundleMode}` +
+        (report.restored.length > 0 ? `; restored ${report.restored.join(", ")}` : ""),
+    );
+    if (report.exitCode === 0 && flags.production === true && report.bundleMode !== "production") {
+      log(
+        "[build] warning: --production was given but the renderer bundle still reads as a " +
+          "development build (productionMode.ts). Check the build's output above.",
+      );
+    }
+    return report.exitCode === 0 ? 0 : 1;
+  }
 
   const config = configFrom(flags);
 
@@ -850,11 +791,13 @@ async function main(): Promise<number> {
         );
       }
       const kit = pathToFileURL(path.join(REPO_ROOT, "harness", "src", "kit.ts")).href;
-      log(`script: ${abs} (VORTEX_AI_KIT=${kit})`);
+      const owner = resolveOwner(config.owner);
+      // --owner and --wait are the kit's wherever they appear, even after the file (cliArgs.ts).
+      log(`script: ${abs} as owner "${owner}" (VORTEX_AI_KIT=${kit})`);
       return runUnderLease({
         command: process.execPath,
         args: [tsxCli(), abs, ...passthrough],
-        owner: resolveOwner(config.owner),
+        owner,
         // The running Vortex's checkout too, so nobody rebuilds it under the script.
         resources: attachedLeaseResources(config),
         purpose: `script ${path.basename(abs)}`,
@@ -928,11 +871,14 @@ async function leaseCommand(
   };
   const owner = resolveOwner(text("owner"));
   const checkout = text("checkout");
-  // `lease run` holds the instance and, with --checkout, that checkout too.
+  // `lease run` and `lease acquire` hold the instance and, with --checkout, that checkout too
+  // (`acquire --checkout-only`: just the checkout).
   const resources =
-    checkout === undefined ? [INSTANCE_RESOURCE] : [INSTANCE_RESOURCE, checkoutResource(checkout)];
-  // acquire/release address one resource: the checkout when given, else the instance.
-  const resource = checkout === undefined ? INSTANCE_RESOURCE : checkoutResource(checkout);
+    checkout === undefined
+      ? [INSTANCE_RESOURCE]
+      : flags["checkout-only"] === true
+        ? [checkoutResource(checkout)]
+        : [INSTANCE_RESOURCE, checkoutResource(checkout)];
   const onReclaim = (state: LeaseState): void =>
     log(
       `Reclaimed a stale ${state.lease.resource} lease from "${state.lease.owner}" (${state.reason}).`,
@@ -949,48 +895,78 @@ async function leaseCommand(
       if (pid !== undefined && (!Number.isInteger(pid) || pid <= 0))
         throw new ConfigError("--pid must be a process id.");
       const ttl = minutes("ttl", 60);
-      const result = await waitForLease(
+      // All or nothing: refused one, none newly taken is left held.
+      const results = await waitForLease(
         () =>
-          acquireLease(resource, owner, {
+          acquireLeases(resources, owner, {
             mode: "explicit",
             purpose: text("purpose"),
             ttlMinutes: ttl,
             boundPid: pid,
           }),
         minutes("wait", 0) * 60_000,
-        (err) => log(`Waiting for the lease:\n${err.message}\n`),
+        (err) =>
+          log(`Waiting for the lease:
+${err.message}
+`),
       );
-      if (result.reclaimed !== undefined) onReclaim(result.reclaimed);
-      const until =
-        result.lease.expiresAt === undefined ? "with no expiry" : `until ${result.lease.expiresAt}`;
+      for (const result of results) {
+        if (result.reclaimed !== undefined) onReclaim(result.reclaimed);
+        const until =
+          result.lease.expiresAt === undefined
+            ? "with no expiry"
+            : `until ${result.lease.expiresAt}`;
+        log(
+          `${result.joined ? "Renewed" : "Acquired"} the ${result.lease.resource} lease for "${owner}" ${until}` +
+            (pid === undefined ? "" : `, while pid ${String(pid)} runs`) +
+            ".",
+        );
+      }
       log(
-        `${result.joined ? "Renewed" : "Acquired"} the ${resource} lease for "${owner}" ${until}` +
-          (pid === undefined ? "" : `, while pid ${String(pid)} runs`) +
-          `. Renew by acquiring again; release with \`lease release --owner ${owner}\`.`,
+        `Renew by acquiring again; release everything "${owner}" holds with \`lease release --owner ${owner}\`.`,
       );
       return 0;
     }
     case "release": {
-      const result = releaseLease(resource, owner, { force: flags.force === true });
-      if (!result.released) {
-        log(`Not released: ${result.reason ?? "unknown"}.`);
-        return result.reason === "not held" ? 0 : 1;
-      }
-      if (result.keptForRunning === true) {
-        log(
-          `Released your hold on ${resource}, but it stays locked while Vortex (pid ` +
-            `${result.stillRunning.join(", ")}) runs from it. \`down\` ends that; --force clears it.`,
-        );
+      // --checkout: that checkout only. Otherwise every lease the owner holds, instance and
+      // checkouts alike, so one call ends a session.
+      // `--force` with neither --owner nor --checkout clears the instance lease, whoever holds it.
+      const one = (resource: string): ReleaseResult & { resource: string } => ({
+        resource,
+        ...releaseLease(resource, owner, { force: flags.force === true }),
+      });
+      const released: Array<ReleaseResult & { resource: string }> =
+        checkout !== undefined
+          ? [one(checkoutResource(checkout))]
+          : flags.force === true && text("owner") === undefined
+            ? [one(INSTANCE_RESOURCE)]
+            : releaseOwnerLeases(owner, { force: flags.force === true });
+      if (released.length === 0) {
+        log(`"${owner}" holds no leases.`);
         return 0;
       }
-      log(`Released the ${resource} lease.`);
-      if (result.stillRunning.length > 0) {
-        log(
-          `A harness Vortex (pid ${result.stillRunning.join(", ")}) is still running; the next ` +
-            "owner's up or down will stop it. Run `down` first to stop it yourself.",
-        );
+      let code = 0;
+      for (const result of released) {
+        const { resource } = result;
+        if (!result.released) {
+          log(`${resource}: not released: ${result.reason ?? "unknown"}.`);
+          if (result.reason !== "not held") code = 1;
+        } else if (result.keptForRunning === true) {
+          log(
+            `${resource}: released your hold, but it stays locked while Vortex (pid ` +
+              `${result.stillRunning.join(", ")}) runs from it. \`down\` ends that; --force clears it.`,
+          );
+        } else {
+          log(`${resource}: released.`);
+          if (result.stillRunning.length > 0) {
+            log(
+              `  A harness Vortex (pid ${result.stillRunning.join(", ")}) is still running; the next ` +
+                "owner's up or down will stop it. Run `down` first to stop it yourself.",
+            );
+          }
+        }
       }
-      return 0;
+      return code;
     }
     case "run": {
       const [cmd, ...args] = passthrough;

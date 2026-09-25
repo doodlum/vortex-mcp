@@ -25,6 +25,11 @@ const ACCESS_TIER = {
   nexus_auth_status: "read",
   collection_status: "read",
   collection_install_state: "read",
+  check_probe_counts: "read",
+  ui_active_dialogs: "read",
+  perf_trace_start: "write",
+  perf_trace_stop: "write",
+  perf_trace_status: "write",
   ui_snapshot: "read",
   ui_wait_for: "read",
   ui_get_viewport: "read",
@@ -76,6 +81,23 @@ const ACCESS_TIER = {
   vortex_restart: "write",
 };
 
+async function readFirstEvent(res) {
+  if (!(res.headers.get("content-type") ?? "").includes("text/event-stream") || res.body === null) {
+    return res.text();
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (/^data: .*\n/m.test(text)) break;
+  }
+  await reader.cancel().catch(() => undefined);
+  return text;
+}
+
 async function callMcp(body) {
   const headers = {
     "content-type": "application/json",
@@ -90,7 +112,9 @@ async function callMcp(body) {
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(10000),
   });
-  const text = await res.text();
+  // A text/event-stream response can stay open after its one event, so read until a complete
+  // `data:` line has arrived rather than waiting for the stream to end.
+  const text = await readFirstEvent(res);
   const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
   if (!res.ok || (dataLine === undefined && !text.trim().startsWith("{"))) {
     throw new Error(

@@ -124,6 +124,7 @@ Generated from the live server's actual `tools/list` response — see
 
 | Tool                          | Access | What it does                                                                                                                                 |
 | ----------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `check_probe_counts`          | read   | How many times Vortex has run its health checks for each test event (plugins-changed, mod-installed, mod-activated, settings-changed, gamem… |
 | `automation_status`           | read   | Identify this renderer lifetime and isolated harness profile.                                                                                |
 | `nexus_auth_status`           | read   | Report whether a Nexus API key, OAuth access token, and OAuth refresh token are present, without returning credentials.                      |
 | `vortex_describe`             | read   | Discover the live Vortex API surface: callable selector names (for vortex_query, with known caveats in `selectorHints`, e.g. selectorHints.… |
@@ -157,8 +158,12 @@ Generated from the live server's actual `tools/list` response — see
 | `ui_wait_for`                 | read   | Poll until a CSS selector or a piece of visible text reaches the given state, then return how long it took.                                  |
 | `ui_get_viewport`             | read   | Report the Electron window's outer size, the renderer's inner (CSS px) size, and the device pixel ratio.                                     |
 | `ui_detect_layout_issues`     | read   | Scan the rendered UI at its CURRENT size for responsive-layout breakage: content overflowing the right edge, elements pushed fully offscree… |
+| `ui_active_dialogs`           | read   | The visible text of each open modal dialog (the same `activeDialogs` a ui_snapshot returns), without walking or measuring the rest of the U… |
 | `ui_read_console`             | read   | Read the renderer's console output and uncaught errors/rejections from an in-process ring buffer (500 entries, oldest dropped), captured si… |
 | `check_nexus_mod_updates`     | write  | Check installed Nexus-sourced mods for available updates via Vortex's own built-in integration and the user's existing Vortex login — no se… |
+| `perf_trace_start`            | write  | Start timing the renderer: every Redux dispatch by action type (a dispatch runs middleware including persistence diffing, reducers and subs… |
+| `perf_trace_stop`             | write  | Stop the trace started by perf_trace_start and return: duration; dispatch count and total time; the action types that cost the most time an… |
+| `perf_trace_status`           | write  | Whether a perf trace is running, and for how long.                                                                                           |
 | `switch_profile`              | write  | Switch Vortex to a different profile by id (query list_profiles to find one).                                                                |
 | `clone_profile`               | write  | Clone an existing profile into a new one (copies its on-disk profile directory — load order, ini tweaks — plus its mod enabled-state), the…  |
 | `vortex_dispatch`             | write  | Dispatch a named Vortex action creator, api.ext function, event, or direct api method — tried in that order.                                 |

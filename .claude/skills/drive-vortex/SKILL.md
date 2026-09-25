@@ -60,10 +60,19 @@ any action that re-renders, snapshot again before acting.
 - **Offline collections for tests.** `installOfflineCollection` in
   `harness/src/offlineCollection.ts` installs a bundled collection with no account,
   from a registered download, and can make the game-version prompt appear
-  (`gameVersions`).
-- **Scrolling measurements.** Use `harness/src/tableProbes.ts` (real wheel input,
-  rows on screen, dropdown direction) or `ai:test:mods-scroll`, not hand-written
-  page scripts.
+  (`gameVersions`). `resumeViaNotification` starts one from its "Collection incomplete"
+  notification (the only offline `driver.start`); `optionals: "stand-in"` or
+  `completeOptionalsWithoutInstall` completes an optionals pass without the install, which
+  stalls for bundled optionals. `collection_install_state.dialogs[].collectionId` says whose
+  dialog is open.
+- **Find dialogs by `ui_active_dialogs`, click inside them.** A full snapshot on a big Mods page
+  stops at its node limit before the modal; a dialog's text is cut at 400 characters and runs
+  its buttons together ("LaterInstall Now"). Use `clickInsideDialog` and `dialogButtons`.
+- **Scrolling and update measurements.** Use `harness/src/tableProbes.ts` (real wheel input,
+  rows on screen, dropdown direction; `measureRowIdentity` for rows given a new object and
+  re-rendered per update; `measureAfter` for blocking until the table shows a change;
+  `recordDialogFade` for a dialog's content while it closes) or `ai:test:mods-scroll`, not
+  hand-written page scripts.
 - **Diagnostics in the renderer.** `vortex-ai eval --expr "<js>"` evaluates in a
   harness instance only. It is for looking; anything a test relies on belongs in a
   tool or helper.

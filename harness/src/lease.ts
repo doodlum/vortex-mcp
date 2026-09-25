@@ -469,6 +469,49 @@ export function releaseLease(
   });
 }
 
+/**
+ * Acquire several leases for one owner, all or nothing: when one is refused, the ones this
+ * call newly took are released again (a lease it only joined or renewed is left as it was),
+ * and the refusal is rethrown. `lease acquire --checkout` takes the instance and the checkout
+ * this way, the instance first, so a caller refused the instance has touched nothing.
+ */
+export function acquireLeases(
+  resources: string[],
+  owner: string,
+  options: AcquireOptions = {},
+): AcquireResult[] {
+  const done: AcquireResult[] = [];
+  try {
+    for (const resource of resources) done.push(acquireLease(resource, owner, options));
+    return done;
+  } catch (err) {
+    for (const result of done.toReversed()) {
+      if (!result.joined) releaseLease(result.lease.resource, owner, options);
+    }
+    throw err;
+  }
+}
+
+export interface OwnerRelease extends ReleaseResult {
+  resource: string;
+}
+
+/**
+ * Release every lease `owner` holds: the instance and every checkout, explicit or implicit,
+ * live or stale. Each is released as `releaseLease` would, so a checkout a Vortex still runs
+ * from stays locked by that Vortex.
+ */
+export function releaseOwnerLeases(
+  owner: string,
+  options: LeaseEnv & { force?: boolean } = {},
+): OwnerRelease[] {
+  return listLeases(options)
+    .filter(({ lease }) => lease.owner === owner)
+    .map(({ lease }) => lease.resource)
+    .toSorted((a, b) => Number(a === INSTANCE_RESOURCE) - Number(b === INSTANCE_RESOURCE))
+    .map((resource) => ({ resource, ...releaseLease(resource, owner, options) }));
+}
+
 // ---------------------------------------------------------------------------
 // Holding a lease for the rest of this process
 // ---------------------------------------------------------------------------

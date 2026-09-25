@@ -568,6 +568,31 @@ export async function clickInsideDialog(
   });
 }
 
+/**
+ * The buttons of the dialog whose text matches, disabled ones included, or undefined when no
+ * such dialog is open. For deciding what a dialog offers before clicking: `clickInsideDialog`
+ * only finds enabled buttons, so a button disabled for now and one that is absent look alike.
+ */
+export async function dialogButtons(
+  mcp: VortexMcpClient,
+  dialogText: string,
+): Promise<Array<{ name: string; disabled: boolean }> | undefined> {
+  return withUiLock(mcp, async () => {
+    for (const selector of DIALOG_SELECTORS) {
+      for (let index = 0; index < 4; index++) {
+        const snap = await snapshot(mcp, selector, index).catch(() => undefined);
+        if (snap === undefined || snap.nodeCount === 0) break;
+        if (!snapshotIsDialog(snap, dialogText)) continue;
+        return findNodes(snap, { role: "button", enabledOnly: false }).map((b) => ({
+          name: b.name ?? b.text ?? "",
+          disabled: b.disabled === true,
+        }));
+      }
+    }
+    return undefined;
+  });
+}
+
 function matchesButton(name: string, button: string | RegExp): boolean {
   if (button instanceof RegExp) {
     button.lastIndex = 0;

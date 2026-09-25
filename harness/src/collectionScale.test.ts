@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { libraryCount, scaleCollection, scaleMembers, scaleRules } from "./collectionScale";
+import {
+  libraryCount,
+  missingTag,
+  scaleCollection,
+  scaleMembers,
+  scaleRules,
+} from "./collectionScale";
 import { referenceTag } from "./largeLibrary";
 
 const ids = Array.from(
@@ -95,5 +101,32 @@ describe("scale collections", () => {
     }
     const rev2 = scaleRules(ids, { members: 600, rules: 300 }, 2);
     expect(rev2).not.toEqual(rules);
+  });
+});
+
+describe("missing optional members", () => {
+  it("give optional members a tag nothing installed has and a file, so the review offers them", () => {
+    const options = { members: 200, optional: 0.1, duplicates: 40, missingOptional: true };
+    const members = scaleMembers(ids, options, 1);
+    // The members themselves; a duplicate of a required member flipped to optional stays installed.
+    const optional = members.slice(0, 200).filter((m) => m.optional === true);
+    expect(optional.length).toBeGreaterThanOrEqual(20);
+    for (const m of optional) {
+      expect(m.tag).toBe(missingTag(m.name));
+      expect(Object.keys(m.files)).toEqual([`${m.name}-optional.txt`]);
+    }
+    // Required members are the installed library mods, as without the option.
+    for (const required of members.filter((m) => m.optional !== true)) {
+      expect(required.tag).toBe(referenceTag(required.name));
+    }
+    // No duplicate turns a missing optional member into a required one.
+    const required = new Set(members.filter((m) => m.optional !== true).map((m) => m.tag));
+    expect(optional.some((m) => required.has(m.tag))).toBe(false);
+    // Without the option, every member is in the library.
+    expect(
+      scaleMembers(ids, { members: 200, optional: 0.1 }, 1).every(
+        (m) => m.tag === referenceTag(m.name),
+      ),
+    ).toBe(true);
   });
 });

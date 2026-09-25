@@ -63,8 +63,40 @@ export async function attachToRenderer(config: HarnessConfig): Promise<RendererH
     throw new CdpUnavailableError("Vortex exposes CDP but has no open window to attach to.");
   }
 
+  // Functions a script passes to page.evaluate carry tsx's `__name(...)` calls (below).
+  await page.evaluate(NAME_SHIM).catch(() => undefined);
+  await page.addInitScript(NAME_SHIM).catch(() => undefined);
   return { page, close: () => browser.close().catch(() => undefined) };
 }
+
+/**
+ * Page source defining esbuild's `__name` helper in the renderer, if nothing has.
+ *
+ * tsx compiles every file with esbuild's `keepNames`, hard-coded, which wraps each named inner
+ * function in `__name(fn, "name")`. A function a script passes to `page.evaluate` is sent as its
+ * source text, so in the page that helper is a free variable and the call throws
+ * "ReferenceError: __name is not defined". `attachToRenderer` runs this on attach and on every
+ * later navigation of that connection, so `page.evaluate(() => { const f = () => …; })` works
+ * from `vortex-ai script` and the `ai:test:*` checks. It only sets a function's `name`, which is
+ * what esbuild's own helper does.
+ */
+export const NAME_SHIM = `(() => {
+  if (typeof globalThis.__name !== "function") {
+    Object.defineProperty(globalThis, "__name", {
+      configurable: true,
+      writable: true,
+      value: (target, value) => {
+        try {
+          Object.defineProperty(target, "name", { value, configurable: true });
+        } catch {
+          // a frozen or non-configurable name: leave it
+        }
+        return target;
+      },
+    });
+  }
+  return true;
+})()`;
 
 export interface ScreenshotOptions {
   /** Written under the artifact directory. Defaults to a timestamped name. */

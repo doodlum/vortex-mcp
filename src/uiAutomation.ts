@@ -614,13 +614,21 @@ function dialogTextOf(el: Element): string {
 }
 
 function collectDialogText(): string[] {
-  const out: string[] = [];
+  return activeDialogElements().map((d) => d.text);
+}
+
+/**
+ * The visible modals with the element each `activeDialogs` entry was read from: the first
+ * container found for each distinct text.
+ */
+export function activeDialogElements(): Array<{ text: string; element: Element }> {
+  const out: Array<{ text: string; element: Element }> = [];
   const selectors = ['[role="dialog"]', ".modal.in", ".modal.show", "dialog[open]"];
   for (const sel of selectors) {
     for (const el of Array.from(doc().querySelectorAll(sel))) {
       if (!isVisible(el)) continue;
       const t = dialogTextOf(el);
-      if (t !== "" && !out.includes(t)) out.push(t);
+      if (t !== "" && !out.some((d) => d.text === t)) out.push({ text: t, element: el });
     }
   }
   return out;

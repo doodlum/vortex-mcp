@@ -8,6 +8,7 @@ import {
   INSTANCE_RESOURCE,
   LeaseHeldError,
   acquireLease,
+  acquireLeases,
   addInstancePid,
   checkoutResource,
   dropHolder,
@@ -15,6 +16,7 @@ import {
   listLeases,
   readLease,
   releaseLease,
+  releaseOwnerLeases,
   removeInstancePid,
   resolveOwner,
   waitForLease,
@@ -192,6 +194,59 @@ describe("releaseLease", () => {
     acquireLease(INSTANCE_RESOURCE, "qa", { ...env, pid: 1001 });
     alive.delete(1001);
     expect(releaseLease(INSTANCE_RESOURCE, "other", env).released).toBe(true);
+  });
+});
+
+describe("a session's leases", () => {
+  it("acquires the instance and a checkout together, or neither", () => {
+    const checkout = checkoutResource(fs.mkdtempSync(path.join(dir, "checkout-")));
+    const explicit = { ...env, mode: "explicit" as const, ttlMinutes: 60 };
+    const taken = acquireLeases([INSTANCE_RESOURCE, checkout], "qa", explicit);
+    expect(taken.map((r) => [r.lease.resource, r.joined])).toEqual([
+      [INSTANCE_RESOURCE, false],
+      [checkout, false],
+    ]);
+    expect(releaseOwnerLeases("qa", env).map((r) => r.resource)).toEqual([
+      checkout,
+      INSTANCE_RESOURCE,
+    ]);
+    // Someone else holds the checkout: the instance this call took is given back.
+    acquireLease(checkout, "fixer", { ...env, pid: 1001 });
+    expect(() => acquireLeases([INSTANCE_RESOURCE, checkout], "qa", explicit)).toThrow(
+      LeaseHeldError,
+    );
+    expect(readLease(INSTANCE_RESOURCE, env)).toBeUndefined();
+    // One it only renewed stays held.
+    acquireLease(INSTANCE_RESOURCE, "qa", explicit);
+    expect(() => acquireLeases([INSTANCE_RESOURCE, checkout], "qa", explicit)).toThrow(
+      LeaseHeldError,
+    );
+    expect(readLease(INSTANCE_RESOURCE, env)?.lease.owner).toBe("qa");
+  });
+
+  it("releases every lease an owner holds and nobody else's", () => {
+    const mine = checkoutResource(fs.mkdtempSync(path.join(dir, "mine-")));
+    const theirs = checkoutResource(fs.mkdtempSync(path.join(dir, "theirs-")));
+    acquireLease(INSTANCE_RESOURCE, "qa", { ...env, mode: "explicit", ttlMinutes: 60 });
+    acquireLease(mine, "qa", { ...env, pid: 1001 });
+    acquireLease(theirs, "fixer", { ...env, pid: 1002 });
+    const released = releaseOwnerLeases("qa", env);
+    expect(released.map((r) => [r.resource, r.released])).toEqual([
+      [mine, true],
+      [INSTANCE_RESOURCE, true],
+    ]);
+    expect(listLeases(env).map((s) => s.lease.resource)).toEqual([theirs]);
+    expect(releaseOwnerLeases("qa", env)).toEqual([]);
+  });
+
+  it("leaves a checkout a Vortex runs from locked by that Vortex", () => {
+    const checkout = checkoutResource(fs.mkdtempSync(path.join(dir, "checkout-")));
+    acquireLease(checkout, "qa", { ...env, mode: "explicit", ttlMinutes: 60 });
+    addInstancePid(checkout, 1002, env);
+    expect(releaseOwnerLeases("qa", env)).toMatchObject([
+      { resource: checkout, released: true, keptForRunning: true },
+    ]);
+    expect(readLease(checkout, env)?.live).toBe(true);
   });
 });
 
