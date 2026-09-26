@@ -31,6 +31,9 @@ you cannot push to `Nexus-Mods/Vortex`.
 It never searches the filesystem for a Vortex checkout. `.vortex-src` is the
 only source tree, and it is gitignored.
 
+`source --no-build` clones for source inspection without installing or building.
+Checkout paths containing spaces are supported; Git runs without shell splitting.
+
 `pnpm run ai:doctor` reports whether it is there before anything else.
 
 ## The loop

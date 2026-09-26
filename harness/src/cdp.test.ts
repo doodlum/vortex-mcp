@@ -4,8 +4,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import { NAME_SHIM, captureScreenshot, realWheel } from "./cdp";
+import { NAME_SHIM, captureScreenshot, realWheel, selectRendererPage } from "./cdp";
 import type { HarnessConfig } from "./config";
+
+it("attaches to the main renderer even when a pop-out inherits its URL and appears first", async () => {
+  const makePage = (url: string, name: string) =>
+    ({ url: () => url, evaluate: vi.fn().mockResolvedValue(name) }) as unknown as Page;
+  const child = makePage("file:///vortex/index.html", "vortex-panel-panel-2");
+  const splash = makePage("file:///vortex/splash.html", "");
+  const main = makePage("file:///vortex/index.html", "");
+  expect(await selectRendererPage([child, splash, main])).toBe(main);
+  expect(await selectRendererPage([child])).toBeUndefined();
+});
 
 describe("realWheel", () => {
   it("releases Control even if the native wheel call fails", async () => {

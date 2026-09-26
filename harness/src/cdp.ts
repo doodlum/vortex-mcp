@@ -41,7 +41,8 @@ export interface RendererHandle {
  * Attach to the running Vortex's renderer window.
  *
  * Vortex opens a splash window as well as the main one, so the target is picked
- * by URL rather than by taking whichever page appears first.
+ * by URL and window name rather than by taking whichever page appears first.
+ * A same-origin panel pop-out can inherit the main renderer's index.html URL.
  */
 export async function attachToRenderer(config: HarnessConfig): Promise<RendererHandle> {
   let browser: Browser;
@@ -57,7 +58,7 @@ export async function attachToRenderer(config: HarnessConfig): Promise<RendererH
   }
 
   const pages = browser.contexts().flatMap((c) => c.pages());
-  const page = pages.find((p) => p.url().includes("index.html")) ?? pages[0];
+  const page = await selectRendererPage(pages);
   if (page === undefined) {
     await browser.close().catch(() => undefined);
     throw new CdpUnavailableError("Vortex exposes CDP but has no open window to attach to.");
@@ -97,6 +98,18 @@ export const NAME_SHIM = `(() => {
   }
   return true;
 })()`;
+
+export async function selectRendererPage(pages: Page[]): Promise<Page | undefined> {
+  const candidates = [
+    ...pages.filter((page) => page.url().includes("index.html")),
+    ...pages.filter((page) => !page.url().includes("index.html")),
+  ];
+  for (const page of candidates) {
+    const name = await page.evaluate(() => window.name).catch(() => undefined);
+    if (name !== undefined && !name.startsWith("vortex-panel-")) return page;
+  }
+  return undefined;
+}
 
 export interface ScreenshotOptions {
   /** Written under the artifact directory. Defaults to a timestamped name. */

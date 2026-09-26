@@ -143,9 +143,13 @@ export async function snapshot(
  * the next snapshot, so acting on a ref the caller obtained earlier is exactly
  * the stale-ref hazard the extension guards against.
  */
-export async function clickByName(mcp: VortexMcpClient, query: NodeQuery): Promise<SnapshotNode> {
+export async function clickByName(
+  mcp: VortexMcpClient,
+  query: NodeQuery,
+  scope?: { selector: string; index?: number },
+): Promise<SnapshotNode> {
   return withUiLock(mcp, async () => {
-    const node = findOne(await snapshot(mcp), query);
+    const node = findOne(await snapshot(mcp, scope?.selector, scope?.index), query);
     await mcp.call("ui_click", { ref: node.ref });
     return node;
   });

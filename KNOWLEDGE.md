@@ -880,3 +880,29 @@ run bare `playwright test`.
 The account specs can't be skipped by file: `game-management.spec.ts` mixes a signed-out test with
 a free-user one, and the tier loops (`account.spec.ts`, `mods*.spec.ts`) set `nexusUser` from a loop
 variable. The runner reads each describe's `test.use({ nexusUser })` and the tier in its title.
+
+### Panel content uses stable portals
+
+Page content is mounted through stable React portals so panel navigation and layout
+changes retain page state. React capture events follow the portal's React ancestry,
+not its DOM ancestry: a handler on the surrounding panel frame misses these clicks.
+Use native DOM capture listeners on the frame for pointerdown and focusin. They
+also handle controls that stop bubbling without cancelling the control's action or
+stealing keyboard focus. Check actual page content, input focus, and the sidebar
+indicator; clicking only panel chrome does not cover this path.
+
+Previously hidden panel tabs could make legacy SuperTable measure zero-width proxy columns. Its
+200ms header debounce then flashed collapsed columns when the page returned. Keep
+the last valid measurements while the proxy row has no width, and observe its size
+to synchronize the visible header before paint.
+
+For hover-only controls (the earlier panel trial used these), wait for the containing control strip's opacity transition before
+taking a scoped MCP snapshot. The button's own computed opacity can be `1` while its parent is
+still invisible. Sidebar width transitions likewise need a geometry assertion that waits for
+the final width before checking collapsed icon centering.
+
+Panel pop-outs were removed by design choice. Lessons from that experiment: child
+documents need CSSOM rules, SVG symbols, a base URL and a doctype; bare about:blank
+uses quirks mode and has no preload API. Its URL can inherit index.html, so URL-only
+CDP selection can pick the wrong window. Windows frameless windows retain resize
+borders, so zero outer-minus-inner size is not a valid titlebar test.

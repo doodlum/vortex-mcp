@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { McpError, type VortexMcpClient } from "./mcpClient";
 import {
   DialogClickError,
+  clickByName,
   advanceFomod,
   clickInsideDialog,
   findNodes,
@@ -63,6 +64,16 @@ function fakeMcp(bySelector: Record<string, SnapshotNode[]>): {
 const NAV = "#fomod-installer-dialog .fomod-nav-buttons";
 
 describe("target matching", () => {
+  it("clicks within a panel even when a page-wide snapshot omits the target", async () => {
+    const selector = '[aria-label="Plugins panel"]';
+    const { mcp, clicked, selectors } = fakeMcp({
+      "": [node("Mods")],
+      [selector]: [node("Close Plugins panel")],
+    });
+    await clickByName(mcp, { role: "button", name: "Close Plugins panel" }, { selector });
+    expect(selectors).toEqual([selector]);
+    expect(clicked).toEqual(["ref-Close Plugins panel"]);
+  });
   it("does not select Save games when asked for Games", () => {
     expect(findNodes(snapshotOf([node("Save games")]), { name: "Games" })).toEqual([]);
   });

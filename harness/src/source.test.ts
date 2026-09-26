@@ -1,6 +1,21 @@
 import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-import { ForkError, parsePnpmVersion, selectPnpmCommand } from "./source";
+import { ForkError, parsePnpmVersion, selectPnpmCommand, runStreaming } from "./source";
+
+it("preserves source paths containing spaces when invoking git", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vortex source "));
+  try {
+    await runStreaming("git", ["init", "--bare", path.join(dir, "source repo")], {
+      label: "Initialize source fixture",
+    });
+    expect(fs.existsSync(path.join(dir, "source repo", "HEAD"))).toBe(true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe("Vortex source package manager", () => {
   it("reads the exact version while ignoring a Corepack integrity suffix", () => {

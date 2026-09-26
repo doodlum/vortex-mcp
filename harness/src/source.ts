@@ -103,7 +103,7 @@ export function childEnv(): NodeJS.ProcessEnv {
  * `CI=1` keeps anything downstream from stopping on an interactive prompt there
  * is no terminal to answer.
  */
-function runStreaming(
+export function runStreaming(
   cmd: string,
   args: string[],
   options: { cwd?: string; label: string },
@@ -111,7 +111,7 @@ function runStreaming(
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd: options.cwd,
-      shell: true,
+      shell: cmd === "pnpm" && process.platform === "win32",
       stdio: "inherit",
       env: childEnv(),
     });
@@ -141,7 +141,7 @@ async function tryExec(
 ): Promise<string | undefined> {
   try {
     const { stdout } = await execFileAsync(cmd, args, {
-      shell: true,
+      shell: cmd === "pnpm" && process.platform === "win32",
       timeout: 20_000,
       cwd: options.cwd,
       env: options.env,

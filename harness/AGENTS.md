@@ -820,10 +820,31 @@ have these controls yet. `realWheel(config, selector, deltaY, { control: true })
 is the reusable shortcut input path; `ui_scroll` changes scroll position and
 does not emulate a native wheel gesture.
 
+`pnpm run ai:test:panels` checks the panel-only layout in a running source
+build with `--bethesda-sandbox`. It covers the placement dropdown, a new-panel
+chooser restricted to the current sidebar, sidebar focus and replacement,
+keyboard resizing, four-panel limit, and separate Home and game layouts.
+Match `VORTEX_AI_OWNER` to the running instance. It saves and restores the
+existing Home and game workspaces. Every open panel page keeps the sidebar's
+selected background; only the focused one has an outline and `aria-current`.
+After a clean `down` and `up --bethesda-sandbox`, run with `--verify-saved`
+to compare the restored layout with the one recorded by the normal run.
+
+For panel-local actions, `clickByName(mcp, query, { selector, index? })` scopes
+the fresh MCP snapshot. This avoids missing controls when a large table consumes
+the page-wide node budget. Modern pages put Close in the page header; older
+pages and the empty chooser use a fallback action row. The new panel chooser is
+`[data-panel-chooser="panel"]`. There are no tab controls or pop-outs.
+Click actual content inside each panel: page content is rendered through stable
+portals and must activate the surrounding panel too.
+
 Run responsive checks in each relevant state, with distinct artifact labels.
 Test both width and height, inspect actual sizes after OS clamping, and visually
 review screenshots against any supplied design. Structural warnings are not a
 substitute for design review. See the state matrix in [WORKFLOWS.md](WORKFLOWS.md).
+
+Source setup supports checkout paths containing spaces. Git and Node commands
+run directly; only the Windows pnpm command shim needs a shell.
 
 For Vortex development, `pnpm run ai:source` prepares `.vortex-src`; `up` prefers
 that managed checkout when present. `--installed` explicitly selects the released

@@ -77,6 +77,32 @@ app per assertion.
   profile. `vortex-ai record --ffmpeg <path> --seconds 15 --label demo` captures
   real-time WebM clips while another MCP/CLI session drives the app.
 
+## Panel-system regression
+
+Use `pnpm run ai:test:panels` against a running Bethesda sandbox for panel
+creation, four-panel layouts, resizing, content focus, Home scoping and
+persistence. It replaces the split-view trials. Run `--verify-saved`
+after stopping and reopening the same sandbox to verify disk persistence.
+Match `VORTEX_AI_OWNER` to the instance owner.
+
+Use `clickByName(mcp, query, { selector, index? })` for panel-local controls so
+large tables in other panels cannot exhaust the snapshot node budget. Modern
+pages use a Close control in their header; older pages and the empty chooser
+use a fallback action row. Check the visible placement dropdown and adaptive
+icon. New panels show sidebar-row choices and exclude pages already open.
+On Home, compare choices with the Home sidebar; game-only pages must not appear.
+Home and each game retain separate layouts when switching contexts.
+After dragging a divider, check that the add-panel icon's cell widths change
+with the workspace. The default candidate depends on wide versus tall geometry.
+Sidebar navigation should focus an already-open page or replace the page
+in the active panel when it is not open, even if another panel is larger.
+One layout persists per game. Every open panel page has the selected sidebar
+background. Only the focused panel's page carries the outline and
+`aria-current="page"`; check both expanded and collapsed sidebars.
+Verify panel activation when clicking actual page content
+or focusing its inputs. Pop-outs
+have been removed; no panel window action should be available.
+
 ## Extension-level unit tests
 
 Pure DOM logic belongs in `src/uiAutomation.test.ts` under jsdom, not in a
